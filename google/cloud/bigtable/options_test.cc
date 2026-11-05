@@ -16,6 +16,7 @@
 #include "google/cloud/grpc_options.h"
 #include "google/cloud/options.h"
 #include "google/cloud/testing_util/fake_clock.h"
+#include "google/cloud/testing_util/scoped_log.h"
 #include <gmock/gmock.h>
 #include <chrono>
 #include <memory>
@@ -29,7 +30,9 @@ namespace {
 using ::google::cloud::bigtable::DeadlineOption;
 using ::google::cloud::internal::GrpcSetupOption;
 using ::google::cloud::testing_util::FakeSystemClock;
+using ::google::cloud::testing_util::ScopedLog;
 using ::testing::Eq;
+using ::testing::IsEmpty;
 
 TEST(MergeOptions, ConnectionDeadlineOption) {
   FakeSystemClock clock;
@@ -168,6 +171,51 @@ TEST(MergeOptions, ClientDeadlineOptionCallGrpcSetupOption) {
   merged_call_opts.get<GrpcSetupOption>()(context);
   EXPECT_THAT(context.compression_algorithm(), Eq(GRPC_COMPRESS_DEFLATE));
   EXPECT_THAT(context.deadline() - clock.Now(), Eq(std::chrono::seconds(5)));
+}
+
+TEST(DataPolicyOptionList, AcceptsAllDataAndExperimentalOptions) {
+  ScopedLog log;
+  auto opts =
+      Options{}
+          .set<bigtable::DataRetryPolicyOption>(
+              std::make_shared<bigtable::DataLimitedErrorCountRetryPolicy>(0))
+          .set<bigtable::DataBackoffPolicyOption>(
+              std::make_shared<ExponentialBackoffPolicy>(
+                  std::chrono::milliseconds(10), std::chrono::milliseconds(100),
+                  2.0))
+          .set<bigtable::DeadlineOption>(std::chrono::milliseconds(500))
+          .set<bigtable::IdempotentMutationPolicyOption>(
+              bigtable::DefaultIdempotentMutationPolicy())
+          .set<bigtable::EnableMetricsOption>(false)
+          .set<bigtable::MetricsPeriodOption>(std::chrono::seconds(60))
+          .set<bigtable::ReverseScanOption>(true)
+          .set<bigtable::experimental::BulkApplyThrottlingOption>(true)
+          .set<
+              bigtable::experimental::ExecuteQueryPlanRefreshRetryPolicyOption>(
+              std::make_shared<
+                  bigtable::experimental::
+                      ExecuteQueryPlanRefreshLimitedErrorCountRetryPolicy>(0))
+          .set<bigtable::experimental::
+                   QueryPlanRefreshFunctionRetryPolicyOption>(
+              std::make_shared<
+                  bigtable::experimental::
+                      QueryPlanRefreshFunctionLimitedErrorCountRetryPolicy>(0))
+          .set<bigtable::experimental::DynamicChannelPoolSizingPolicyOption>(
+              bigtable::experimental::DynamicChannelPoolSizingPolicy{})
+          .set<bigtable::experimental::DirectPathModeOption>(
+              bigtable::experimental::DirectPathMode::kDisabled)
+          .set<bigtable::experimental::DirectPathMetricsModeOption>(
+              bigtable::experimental::DirectPathMetricsMode::kDisabled)
+          .set<bigtable::experimental::DirectPathProbeTimeoutOption>(
+              std::chrono::milliseconds(1000))
+          .set<bigtable::experimental::DirectPathDiagnosticsTimeoutOption>(
+              std::chrono::milliseconds(2000))
+          .set<bigtable::experimental::DirectPathInitializationModeOption>(
+              bigtable::experimental::DirectPathInitializationMode::kBlocking);
+
+  google::cloud::internal::CheckExpectedOptions<bigtable::DataPolicyOptionList>(
+      opts, "test-caller");
+  EXPECT_THAT(log.ExtractLines(), IsEmpty());
 }
 
 }  // namespace

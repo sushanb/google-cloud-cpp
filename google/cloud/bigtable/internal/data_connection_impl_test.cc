@@ -4050,6 +4050,91 @@ TEST_F(DataConnectionTest, AsyncPrepareQueryFailsOnInvalidType) {
   fake_cq_impl->SimulateCompletion(false);
 }
 
+TEST_F(DataConnectionTest, AffinityStubRoutingValidAndMalformedTableNames) {
+  bigtable::InstanceResource instance_a(Project("the-project"), "the-instance");
+  auto mock_stub_a = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock_stub_a, MutateRow)
+      .Times(7)
+      .WillRepeatedly([](grpc::ClientContext&, Options const&,
+                         v2::MutateRowRequest const&,
+                         bigtable_internal::OperationContext&) {
+        return v2::MutateRowResponse{};
+      });
+
+  absl::flat_hash_map<std::string, std::shared_ptr<BigtableStub>>
+      affinity_stubs;
+  affinity_stubs[instance_a.FullName()] = mock_stub_a;
+
+  MockFunction<std::shared_ptr<BigtableStub>(std::string_view,
+                                             StubManager::Priming)>
+      stub_creation_fn;
+  EXPECT_CALL(stub_creation_fn, Call).Times(0);
+
+  auto background = internal::MakeBackgroundThreadsFactory()();
+  auto stub_manager = std::make_unique<StubManager>(
+      std::move(affinity_stubs), stub_creation_fn.AsStdFunction());
+  auto conn = std::make_shared<DataConnectionImpl>(
+      std::move(background), std::move(stub_manager),
+      std::make_unique<SimpleOperationContextFactory>(),
+      std::make_shared<NoopMutateRowsLimiter>(), Options{});
+
+  internal::OptionsSpan span(CallOptions());
+  ASSERT_STATUS_OK(conn->Apply(kTableName, IdempotentMutation("row")));
+  for (auto const* malformed_table : {
+           "malformed-table-without-slashes",
+           "/tables/the-table",
+           "bad-prefix/tables/the-table",
+           "projects//instances/the-instance/tables/the-table",
+           "projects/the-project/instances//tables/the-table",
+           "projects/the-project/instances/the-instance/tables/",
+       }) {
+    ASSERT_STATUS_OK(conn->Apply(malformed_table, IdempotentMutation("row")));
+  }
+}
+
+TEST_F(DataConnectionTest, AffinityStubRoutingDynamicValidInstance) {
+  bigtable::InstanceResource instance_a(Project("the-project"), "the-instance");
+  bigtable::InstanceResource instance_b(Project("other-project"),
+                                        "other-instance");
+  auto mock_stub_a = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock_stub_a, MutateRow).Times(0);
+
+  auto mock_stub_b = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock_stub_b, MutateRow)
+      .WillOnce([](grpc::ClientContext&, Options const&,
+                   v2::MutateRowRequest const& request,
+                   bigtable_internal::OperationContext&) {
+        EXPECT_EQ("projects/other-project/instances/other-instance/tables/t",
+                  request.table_name());
+        return v2::MutateRowResponse{};
+      });
+
+  absl::flat_hash_map<std::string, std::shared_ptr<BigtableStub>>
+      affinity_stubs;
+  affinity_stubs[instance_a.FullName()] = mock_stub_a;
+
+  MockFunction<std::shared_ptr<BigtableStub>(std::string_view,
+                                             StubManager::Priming)>
+      stub_creation_fn;
+  EXPECT_CALL(stub_creation_fn, Call(Eq(instance_b.FullName()),
+                                     Eq(StubManager::Priming::kNoPriming)))
+      .WillOnce(
+          [&](std::string_view, StubManager::Priming) { return mock_stub_b; });
+
+  auto background = internal::MakeBackgroundThreadsFactory()();
+  auto stub_manager = std::make_unique<StubManager>(
+      std::move(affinity_stubs), stub_creation_fn.AsStdFunction());
+  auto conn = std::make_shared<DataConnectionImpl>(
+      std::move(background), std::move(stub_manager),
+      std::make_unique<SimpleOperationContextFactory>(),
+      std::make_shared<NoopMutateRowsLimiter>(), Options{});
+
+  internal::OptionsSpan span(CallOptions());
+  ASSERT_STATUS_OK(
+      conn->Apply("projects/other-project/instances/other-instance/tables/t",
+                  IdempotentMutation("row")));
+}
+
 }  // namespace
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
 }  // namespace bigtable_internal

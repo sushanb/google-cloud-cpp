@@ -20,6 +20,9 @@
 #include "google/cloud/testing_util/scoped_log.h"
 #include "google/cloud/testing_util/status_matchers.h"
 #include <gmock/gmock.h>
+#include <atomic>
+#include <future>
+#include <thread>
 
 namespace google {
 namespace cloud {
@@ -33,6 +36,7 @@ using ::testing::Contains;
 using ::testing::Eq;
 using ::testing::HasSubstr;
 using ::testing::MockFunction;
+using ::testing::Not;
 using ::testing::StartsWith;
 
 TEST(StubManagerTest, NoAffinity) {
@@ -133,6 +137,100 @@ TEST(StubManagerTest, AffinityToMissingInstance) {
   EXPECT_THAT(log.ExtractLines(),
               Contains(HasSubstr(
                   "Dynamic connection resolution adding new channel pool")));
+}
+
+TEST(StubManagerTest, EmptyInstanceNameFallsBackToExistingStubWithoutCaching) {
+  testing_util::ScopedLog log;
+  bigtable::InstanceResource instance_a(Project("my-project"), "a");
+  auto mock_stub_a = std::make_shared<MockBigtableStub>();
+  absl::flat_hash_map<std::string, std::shared_ptr<BigtableStub>>
+      affinity_stubs;
+  affinity_stubs[instance_a.FullName()] = mock_stub_a;
+
+  MockFunction<std::shared_ptr<BigtableStub>(std::string_view,
+                                             StubManager::Priming)>
+      stub_creation_fn;
+  EXPECT_CALL(stub_creation_fn, Call).Times(0);
+
+  StubManager manager(std::move(affinity_stubs),
+                      stub_creation_fn.AsStdFunction());
+
+  EXPECT_THAT(manager.GetStub(""), Eq(mock_stub_a));
+  EXPECT_THAT(manager.GetStub(""), Eq(mock_stub_a));
+  EXPECT_THAT(log.ExtractLines(),
+              Not(Contains(HasSubstr("Dynamic connection resolution"))));
+}
+
+TEST(StubManagerTest, EmptyInstanceNameWithNoExistingStubsDoesNotCache) {
+  testing_util::ScopedLog log;
+  auto stub_1 = std::make_shared<MockBigtableStub>();
+  auto stub_2 = std::make_shared<MockBigtableStub>();
+
+  MockFunction<std::shared_ptr<BigtableStub>(std::string_view,
+                                             StubManager::Priming)>
+      stub_creation_fn;
+  EXPECT_CALL(stub_creation_fn,
+              Call(Eq(""), Eq(StubManager::Priming::kNoPriming)))
+      .WillOnce([&](std::string_view, StubManager::Priming) { return stub_1; })
+      .WillOnce([&](std::string_view, StubManager::Priming) { return stub_2; });
+
+  StubManager manager({}, stub_creation_fn.AsStdFunction());
+
+  EXPECT_THAT(manager.GetStub(""), Eq(stub_1));
+  EXPECT_THAT(manager.GetStub(""), Eq(stub_2));
+  EXPECT_THAT(log.ExtractLines(),
+              Not(Contains(HasSubstr("Dynamic connection resolution"))));
+}
+
+TEST(StubManagerTest, StubCreationDoesNotBlockExistingInstanceReads) {
+  bigtable::InstanceResource instance_a(Project("my-project"), "a");
+  bigtable::InstanceResource instance_b(Project("my-project"), "b");
+  auto mock_stub_a = std::make_shared<MockBigtableStub>();
+
+  absl::flat_hash_map<std::string, std::shared_ptr<BigtableStub>>
+      affinity_stubs;
+  affinity_stubs[instance_a.FullName()] = mock_stub_a;
+
+  std::promise<void> entered_creation;
+  std::shared_future<void> entered_creation_future =
+      entered_creation.get_future().share();
+  std::promise<void> release_creation;
+  std::shared_future<void> release_creation_future =
+      release_creation.get_future().share();
+  std::atomic<bool> notified{false};
+
+  auto stub_creation_fn = [&](std::string_view instance_name,
+                              StubManager::Priming priming) {
+    EXPECT_THAT(instance_name, Eq(instance_b.FullName()));
+    EXPECT_THAT(priming, Eq(StubManager::Priming::kNoPriming));
+    if (!notified.exchange(true)) {
+      entered_creation.set_value();
+    }
+    release_creation_future.wait();
+    return std::make_shared<MockBigtableStub>();
+  };
+
+  StubManager manager(std::move(affinity_stubs), stub_creation_fn);
+
+  std::shared_ptr<BigtableStub> stub_b_1;
+  std::thread t1([&] { stub_b_1 = manager.GetStub(instance_b.FullName()); });
+  entered_creation_future.wait();
+
+  // While stub_creation_fn is in flight on t1, reading an already-cached
+  // instance must succeed without blocking on mu_.
+  EXPECT_THAT(manager.GetStub(instance_a.FullName()), Eq(mock_stub_a));
+
+  std::shared_ptr<BigtableStub> stub_b_2;
+  std::thread t2([&] { stub_b_2 = manager.GetStub(instance_b.FullName()); });
+
+  release_creation.set_value();
+  t1.join();
+  t2.join();
+
+  auto stub_b_cached = manager.GetStub(instance_b.FullName());
+  EXPECT_NE(stub_b_cached, nullptr);
+  EXPECT_THAT(stub_b_1, Eq(stub_b_cached));
+  EXPECT_THAT(stub_b_2, Eq(stub_b_cached));
 }
 
 }  // namespace

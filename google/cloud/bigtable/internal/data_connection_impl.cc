@@ -44,6 +44,7 @@
 #include "google/cloud/universe_domain_options.h"
 #include <memory>
 #include <string>
+#include <string_view>
 
 namespace google {
 namespace cloud {
@@ -193,9 +194,32 @@ ResultType MakeStatusOnlyResult(Status status) {
 }
 
 std::string_view InstanceNameFromTableName(std::string_view table_name) {
-  auto pos = table_name.rfind("/tables");
-  if (pos == std::string_view::npos) return {};
-  return table_name.substr(0, pos);
+  constexpr std::string_view kProjectsPrefix = "projects/";
+  constexpr std::string_view kInstancesSegment = "/instances/";
+  constexpr std::string_view kTablesSegment = "/tables/";
+  if (table_name.substr(0, kProjectsPrefix.size()) != kProjectsPrefix) {
+    return {};
+  }
+  auto const instances_pos =
+      table_name.find(kInstancesSegment, kProjectsPrefix.size());
+  if (instances_pos == std::string_view::npos) return {};
+  auto const project_id = table_name.substr(
+      kProjectsPrefix.size(), instances_pos - kProjectsPrefix.size());
+  if (project_id.empty() || project_id.find('/') != std::string_view::npos) {
+    return {};
+  }
+  auto const instance_id_start = instances_pos + kInstancesSegment.size();
+  auto const tables_pos = table_name.find(kTablesSegment, instance_id_start);
+  if (tables_pos == std::string_view::npos) return {};
+  auto const table_suffix =
+      table_name.substr(tables_pos + kTablesSegment.size());
+  if (table_suffix.empty() || table_suffix.front() == '/') return {};
+  auto const instance_id =
+      table_name.substr(instance_id_start, tables_pos - instance_id_start);
+  if (instance_id.empty() || instance_id.find('/') != std::string_view::npos) {
+    return {};
+  }
+  return table_name.substr(0, tables_pos);
 }
 }  // namespace
 
@@ -756,7 +780,7 @@ StatusOr<bigtable::PreparedQuery> DataConnectionImpl::PrepareQuery(
   }
   auto operation_context = operation_context_factory_->PrepareQuery(
       instance_full_name, app_profile_id(*current));
-  auto stub = stub_manager_->GetStub(params.instance.FullName());
+  auto stub = stub_manager_->GetStub(instance_full_name);
   auto response = google::cloud::internal::RetryLoop(
       retry_policy(*current), backoff_policy(*current),
       Idempotency::kIdempotent,
