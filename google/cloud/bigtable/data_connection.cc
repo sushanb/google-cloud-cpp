@@ -34,14 +34,17 @@
 #include "google/cloud/grpc_options.h"
 #include "google/cloud/internal/opentelemetry.h"
 #include "google/cloud/internal/unified_grpc_credentials.h"
+#include "absl/strings/match.h"
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
 #include "google/cloud/bigtable/internal/client_schema_metrics.h"
 #include "google/cloud/monitoring/v3/metric_connection.h"
 #include "google/cloud/internal/random.h"
 #include <opentelemetry/context/runtime_context.h>
 #endif  // GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+#include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <utility>
 
 namespace google {
 namespace cloud {
@@ -107,6 +110,7 @@ GetDirectAccessCompatibility(
 
 struct DataConnectionComponents {
   Options options;
+  Options raw_options;
   std::unique_ptr<BackgroundThreads> background;
   std::shared_ptr<google::cloud::internal::GrpcAuthenticationStrategy> auth;
   std::shared_ptr<bigtable_internal::MutateRowsLimiter> limiter;
@@ -128,7 +132,18 @@ DataConnectionComponents MakeDataConnectionComponents(
   if (!instances.empty()) {
     options.set<bigtable_internal::InstanceChannelAffinityOption>(instances);
   }
+  Options raw_options = options;
   options = bigtable::internal::DefaultDataOptions(std::move(options));
+  if (!instances.empty() && bigtable::internal::IsDirectPath(options) &&
+      options.get<
+          bigtable::experimental::DirectPathInitializationModeOption>() ==
+          bigtable::experimental::DirectPathInitializationMode::
+              kAsynchronousSpeculative &&
+      !options.has<GrpcBackgroundThreadPoolSizeOption>() &&
+      !options.has<GrpcCompletionQueueOption>() &&
+      !options.has<GrpcBackgroundThreadsFactoryOption>()) {
+    options.set<GrpcBackgroundThreadPoolSizeOption>(2);
+  }
   std::unique_ptr<BackgroundThreads> background =
       google::cloud::internal::MakeBackgroundThreadsFactory(options)();
   std::shared_ptr<google::cloud::internal::GrpcAuthenticationStrategy> auth =
@@ -144,14 +159,16 @@ DataConnectionComponents MakeDataConnectionComponents(
       direct_access_compatibility =
           GetDirectAccessCompatibility(operation_context_factory.get());
   return {std::move(options),
+          std::move(raw_options),
           std::move(background),
           std::move(auth),
           std::move(limiter),
           std::move(operation_context_factory),
           std::move(direct_access_compatibility)};
 #else
-  return {std::move(options), std::move(background), std::move(auth),
-          std::move(limiter), std::move(operation_context_factory)};
+  return {std::move(options),    std::move(raw_options),
+          std::move(background), std::move(auth),
+          std::move(limiter),    std::move(operation_context_factory)};
 #endif
 }
 
@@ -202,6 +219,7 @@ std::shared_ptr<bigtable::DataConnection> MakeInstanceAffinityDataConnection(
 }
 
 Options MakeDirectPathOptions(Options options) {
+  options.unset<bigtable_internal::DirectPathFallbackToCloudPathOption>();
   options.set<::google::cloud::bigtable_internal::DataEndpointOption>(
       bigtable::internal::DefaultDirectPathDataEndpoint());
   options.set<EndpointOption>(
@@ -213,67 +231,173 @@ Options MakeDirectPathOptions(Options options) {
   return options;
 }
 
-Options MakeCloudPathOptions(Options options) {
+Options MakeCloudPathOptions(Options options, Options raw_options) {
+  if (raw_options.has<EndpointOption>() &&
+      absl::StartsWith(raw_options.get<EndpointOption>(), "google-c2p:")) {
+    raw_options.unset<EndpointOption>();
+  }
+  if (raw_options
+          .has<::google::cloud::bigtable_internal::DataEndpointOption>() &&
+      absl::StartsWith(
+          raw_options
+              .get<::google::cloud::bigtable_internal::DataEndpointOption>(),
+          "google-c2p:")) {
+    raw_options.unset<::google::cloud::bigtable_internal::DataEndpointOption>();
+  }
+  raw_options.set<bigtable_internal::DirectPathFallbackToCloudPathOption>(true);
+  raw_options.set<bigtable::experimental::DirectPathModeOption>(
+      bigtable::experimental::DirectPathMode::kDisabled);
+  Options const cloudpath_defaults =
+      bigtable::internal::DefaultDataOptions(std::move(raw_options));
+
   options.set<::google::cloud::bigtable_internal::DataEndpointOption>(
-      "bigtable.googleapis.com");
-  options.set<EndpointOption>("bigtable.googleapis.com");
-  options.set<AuthorityOption>("bigtable.googleapis.com");
+      cloudpath_defaults
+          .get<::google::cloud::bigtable_internal::DataEndpointOption>());
+  options.set<EndpointOption>(cloudpath_defaults.get<EndpointOption>());
+  options.set<AuthorityOption>(cloudpath_defaults.get<AuthorityOption>());
   options.set<bigtable::experimental::DirectPathModeOption>(
       bigtable::experimental::DirectPathMode::kDisabled);
+  options.set<bigtable_internal::DirectPathFallbackToCloudPathOption>(true);
   return options;
 }
+
+class SpeculativeStubManagerTask {
+ public:
+  SpeculativeStubManagerTask(
+      std::shared_ptr<google::cloud::internal::GrpcAuthenticationStrategy> auth,
+      CompletionQueue cq, std::vector<bigtable::InstanceResource> instances,
+      Options stub_options)
+      : auth_(std::move(auth)),
+        cq_(std::move(cq)),
+        instances_(std::move(instances)),
+        stub_options_(std::move(stub_options)),
+        cancel_token_(
+            std::make_shared<bigtable_internal::PrimingCancellationToken>()) {}
+
+  void Run() {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (started_ || discarded_) return;
+      started_ = true;
+    }
+
+    std::unique_ptr<bigtable_internal::StubManager> built;
+    if (!cancel_token_->IsCancelled()) {
+      Options init_options = stub_options_;
+      init_options.set<bigtable_internal::PrimingCancellationTokenOption>(
+          cancel_token_);
+      auto init_stub_creation_fn =
+          [auth = auth_, cq = cq_, init_options](
+              std::string_view instance_name,
+              bigtable_internal::StubManager::Priming priming) {
+            return bigtable_internal::CreateBigtableStub(
+                auth, cq, instance_name, priming, init_options);
+          };
+      absl::flat_hash_map<std::string,
+                          std::shared_ptr<bigtable_internal::BigtableStub>>
+          affinity_stubs = bigtable_internal::CreateBigtableAffinityStubs(
+              instances_, init_stub_creation_fn);
+      if (!cancel_token_->IsCancelled()) {
+        auto runtime_stub_creation_fn =
+            [auth = auth_, cq = cq_, options = stub_options_](
+                std::string_view instance_name,
+                bigtable_internal::StubManager::Priming priming) {
+              return bigtable_internal::CreateBigtableStub(
+                  auth, cq, instance_name, priming, options);
+            };
+        built = std::make_unique<bigtable_internal::StubManager>(
+            std::move(affinity_stubs), std::move(runtime_stub_creation_fn));
+      }
+    }
+
+    std::unique_ptr<bigtable_internal::StubManager> to_destroy;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (discarded_) {
+        to_destroy = std::move(built);
+      } else {
+        result_ = std::move(built);
+      }
+      done_ = true;
+    }
+    cv_.notify_all();
+  }
+
+  std::unique_ptr<bigtable_internal::StubManager> Get() {
+    {
+      std::unique_lock<std::mutex> lk(mu_);
+      if (started_) {
+        cv_.wait(lk, [this] { return done_; });
+        return std::move(result_);
+      }
+      started_ = true;
+    }
+
+    auto runtime_stub_creation_fn =
+        [auth = auth_, cq = cq_, options = stub_options_](
+            std::string_view instance_name,
+            bigtable_internal::StubManager::Priming priming) {
+          return bigtable_internal::CreateBigtableStub(auth, cq, instance_name,
+                                                       priming, options);
+        };
+    absl::flat_hash_map<std::string,
+                        std::shared_ptr<bigtable_internal::BigtableStub>>
+        affinity_stubs = bigtable_internal::CreateBigtableAffinityStubs(
+            instances_, runtime_stub_creation_fn);
+    auto built = std::make_unique<bigtable_internal::StubManager>(
+        std::move(affinity_stubs), std::move(runtime_stub_creation_fn));
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      done_ = true;
+    }
+    cv_.notify_all();
+    return built;
+  }
+
+  void Discard() {
+    cancel_token_->Cancel();
+    std::unique_ptr<bigtable_internal::StubManager> to_destroy;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      discarded_ = true;
+      to_destroy = std::move(result_);
+    }
+  }
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool started_ = false;
+  bool done_ = false;
+  bool discarded_ = false;
+  std::shared_ptr<google::cloud::internal::GrpcAuthenticationStrategy> auth_;
+  CompletionQueue cq_;
+  std::vector<bigtable::InstanceResource> instances_;
+  Options stub_options_;
+  std::shared_ptr<bigtable_internal::PrimingCancellationToken> cancel_token_;
+  std::unique_ptr<bigtable_internal::StubManager> result_;
+};
 
 std::shared_ptr<bigtable::DataConnection>
 MakeSpeculativeDirectPathDataConnection(
     DataConnectionComponents components,
     std::vector<bigtable::InstanceResource> const& instances,
     Options directpath_options, Options cloudpath_options) {
-  // Step 1: Concurrently create StubManagers for both DirectPath and CloudPath
+  // Step 1: Concurrently create StubManagers for both CloudPath and DirectPath
   // on background threads so that stubs are warming up while probing proceeds.
-  promise<std::unique_ptr<bigtable_internal::StubManager>> directpath_promise;
-  future<std::unique_ptr<bigtable_internal::StubManager>> directpath_future =
-      directpath_promise.get_future();
-  promise<std::unique_ptr<bigtable_internal::StubManager>> cloudpath_promise;
-  future<std::unique_ptr<bigtable_internal::StubManager>> cloudpath_future =
-      cloudpath_promise.get_future();
+  // CloudPath is enqueued first and `SpeculativeStubManagerTask::Get()` runs
+  // inline if not yet started, preventing starvation even on a 1-thread CQ.
+  auto cloudpath_task = std::make_shared<SpeculativeStubManagerTask>(
+      components.auth, components.background->cq(), instances,
+      cloudpath_options);
+  auto directpath_task = std::make_shared<SpeculativeStubManagerTask>(
+      components.auth, components.background->cq(), instances,
+      directpath_options);
 
   components.background->cq().RunAsync(
-      [p = std::move(directpath_promise), auth = components.auth,
-       cq = components.background->cq(), directpath_options,
-       instances]() mutable {
-        auto stub_creation_fn =
-            [auth, cq, directpath_options](
-                std::string_view instance_name,
-                bigtable_internal::StubManager::Priming priming) {
-              return bigtable_internal::CreateBigtableStub(
-                  auth, cq, instance_name, priming, directpath_options);
-            };
-        absl::flat_hash_map<std::string,
-                            std::shared_ptr<bigtable_internal::BigtableStub>>
-            affinity_stubs = bigtable_internal::CreateBigtableAffinityStubs(
-                instances, stub_creation_fn);
-        p.set_value(std::make_unique<bigtable_internal::StubManager>(
-            std::move(affinity_stubs), stub_creation_fn));
-      });
-
+      [cloudpath_task] { cloudpath_task->Run(); });
   components.background->cq().RunAsync(
-      [p = std::move(cloudpath_promise), auth = components.auth,
-       cq = components.background->cq(), cloudpath_options,
-       instances]() mutable {
-        auto stub_creation_fn =
-            [auth, cq, cloudpath_options](
-                std::string_view instance_name,
-                bigtable_internal::StubManager::Priming priming) {
-              return bigtable_internal::CreateBigtableStub(
-                  auth, cq, instance_name, priming, cloudpath_options);
-            };
-        absl::flat_hash_map<std::string,
-                            std::shared_ptr<bigtable_internal::BigtableStub>>
-            affinity_stubs = bigtable_internal::CreateBigtableAffinityStubs(
-                instances, stub_creation_fn);
-        p.set_value(std::make_unique<bigtable_internal::StubManager>(
-            std::move(affinity_stubs), stub_creation_fn));
-      });
+      [directpath_task] { directpath_task->Run(); });
 
   // Step 2: Probe DirectPath connectivity and ALTS negotiation on the primary
   // instance.
@@ -282,15 +406,12 @@ MakeSpeculativeDirectPathDataConnection(
           components.auth, instances.front(), directpath_options,
           components.background->cq());
 
-  // Step 3a: If DirectPath probing succeeds, use DirectPath stubs, discard the
-  // fallback CloudPath future asynchronously, and record successful metrics.
+  // Step 3a: If DirectPath probing succeeds, cancel and discard the unused
+  // CloudPath task, retrieve the DirectPath StubManager, and record metrics.
   if (probe_result.ok() && probe_result->success) {
+    cloudpath_task->Discard();
     std::unique_ptr<bigtable_internal::StubManager> stub_manager =
-        directpath_future.get();
-    std::move(cloudpath_future)
-        .then([](future<std::unique_ptr<bigtable_internal::StubManager>> f) {
-          (void)f.get();
-        });
+        directpath_task->Get();
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
     if (components.direct_access_compatibility != nullptr) {
       components.direct_access_compatibility->Record(
@@ -305,16 +426,12 @@ MakeSpeculativeDirectPathDataConnection(
         std::move(components.limiter), std::move(directpath_options));
   }
 
-  // Step 3b: If DirectPath probing fails, fall back to the CloudPath
-  // StubManager, discard the unused DirectPath future asynchronously, and run
-  // environmental diagnostics asynchronously to diagnose and record metrics for
-  // the failure reason.
+  // Step 3b: If DirectPath probing fails, cancel and discard the unused
+  // DirectPath task, fall back to the CloudPath StubManager, and run
+  // environmental diagnostics asynchronously.
+  directpath_task->Discard();
   std::unique_ptr<bigtable_internal::StubManager> stub_manager =
-      cloudpath_future.get();
-  std::move(directpath_future)
-      .then([](future<std::unique_ptr<bigtable_internal::StubManager>> f) {
-        (void)f.get();
-      });
+      cloudpath_task->Get();
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
   bigtable_internal::DirectPathDiagnostics::RunAsync(
       components.background->cq(), directpath_options,
@@ -394,8 +511,8 @@ std::shared_ptr<bigtable::DataConnection> MakeDirectPathDataConnection(
       components.options
           .get<bigtable::experimental::DirectPathInitializationModeOption>();
   Options directpath_options = MakeDirectPathOptions(components.options);
-  Options cloudpath_options =
-      MakeCloudPathOptions(std::move(components.options));
+  Options cloudpath_options = MakeCloudPathOptions(
+      std::move(components.options), std::move(components.raw_options));
 
   if (initialization_mode ==
       bigtable::experimental::DirectPathInitializationMode::kBlocking) {

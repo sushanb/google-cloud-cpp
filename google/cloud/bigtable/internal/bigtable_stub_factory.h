@@ -23,13 +23,57 @@
 #include "google/cloud/internal/unified_grpc_credentials.h"
 #include "google/cloud/options.h"
 #include "google/cloud/version.h"
+#include <grpcpp/grpcpp.h>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <utility>
 
 namespace google {
 namespace cloud {
 namespace bigtable_internal {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
+
+/// Coordinates cancellation of speculative channel-pool priming when the
+/// unused path is discarded.
+class PrimingCancellationToken {
+ public:
+  void Cancel() {
+    std::shared_ptr<grpc::ClientContext> active;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      cancelled_ = true;
+      active = active_context_;
+    }
+    if (active != nullptr) active->TryCancel();
+  }
+
+  bool IsCancelled() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return cancelled_;
+  }
+
+  bool RegisterContext(std::shared_ptr<grpc::ClientContext> context) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (cancelled_) return false;
+    active_context_ = std::move(context);
+    return true;
+  }
+
+  void ClearContext() {
+    std::lock_guard<std::mutex> lk(mu_);
+    active_context_.reset();
+  }
+
+ private:
+  mutable std::mutex mu_;
+  bool cancelled_ = false;
+  std::shared_ptr<grpc::ClientContext> active_context_;
+};
+
+struct PrimingCancellationTokenOption {
+  using Type = std::shared_ptr<PrimingCancellationToken>;
+};
 
 using BaseBigtableStubFactory = std::function<std::shared_ptr<BigtableStub>(
     std::shared_ptr<grpc::Channel>)>;

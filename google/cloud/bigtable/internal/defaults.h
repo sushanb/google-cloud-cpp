@@ -22,6 +22,19 @@
 
 namespace google {
 namespace cloud {
+namespace bigtable_internal {
+GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
+
+/**
+ * Internal option indicating that a connection has fallen back from DirectPath
+ * to CloudPath, overriding DirectPath environment variables and options.
+ */
+struct DirectPathFallbackToCloudPathOption {
+  using Type = bool;
+};
+
+GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
+}  // namespace bigtable_internal
 namespace bigtable {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace internal {

@@ -29,17 +29,39 @@
 #include "google/cloud/internal/algorithm.h"
 #include "google/cloud/internal/api_client_header.h"
 #include "google/cloud/internal/base64_transforms.h"
+#include "google/cloud/internal/make_status.h"
 #include "google/cloud/internal/opentelemetry.h"
 #include "google/cloud/internal/unified_grpc_credentials.h"
 #include "google/cloud/log.h"
 #include "google/bigtable/v2/feature_flags.pb.h"
 #include <grpcpp/grpcpp.h>
+#include <algorithm>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <utility>
 
 namespace google {
 namespace cloud {
 namespace bigtable_internal {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace {
+
+auto constexpr kDefaultPrimingTimeout =
+    std::chrono::milliseconds(std::chrono::seconds(10));
+
+std::chrono::milliseconds PrimingTimeout(Options const& options) {
+  if (bigtable::internal::IsDirectPath(options) &&
+      options.has<bigtable::experimental::DirectPathProbeTimeoutOption>()) {
+    auto const probe_timeout =
+        options.get<bigtable::experimental::DirectPathProbeTimeoutOption>();
+    if (probe_timeout > std::chrono::milliseconds::zero()) {
+      return probe_timeout;
+    }
+  }
+  return kDefaultPrimingTimeout;
+}
 
 std::shared_ptr<grpc::Channel> CreateGrpcChannel(
     internal::GrpcAuthenticationStrategy& auth, Options const& options,
@@ -120,12 +142,20 @@ std::shared_ptr<BigtableStub> CreateBigtableStubRandomTwoLeastUsed(
     std::string_view instance_name, StubManager::Priming priming,
     Options const& options, BaseBigtableStubFactory stub_factory,
     std::shared_ptr<ConnectionRefreshState> refresh_state) {
-  auto refreshing_channel_stub_factory =
+  auto const cancel_token = options.get<PrimingCancellationTokenOption>();
+  Options runtime_options = options;
+  runtime_options.unset<PrimingCancellationTokenOption>();
+
+  auto create_channel_usage =
       [stub_factory = std::move(stub_factory), cq_impl, refresh_state,
-       auth = std::move(auth),
-       options](std::uint32_t id, std::string_view instance_name,
-                StubManager::Priming priming)
+       auth = std::move(auth), options = std::move(runtime_options)](
+          std::uint32_t id, std::string_view inst_name,
+          StubManager::Priming channel_priming, PrimingCancellationToken* token)
       -> StatusOr<std::shared_ptr<ChannelUsage<BigtableStub>>> {
+    if (token != nullptr && token->IsCancelled()) {
+      return internal::CancelledError("Speculative priming cancelled",
+                                      GCP_ERROR_INFO());
+    }
     auto wrapper = std::make_shared<ChannelUsage<BigtableStub>>();
     auto connection_status_fn = [weak = wrapper->MakeWeak()](Status const& s) {
       if (auto self = weak.lock()) {
@@ -144,18 +174,24 @@ std::shared_ptr<BigtableStub> CreateBigtableStubRandomTwoLeastUsed(
 
     auto channel = CreateGrpcChannel(*auth, options, id);
     auto stub = stub_factory(std::move(channel));
-    if (priming == StubManager::Priming::kSynchronousPriming) {
-      grpc::ClientContext client_context;
+    if (channel_priming == StubManager::Priming::kSynchronousPriming) {
+      auto client_context = std::make_shared<grpc::ClientContext>();
+      client_context->set_deadline(std::chrono::system_clock::now() +
+                                   PrimingTimeout(options));
+      if (token != nullptr && !token->RegisterContext(client_context)) {
+        return internal::CancelledError("Speculative priming cancelled",
+                                        GCP_ERROR_INFO());
+      }
       google::bigtable::v2::PingAndWarmRequest request;
-      request.set_name(std::string{instance_name});
+      request.set_name(std::string{inst_name});
       OperationContext op_ctx;
-      auto response = stub->PingAndWarm(client_context, options,
+      auto response = stub->PingAndWarm(*client_context, options,
                                         std::move(request), op_ctx);
+      if (token != nullptr) token->ClearContext();
       if (!response.ok()) return response.status();
     }
 
-    ScheduleStubRefresh(cq_impl, refresh_state, stub,
-                        std::string{instance_name},
+    ScheduleStubRefresh(cq_impl, refresh_state, stub, std::string{inst_name},
                         std::move(connection_status_fn));
 
     wrapper->set_stub(std::move(stub));
@@ -163,14 +199,25 @@ std::shared_ptr<BigtableStub> CreateBigtableStubRandomTwoLeastUsed(
   };
 
   std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> children;
-  children.reserve(std::max(1, options.get<GrpcNumChannelsOption>()));
+  children.reserve(static_cast<std::size_t>(
+      (std::max)(1, options.get<GrpcNumChannelsOption>())));
   std::uint32_t id = 0;
-  for (std::uint32_t i = 0; i < children.capacity(); ++i) {
-    auto stub = refreshing_channel_stub_factory(id++, instance_name, priming);
+  for (std::size_t i = 0; i < children.capacity(); ++i) {
+    if (cancel_token != nullptr && cancel_token->IsCancelled()) break;
+    auto stub =
+        create_channel_usage(id++, instance_name, priming, cancel_token.get());
     if (stub.ok()) {
       children.push_back(*std::move(stub));
     }
   }
+
+  auto refreshing_channel_stub_factory =
+      [create_channel_usage = std::move(create_channel_usage)](
+          std::uint32_t channel_id, std::string const& inst_name,
+          StubManager::Priming channel_priming) {
+        return create_channel_usage(channel_id, inst_name, channel_priming,
+                                    nullptr);
+      };
 
   return std::make_shared<BigtableRandomTwoLeastUsed>(
       DynamicChannelPool<BigtableStub>::Create(

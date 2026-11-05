@@ -14,7 +14,9 @@
 
 #include "google/cloud/bigtable/internal/bigtable_stub_factory.h"
 #include "google/cloud/bigtable/internal/bigtable_random_two_least_used_decorator.h"
+#include "google/cloud/bigtable/internal/defaults.h"
 #include "google/cloud/bigtable/internal/dynamic_channel_pool.h"
+#include "google/cloud/bigtable/internal/metrics.h"
 #include "google/cloud/bigtable/internal/operation_context.h"
 #include "google/cloud/bigtable/options.h"
 #include "google/cloud/bigtable/testing/mock_bigtable_stub.h"
@@ -28,6 +30,7 @@
 #include "google/cloud/testing_util/fake_completion_queue_impl.h"
 #include "google/cloud/testing_util/mock_grpc_authentication_strategy.h"
 #include "google/cloud/testing_util/opentelemetry_matchers.h"
+#include "google/cloud/testing_util/scoped_environment.h"
 #include "google/cloud/testing_util/scoped_log.h"
 #include "google/cloud/testing_util/setenv.h"
 #include "google/cloud/testing_util/status_matchers.h"
@@ -602,6 +605,156 @@ TEST(BigtableStubFactory, CreateBigtableAffinityStubs) {
       CreateBigtableAffinityStubs(instances, stub_creation_fn.AsStdFunction());
 
   EXPECT_THAT(stubs, testing::SizeIs(2));
+}
+
+TEST(BigtableStubFactory, SynchronousPrimingSetsFiniteDeadline) {
+  MockFactory factory;
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, PingAndWarm)
+      .WillOnce([](grpc::ClientContext& context, Options const&,
+                   google::bigtable::v2::PingAndWarmRequest const&,
+                   OperationContext&) {
+        auto const now = std::chrono::system_clock::now();
+        EXPECT_GT(context.deadline(), now);
+        EXPECT_LE(context.deadline(), now + std::chrono::milliseconds(500));
+        return google::bigtable::v2::PingAndWarmResponse{};
+      });
+
+  EXPECT_CALL(factory, Call)
+      .WillOnce([&](std::shared_ptr<grpc::Channel> const&) { return mock; });
+
+  auto auth = MakeStubFactoryMockAuth();
+  EXPECT_CALL(*auth, CreateChannel("localhost:1", _));
+
+  auto fake_cq_impl = std::make_shared<testing_util::FakeCompletionQueueImpl>();
+  auto refresh_state = std::make_shared<ConnectionRefreshState>(
+      fake_cq_impl, std::chrono::milliseconds(0), std::chrono::milliseconds(0));
+
+  auto stub = CreateBigtableStubRandomTwoLeastUsed(
+      std::move(auth), fake_cq_impl,
+      "projects/my-projects/instances/my-instance",
+      StubManager::Priming::kSynchronousPriming,
+      Options{}
+          .set<GrpcNumChannelsOption>(1)
+          .set<EndpointOption>("localhost:1")
+          .set<UnifiedCredentialsOption>(MakeInsecureCredentials())
+          .set<bigtable::experimental::DirectPathModeOption>(
+              bigtable::experimental::DirectPathMode::kEnabled)
+          .set<bigtable::experimental::DirectPathProbeTimeoutOption>(
+              std::chrono::milliseconds(250)),
+      factory.AsStdFunction(), std::move(refresh_state));
+  EXPECT_NE(stub, nullptr);
+  fake_cq_impl->SimulateCompletion(false);
+}
+
+TEST(BigtableStubFactory, SynchronousPrimingHonorsCancellationToken) {
+  auto constexpr kTestChannels = 4;
+  auto cancel_token = std::make_shared<PrimingCancellationToken>();
+
+  MockFactory factory;
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, PingAndWarm)
+      .Times(1)
+      .WillOnce([cancel_token](grpc::ClientContext&, Options const&,
+                               google::bigtable::v2::PingAndWarmRequest const&,
+                               OperationContext&) {
+        cancel_token->Cancel();
+        return internal::CancelledError("cancelled");
+      });
+
+  EXPECT_CALL(factory, Call)
+      .Times(1)
+      .WillOnce([&](std::shared_ptr<grpc::Channel> const&) { return mock; });
+
+  auto auth = MakeStubFactoryMockAuth();
+  EXPECT_CALL(*auth, CreateChannel("localhost:1", _)).Times(1);
+
+  auto fake_cq_impl = std::make_shared<testing_util::FakeCompletionQueueImpl>();
+  auto refresh_state = std::make_shared<ConnectionRefreshState>(
+      fake_cq_impl, std::chrono::milliseconds(0), std::chrono::milliseconds(0));
+
+  auto stub = CreateBigtableStubRandomTwoLeastUsed(
+      std::move(auth), fake_cq_impl,
+      "projects/my-projects/instances/my-instance",
+      StubManager::Priming::kSynchronousPriming,
+      Options{}
+          .set<GrpcNumChannelsOption>(kTestChannels)
+          .set<EndpointOption>("localhost:1")
+          .set<UnifiedCredentialsOption>(MakeInsecureCredentials())
+          .set<PrimingCancellationTokenOption>(cancel_token),
+      factory.AsStdFunction(), std::move(refresh_state));
+  EXPECT_NE(stub, nullptr);
+  fake_cq_impl->SimulateCompletion(false);
+}
+
+TEST(BigtableStubFactory, FallbackToCloudPathOverridesDirectPathEnvVars) {
+  testing_util::ScopedEnvironment cbt_dp("CBT_ENABLE_DIRECTPATH", "true");
+  testing_util::ScopedEnvironment gcp_dp("GOOGLE_CLOUD_ENABLE_DIRECT_PATH",
+                                         "bigtable");
+
+  MockFactory factory;
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, PingAndWarm)
+      .WillOnce(Return(google::bigtable::v2::PingAndWarmResponse{}));
+  EXPECT_CALL(*mock, MutateRow)
+      .WillOnce([](grpc::ClientContext& context, Options const&,
+                   google::bigtable::v2::MutateRowRequest const&,
+                   OperationContext&) {
+        ValidateMetadataFixture fixture;
+        auto headers = fixture.GetMetadata(context);
+        auto it = headers.find("bigtable-features");
+        EXPECT_NE(it, headers.end());
+        if (it == headers.end()) {
+          return internal::AbortedError("header not found");
+        }
+        auto decoded = internal::UrlsafeBase64Decode(it->second);
+        EXPECT_STATUS_OK(decoded);
+        if (!decoded) return internal::AbortedError("fail to decode");
+        google::bigtable::v2::FeatureFlags proto;
+        EXPECT_TRUE(proto.ParseFromArray(decoded->data(),
+                                         static_cast<int>(decoded->size())));
+        EXPECT_FALSE(proto.traffic_director_enabled());
+        EXPECT_FALSE(proto.direct_access_requested());
+        return internal::AbortedError("fail");
+      });
+
+  EXPECT_CALL(factory, Call)
+      .Times(2)
+      .WillRepeatedly(
+          [&](std::shared_ptr<grpc::Channel> const&) { return mock; });
+
+  auto auth = MakeStubFactoryMockAuth();
+  EXPECT_CALL(*auth, CreateChannel("localhost:1", _)).Times(2);
+  EXPECT_CALL(*auth, RequiresConfigureContext).WillOnce(Return(false));
+
+  auto const fallback_options =
+      Options{}
+          .set<GrpcNumChannelsOption>(1)
+          .set<EndpointOption>("localhost:1")
+          .set<UnifiedCredentialsOption>(MakeInsecureCredentials())
+          .set<DirectPathFallbackToCloudPathOption>(true);
+
+  auto fake_cq_impl = std::make_shared<testing_util::FakeCompletionQueueImpl>();
+  auto refresh_state = std::make_shared<ConnectionRefreshState>(
+      fake_cq_impl, std::chrono::milliseconds(0), std::chrono::milliseconds(0));
+
+  auto pool_stub = CreateBigtableStubRandomTwoLeastUsed(
+      auth, fake_cq_impl, "projects/my-projects/instances/my-instance",
+      StubManager::Priming::kSynchronousPriming, fallback_options,
+      factory.AsStdFunction(), std::move(refresh_state));
+  auto random_two =
+      std::dynamic_pointer_cast<BigtableRandomTwoLeastUsed>(pool_stub);
+  ASSERT_NE(random_two, nullptr);
+  EXPECT_EQ(random_two->pool()->transport_type(), TransportType::kCloudPath);
+
+  CompletionQueue cq(fake_cq_impl);
+  auto decorated_stub = CreateDecoratedStubs(
+      std::move(auth), cq, fallback_options, factory.AsStdFunction());
+  grpc::ClientContext context;
+  OperationContext op_ctx;
+  (void)decorated_stub->MutateRow(context, fallback_options, {}, op_ctx);
+
+  fake_cq_impl->SimulateCompletion(false);
 }
 
 }  // namespace

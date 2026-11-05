@@ -16,15 +16,18 @@
 #include "google/cloud/bigtable/data_connection.h"
 #include "google/cloud/bigtable/internal/bigtable_stub_factory.h"
 #include "google/cloud/bigtable/internal/data_connection_impl.h"
+#include "google/cloud/bigtable/internal/defaults.h"
 #include "google/cloud/bigtable/options.h"
 #include "google/cloud/common_options.h"
 #include "google/cloud/credentials.h"
 #include "google/cloud/grpc_options.h"
 #include "google/cloud/testing_util/opentelemetry_matchers.h"
 #include "google/cloud/testing_util/scoped_environment.h"
+#include "google/cloud/universe_domain_options.h"
 #include "rpc_retry_policy.h"
 #include <gmock/gmock.h>
 #include <chrono>
+#include <optional>
 
 namespace google {
 namespace cloud {
@@ -174,6 +177,86 @@ TEST(MakeDataConnection, DirectPathInitializationModeSpeculative) {
   EXPECT_NE(conn, nullptr);
 }
 #endif
+
+TEST(MakeDataConnection,
+     SpeculativeDirectPathFallbackDoesNotStarveSingleThreadCq) {
+  testing_util::ScopedEnvironment emulator("BIGTABLE_EMULATOR_HOST",
+                                           std::nullopt);
+  InstanceResource instance_a{Project("my-project"), "instance-a"};
+  auto conn = MakeDataConnection(
+      {instance_a},
+      TestOptions()
+          .set<EnableMetricsOption>(false)
+          .set<GrpcBackgroundThreadPoolSizeOption>(1)
+          .set<GrpcNumChannelsOption>(4)
+          .set<experimental::DirectPathModeOption>(
+              experimental::DirectPathMode::kEnabled)
+          .set<experimental::DirectPathProbeTimeoutOption>(ms(100))
+          .set<experimental::DirectPathDiagnosticsTimeoutOption>(ms(50))
+          .set<experimental::DirectPathInitializationModeOption>(
+              experimental::DirectPathInitializationMode::
+                  kAsynchronousSpeculative));
+  ASSERT_NE(conn, nullptr);
+  EXPECT_FALSE(bigtable::internal::IsDirectPath(conn->options()));
+  EXPECT_EQ(conn->options().get<EndpointOption>(), "localhost:1");
+}
+
+TEST(MakeDataConnection,
+     DirectPathEnvVarFallbackPreservesUniverseDomainAndDisablesDirectPath) {
+  testing_util::ScopedEnvironment emulator("BIGTABLE_EMULATOR_HOST",
+                                           std::nullopt);
+  testing_util::ScopedEnvironment cbt_dp("CBT_ENABLE_DIRECTPATH", "true");
+  testing_util::ScopedEnvironment gcp_dp("GOOGLE_CLOUD_ENABLE_DIRECT_PATH",
+                                         "bigtable");
+  InstanceResource instance_a{Project("my-project"), "instance-a"};
+
+  for (auto const mode :
+       {experimental::DirectPathInitializationMode::kBlocking,
+        experimental::DirectPathInitializationMode::kAsynchronousSpeculative}) {
+    auto conn = MakeDataConnection(
+        {instance_a},
+        Options{}
+            .set<google::cloud::internal::UniverseDomainOption>("ud.invalid")
+            .set<UnifiedCredentialsOption>(MakeInsecureCredentials())
+            .set<EnableMetricsOption>(false)
+            .set<MaxConnectionRefreshOption>(ms(0))
+            .set<GrpcNumChannelsOption>(1)
+            .set<experimental::DirectPathProbeTimeoutOption>(ms(100))
+            .set<experimental::DirectPathDiagnosticsTimeoutOption>(ms(50))
+            .set<experimental::DirectPathInitializationModeOption>(mode));
+    ASSERT_NE(conn, nullptr);
+    auto const opts = conn->options();
+    EXPECT_FALSE(bigtable::internal::IsDirectPath(opts));
+    EXPECT_EQ(opts.get<experimental::DirectPathModeOption>(),
+              experimental::DirectPathMode::kDisabled);
+    EXPECT_EQ(opts.get<EndpointOption>(), "bigtable.ud.invalid");
+    EXPECT_EQ(opts.get<bigtable_internal::DataEndpointOption>(),
+              "bigtable.ud.invalid");
+    EXPECT_EQ(opts.get<AuthorityOption>(), "bigtable.ud.invalid");
+  }
+}
+
+TEST(MakeDataConnection,
+     DirectPathFallbackPreservesCustomEndpointAndAuthority) {
+  testing_util::ScopedEnvironment emulator("BIGTABLE_EMULATOR_HOST",
+                                           std::nullopt);
+  testing_util::ScopedEnvironment cbt_dp("CBT_ENABLE_DIRECTPATH", "true");
+  InstanceResource instance_a{Project("my-project"), "instance-a"};
+
+  auto conn = MakeDataConnection(
+      {instance_a},
+      TestOptions()
+          .set<EnableMetricsOption>(false)
+          .set<EndpointOption>("localhost:1")
+          .set<AuthorityOption>("custom.authority.local")
+          .set<experimental::DirectPathProbeTimeoutOption>(ms(100))
+          .set<experimental::DirectPathDiagnosticsTimeoutOption>(ms(50)));
+  ASSERT_NE(conn, nullptr);
+  auto const opts = conn->options();
+  EXPECT_FALSE(bigtable::internal::IsDirectPath(opts));
+  EXPECT_EQ(opts.get<EndpointOption>(), "localhost:1");
+  EXPECT_EQ(opts.get<AuthorityOption>(), "custom.authority.local");
+}
 
 }  // namespace
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END

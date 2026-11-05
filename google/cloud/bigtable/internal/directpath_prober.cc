@@ -25,12 +25,14 @@
 #include "google/cloud/grpc_options.h"
 #include "google/cloud/internal/make_status.h"
 #include "absl/strings/match.h"
-#include "absl/strings/numbers.h"
 #include "absl/strings/str_split.h"
 #include "google/bigtable/v2/bigtable.grpc.pb.h"
 #include <grpcpp/grpcpp.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <string_view>
 #include <vector>
 
@@ -72,27 +74,178 @@ bool IsPeerAuthenticated(grpc::ClientContext const& context) {
   return auth_ctx->IsPeerAuthenticated();
 }
 
+bool ParsePort(std::string_view port_str) {
+  if (port_str.empty() || port_str.size() > 5) return false;
+  std::uint32_t port = 0;
+  for (char const c : port_str) {
+    if (c < '0' || c > '9') return false;
+    port = port * 10 + static_cast<std::uint32_t>(c - '0');
+  }
+  return port <= 65535U;
+}
+
+bool ParseIpv4(std::string_view ip_str, std::array<std::uint8_t, 4>& out) {
+  if (ip_str.empty()) return false;
+  std::vector<std::string_view> const octets = absl::StrSplit(ip_str, '.');
+  if (octets.size() != 4) return false;
+  for (std::size_t i = 0; i < 4; ++i) {
+    std::string_view const octet = octets[i];
+    if (octet.empty() || octet.size() > 3) return false;
+    if (octet.size() > 1 && octet[0] == '0') return false;
+    std::uint32_t val = 0;
+    for (char const c : octet) {
+      if (c < '0' || c > '9') return false;
+      val = val * 10 + static_cast<std::uint32_t>(c - '0');
+    }
+    if (val > 255U) return false;
+    out[i] = static_cast<std::uint8_t>(val);
+  }
+  return true;
+}
+
+bool ParseIpv6Hextets(std::string_view part, bool allow_ipv4_tail,
+                      std::vector<std::uint16_t>& hextets) {
+  if (part.empty()) return true;
+  std::vector<std::string_view> const groups = absl::StrSplit(part, ':');
+  for (std::size_t i = 0; i < groups.size(); ++i) {
+    std::string_view const group = groups[i];
+    if (group.empty()) return false;
+    if (allow_ipv4_tail && i + 1 == groups.size() &&
+        group.find('.') != std::string_view::npos) {
+      std::array<std::uint8_t, 4> v4{};
+      if (!ParseIpv4(group, v4)) return false;
+      hextets.push_back(static_cast<std::uint16_t>(
+          (static_cast<std::uint16_t>(v4[0]) << 8U) | v4[1]));
+      hextets.push_back(static_cast<std::uint16_t>(
+          (static_cast<std::uint16_t>(v4[2]) << 8U) | v4[3]));
+      continue;
+    }
+    if (group.size() > 4) return false;
+    std::uint16_t val = 0;
+    for (char const c : group) {
+      std::uint16_t digit = 0;
+      if (c >= '0' && c <= '9') {
+        digit = static_cast<std::uint16_t>(c - '0');
+      } else if (c >= 'a' && c <= 'f') {
+        digit = static_cast<std::uint16_t>(10 + (c - 'a'));
+      } else if (c >= 'A' && c <= 'F') {
+        digit = static_cast<std::uint16_t>(10 + (c - 'A'));
+      } else {
+        return false;
+      }
+      val = static_cast<std::uint16_t>((val << 4U) | digit);
+    }
+    hextets.push_back(val);
+  }
+  return true;
+}
+
+bool ParseIpv6(std::string_view ip_str, std::array<std::uint8_t, 16>& out) {
+  out.fill(0);
+  auto const pct = ip_str.find('%');
+  if (pct != std::string_view::npos) {
+    if (pct + 1 == ip_str.size()) return false;
+    ip_str = ip_str.substr(0, pct);
+  }
+  if (ip_str.empty()) return false;
+
+  auto const double_colon = ip_str.find("::");
+  if (double_colon == std::string_view::npos) {
+    std::vector<std::uint16_t> hextets;
+    hextets.reserve(8);
+    if (!ParseIpv6Hextets(ip_str, /*allow_ipv4_tail=*/true, hextets) ||
+        hextets.size() != 8) {
+      return false;
+    }
+    for (std::size_t i = 0; i < 8; ++i) {
+      out[2 * i] = static_cast<std::uint8_t>(hextets[i] >> 8U);
+      out[2 * i + 1] = static_cast<std::uint8_t>(hextets[i] & 0xFFU);
+    }
+    return true;
+  }
+
+  if (ip_str.find("::", double_colon + 1) != std::string_view::npos) {
+    return false;
+  }
+  std::string_view const head_str = ip_str.substr(0, double_colon);
+  std::string_view const tail_str = ip_str.substr(double_colon + 2);
+  std::vector<std::uint16_t> head;
+  std::vector<std::uint16_t> tail;
+  if (!ParseIpv6Hextets(head_str, /*allow_ipv4_tail=*/false, head) ||
+      !ParseIpv6Hextets(tail_str, /*allow_ipv4_tail=*/true, tail) ||
+      head.size() + tail.size() >= 8) {
+    return false;
+  }
+  for (std::size_t i = 0; i < head.size(); ++i) {
+    out[2 * i] = static_cast<std::uint8_t>(head[i] >> 8U);
+    out[2 * i + 1] = static_cast<std::uint8_t>(head[i] & 0xFFU);
+  }
+  std::size_t const tail_offset = 16 - 2 * tail.size();
+  for (std::size_t i = 0; i < tail.size(); ++i) {
+    out[tail_offset + 2 * i] = static_cast<std::uint8_t>(tail[i] >> 8U);
+    out[tail_offset + 2 * i + 1] = static_cast<std::uint8_t>(tail[i] & 0xFFU);
+  }
+  return true;
+}
+
+// DirectPath IPv4 addresses fall within 34.126.0.0/18 (0x227E0000/18).
+bool IsDirectPathIpv4Bytes(std::array<std::uint8_t, 4> const& ipv4) {
+  std::uint32_t const addr = (static_cast<std::uint32_t>(ipv4[0]) << 24U) |
+                             (static_cast<std::uint32_t>(ipv4[1]) << 16U) |
+                             (static_cast<std::uint32_t>(ipv4[2]) << 8U) |
+                             static_cast<std::uint32_t>(ipv4[3]);
+  return (addr & 0xFFFFC000U) == 0x227E0000U;
+}
+
+// DirectPath IPv6 addresses fall within 2001:4860:8040::/42, or IPv4-mapped
+// IPv6 ::ffff:34.126.0.0/114 (::ffff:0:0/96 wrapping 34.126.0.0/18).
+bool IsDirectPathIpv6Bytes(std::array<std::uint8_t, 16> const& ipv6) {
+  if (ipv6[0] == 0x20 && ipv6[1] == 0x01 && ipv6[2] == 0x48 &&
+      ipv6[3] == 0x60 && ipv6[4] == 0x80 && (ipv6[5] & 0xC0U) == 0x40U) {
+    return true;
+  }
+  bool const is_v4_mapped =
+      std::all_of(ipv6.begin(), ipv6.begin() + 10,
+                  [](std::uint8_t b) { return b == 0; }) &&
+      ipv6[10] == 0xFF && ipv6[11] == 0xFF;
+  if (is_v4_mapped) {
+    return IsDirectPathIpv4Bytes({ipv6[12], ipv6[13], ipv6[14], ipv6[15]});
+  }
+  return false;
+}
+
 // Returns true if the peer IP address belongs to a DirectPath subnet.
-// IPv6 connections over DirectPath use DirectPath IPv6 subnets, while IPv4
-// connections route through the DirectPath 34.126.0.0/18 CIDR block.
+// IPv6 connections over DirectPath use the 2001:4860:8040::/42 CIDR block,
+// while IPv4 connections route through the 34.126.0.0/18 CIDR block.
 bool IsDirectPathIp(std::string_view peer_address) {
-  if (absl::StartsWith(peer_address, "ipv6:")) return true;
-  if (absl::StartsWith(peer_address, "ipv4:")) {
-    std::string_view const ip_port = peer_address.substr(5);
-    std::vector<std::string_view> const parts = absl::StrSplit(ip_port, ':');
-    if (!parts.empty()) {
-      std::vector<std::string_view> const octets =
-          absl::StrSplit(parts[0], '.');
-      // DirectPath IPv4 addresses fall within the 34.126.0.0/18 subnet range
-      // (34.126.0.0 to 34.126.63.255), where the first two octets are 34.126
-      // and the third octet is between 0 and 63 inclusive.
-      if (octets.size() == 4 && octets[0] == "34" && octets[1] == "126") {
-        int third = 0;
-        if (absl::SimpleAtoi(octets[2], &third) && third >= 0 && third <= 63) {
-          return true;
+  if (absl::StartsWith(peer_address, "ipv6:")) {
+    std::string_view const rest = peer_address.substr(5);
+    std::string_view ip_str;
+    if (absl::StartsWith(rest, "[")) {
+      auto const close = rest.find(']');
+      if (close == std::string_view::npos) return false;
+      if (close + 1 < rest.size()) {
+        if (rest[close + 1] != ':' || !ParsePort(rest.substr(close + 2))) {
+          return false;
         }
       }
+      ip_str = rest.substr(1, close - 1);
+    } else {
+      ip_str = rest;
     }
+    std::array<std::uint8_t, 16> ipv6{};
+    return ParseIpv6(ip_str, ipv6) && IsDirectPathIpv6Bytes(ipv6);
+  }
+  if (absl::StartsWith(peer_address, "ipv4:")) {
+    std::string_view const rest = peer_address.substr(5);
+    auto const colon = rest.find(':');
+    std::string_view ip_str = rest;
+    if (colon != std::string_view::npos) {
+      if (!ParsePort(rest.substr(colon + 1))) return false;
+      ip_str = rest.substr(0, colon);
+    }
+    std::array<std::uint8_t, 4> ipv4{};
+    return ParseIpv4(ip_str, ipv4) && IsDirectPathIpv4Bytes(ipv4);
   }
   return false;
 }
@@ -132,6 +285,7 @@ StatusOr<DirectPathProbeResult> DirectPathProber::Probe(
     }
 
     Options probe_options = options;
+    probe_options.unset<DirectPathFallbackToCloudPathOption>();
     probe_options.set<::google::cloud::bigtable_internal::DataEndpointOption>(
         bigtable::internal::DefaultDirectPathDataEndpoint());
     probe_options.set<EndpointOption>(
