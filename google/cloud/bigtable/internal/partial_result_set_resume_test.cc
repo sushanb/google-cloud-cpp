@@ -19,13 +19,17 @@
 #include "google/cloud/bigtable/retry_policy.h"
 #include "google/cloud/bigtable/testing/mock_partial_result_set_reader.h"
 #include "google/cloud/testing_util/is_proto_equal.h"
+#include "google/cloud/testing_util/mock_backoff_policy.h"
 #include "google/cloud/testing_util/status_matchers.h"
 #include "absl/strings/substitute.h"
 #include <google/protobuf/text_format.h>
 #include <gmock/gmock.h>
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <utility>
 
 namespace google {
 namespace cloud {
@@ -451,6 +455,76 @@ TEST(PartialResultSetResume, ResumptionMidway) {
 
   auto row = (*reader)->NextRow();
   EXPECT_THAT(row, IsValidAndEquals(bigtable::QueryRow{}));
+}
+
+class TrackingPartialResultSetReader : public MockPartialResultSetReader {
+ public:
+  explicit TrackingPartialResultSetReader(int* live_readers)
+      : live_readers_(live_readers) {
+    ++(*live_readers_);
+  }
+  ~TrackingPartialResultSetReader() override { --(*live_readers_); }
+
+ private:
+  int* live_readers_;
+};
+
+TEST(PartialResultSetResume,
+     ReleasesPreviousReaderBeforeBackoffAndRetryFactory) {
+  google::bigtable::v2::PartialResultSet r12;
+  MakeResponse(r12, {"value-1", "value-2"}, "resume-after-2", true);
+
+  int live_readers = 0;
+  MockFactory mock_factory;
+  EXPECT_CALL(mock_factory, MakeReader)
+      .WillOnce([&](std::string const& token) {
+        EXPECT_TRUE(token.empty());
+        EXPECT_EQ(live_readers, 0);
+        auto mock =
+            std::make_unique<TrackingPartialResultSetReader>(&live_readers);
+        EXPECT_CALL(*mock, Read(_, _))
+            .WillOnce(ReadAction(r12, false))
+            .WillOnce(Return(false));
+        EXPECT_CALL(*mock, Finish())
+            .WillOnce(Return(Status(StatusCode::kUnavailable, "Try again")));
+        return mock;
+      })
+      .WillOnce([&](std::string const& token) {
+        EXPECT_EQ("resume-after-2", token);
+        // The previous reader must already be destroyed before creating the
+        // replacement stream.
+        EXPECT_EQ(live_readers, 0);
+        auto mock =
+            std::make_unique<TrackingPartialResultSetReader>(&live_readers);
+        EXPECT_CALL(*mock, Read(_, _)).WillOnce(Return(false));
+        EXPECT_CALL(*mock, Finish()).WillOnce(Return(Status{}));
+        return mock;
+      });
+
+  auto backoff = std::make_unique<testing_util::MockBackoffPolicy>();
+  EXPECT_CALL(*backoff, OnCompletion).WillOnce([&live_readers] {
+    EXPECT_EQ(live_readers, 0);
+    return std::chrono::milliseconds(0);
+  });
+
+  auto reader = std::make_unique<PartialResultSetResume>(
+      [&mock_factory](std::string const& token) {
+        return mock_factory.MakeReader(token);
+      },
+      Idempotency::kIdempotent,
+      bigtable::DataLimitedErrorCountRetryPolicy(/*maximum_failures=*/2)
+          .clone(),
+      std::move(backoff));
+
+  google::bigtable::v2::PartialResultSet raw_result;
+  auto result = UnownedPartialResultSet::FromPartialResultSet(raw_result);
+  ASSERT_TRUE(reader->Read("", result));
+  EXPECT_THAT(raw_result, IsProtoEqual(r12));
+  ASSERT_FALSE(reader->Read("resume-after-2", result));
+  EXPECT_STATUS_OK(reader->Finish());
+
+  reader.reset();
+  EXPECT_EQ(live_readers, 0);
 }
 
 }  // namespace

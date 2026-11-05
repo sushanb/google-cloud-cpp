@@ -17,6 +17,7 @@
 #include "google/cloud/async_streaming_read_write_rpc.h"
 #include "google/cloud/internal/async_streaming_read_rpc.h"
 #include "google/cloud/internal/streaming_read_rpc.h"
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -28,26 +29,58 @@ namespace bigtable_internal {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace {
 
+class OneShotRelease {
+ public:
+  explicit OneShotRelease(std::function<void()> release_stub)
+      : release_stub_(std::move(release_stub)) {}
+
+  OneShotRelease(OneShotRelease const&) = delete;
+  OneShotRelease& operator=(OneShotRelease const&) = delete;
+
+  ~OneShotRelease() { Release(); }
+
+  void Release() {
+    if (released_.exchange(true, std::memory_order_acq_rel)) return;
+    if (release_stub_) release_stub_();
+  }
+
+ private:
+  std::function<void()> release_stub_;
+  std::atomic<bool> released_{false};
+};
+
 template <typename T>
 class StreamingReadRpcTracking : public internal::StreamingReadRpc<T> {
  public:
   StreamingReadRpcTracking(std::unique_ptr<internal::StreamingReadRpc<T>> child,
-                           std::function<void()> on_destruction)
-      : child_(std::move(child)), on_destruction_(std::move(on_destruction)) {}
+                           std::function<void()> release_stub)
+      : child_(std::move(child)), release_stub_(std::move(release_stub)) {}
 
-  ~StreamingReadRpcTracking() override { on_destruction_(); }
+  ~StreamingReadRpcTracking() override {
+    child_.reset();
+    ReleaseOnce();
+  }
 
   void Cancel() override { child_->Cancel(); }
   std::optional<Status> Read(T* response) override {
-    return child_->Read(response);
+    auto status = child_->Read(response);
+    if (status.has_value()) ReleaseOnce();
+    return status;
   }
   RpcMetadata GetRequestMetadata() const override {
     return child_->GetRequestMetadata();
   }
 
  private:
+  void ReleaseOnce() {
+    if (released_) return;
+    released_ = true;
+    if (release_stub_) release_stub_();
+  }
+
   std::unique_ptr<internal::StreamingReadRpc<T>> child_;
-  std::function<void()> on_destruction_;
+  std::function<void()> release_stub_;
+  bool released_ = false;
 };
 
 template <typename T>
@@ -56,22 +89,37 @@ class AsyncStreamingReadRpcTracking
  public:
   AsyncStreamingReadRpcTracking(
       std::unique_ptr<internal::AsyncStreamingReadRpc<T>> child,
-      std::function<void()> on_destruction)
-      : child_(std::move(child)), on_destruction_(std::move(on_destruction)) {}
+      std::function<void()> release_stub)
+      : child_(std::move(child)),
+        release_(std::make_shared<OneShotRelease>(std::move(release_stub))) {}
 
-  ~AsyncStreamingReadRpcTracking() override { on_destruction_(); }
+  ~AsyncStreamingReadRpcTracking() override {
+    child_.reset();
+    release_->Release();
+  }
 
   void Cancel() override { child_->Cancel(); }
   future<bool> Start() override { return child_->Start(); }
   future<std::optional<T>> Read() override { return child_->Read(); }
-  future<Status> Finish() override { return child_->Finish(); }
+  future<Status> Finish() override {
+    auto finish = child_->Finish();
+    if (!finish.valid()) {
+      release_->Release();
+      return finish;
+    }
+    auto release = release_;
+    return finish.then([release = std::move(release)](future<Status> f) {
+      release->Release();
+      return f.get();
+    });
+  }
   RpcMetadata GetRequestMetadata() const override {
     return child_->GetRequestMetadata();
   }
 
  private:
   std::unique_ptr<internal::AsyncStreamingReadRpc<T>> child_;
-  std::function<void()> on_destruction_;
+  std::shared_ptr<OneShotRelease> release_;
 };
 
 template <typename Request, typename Response>
@@ -80,10 +128,14 @@ class AsyncStreamingReadWriteRpcTracking
  public:
   AsyncStreamingReadWriteRpcTracking(
       std::unique_ptr<AsyncStreamingReadWriteRpc<Request, Response>> child,
-      std::function<void()> on_destruction)
-      : child_(std::move(child)), on_destruction_(std::move(on_destruction)) {}
+      std::function<void()> release_stub)
+      : child_(std::move(child)),
+        release_(std::make_shared<OneShotRelease>(std::move(release_stub))) {}
 
-  ~AsyncStreamingReadWriteRpcTracking() override { on_destruction_(); }
+  ~AsyncStreamingReadWriteRpcTracking() override {
+    child_.reset();
+    release_->Release();
+  }
 
   void Cancel() override { child_->Cancel(); }
   future<bool> Start() override { return child_->Start(); }
@@ -95,14 +147,25 @@ class AsyncStreamingReadWriteRpcTracking
     return child_->Write(r, std::move(o));
   }
   future<bool> WritesDone() override { return child_->WritesDone(); }
-  future<Status> Finish() override { return child_->Finish(); }
+  future<Status> Finish() override {
+    auto finish = child_->Finish();
+    if (!finish.valid()) {
+      release_->Release();
+      return finish;
+    }
+    auto release = release_;
+    return finish.then([release = std::move(release)](future<Status> f) {
+      release->Release();
+      return f.get();
+    });
+  }
   RpcMetadata GetRequestMetadata() const override {
     return child_->GetRequestMetadata();
   }
 
  private:
   std::unique_ptr<AsyncStreamingReadWriteRpc<Request, Response>> child_;
-  std::function<void()> on_destruction_;
+  std::shared_ptr<OneShotRelease> release_;
 };
 
 template <typename Response>

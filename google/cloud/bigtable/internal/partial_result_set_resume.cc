@@ -48,6 +48,7 @@ bool PartialResultSetResume::Read(
       if (retry_policy_->IsExhausted()) break;
       return false;
     }
+    reader_.reset();
     std::this_thread::sleep_for(backoff_policy_->OnCompletion());
     resumption = true;
     last_status_.reset();

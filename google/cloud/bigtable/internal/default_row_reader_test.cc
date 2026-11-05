@@ -1576,6 +1576,135 @@ TEST_F(DefaultRowReaderTest, RetryInfoIgnored) {
               ElementsAre(StatusIs(StatusCode::kResourceExhausted)));
 }
 
+class TrackingReadRowsStream : public MockReadRowsStream {
+ public:
+  explicit TrackingReadRowsStream(int* live_streams)
+      : live_streams_(live_streams) {
+    ++(*live_streams_);
+  }
+  ~TrackingReadRowsStream() override { --(*live_streams_); }
+
+ private:
+  int* live_streams_;
+};
+
+TEST_F(DefaultRowReaderTest, ReleasesStreamAtEofBeforeReaderDestruction) {
+  int live_streams = 0;
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, ReadRows)
+      .WillOnce([&live_streams](auto, auto const&, auto const&, auto const&) {
+        auto stream = std::make_unique<TrackingReadRowsStream>(&live_streams);
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([](google::bigtable::v2::ReadRowsResponse* r) {
+              *r = MakeRow("r1");
+              return std::nullopt;
+            })
+            .WillOnce(Return(Status{}));
+        return stream;
+      });
+
+  internal::OptionsSpan span(TestOptions(/*expected_streams=*/1));
+
+  auto impl = std::make_shared<DefaultRowReader>(
+      mock, kAppProfile, kTableName, bigtable::RowSet(),
+      bigtable::RowReader::NO_ROWS_LIMIT, bigtable::Filter::PassAllFilter(),
+      false, retry_.clone(), backoff_.clone(), false,
+      std::make_shared<OperationContext>());
+  auto reader = bigtable_internal::MakeRowReader(std::move(impl));
+  EXPECT_THAT(StatusOrRowKeys(reader), ElementsAre(IsOkAndHolds("r1")));
+  // The underlying stream must be destroyed immediately at EOF rather than
+  // pinned until `reader` goes out of scope.
+  EXPECT_EQ(live_streams, 0);
+}
+
+TEST_F(DefaultRowReaderTest, ReleasesStreamOnCancelBeforeReaderDestruction) {
+  int live_streams = 0;
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, ReadRows)
+      .WillOnce([&live_streams](auto, auto const&, auto const&, auto const&) {
+        auto stream = std::make_unique<TrackingReadRowsStream>(&live_streams);
+        ::testing::InSequence s;
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([](google::bigtable::v2::ReadRowsResponse* r) {
+              *r = MakeRow("r1");
+              return std::nullopt;
+            });
+        EXPECT_CALL(*stream, Cancel);
+        EXPECT_CALL(*stream, Read).WillOnce(Return(Status{}));
+        return stream;
+      });
+
+  internal::OptionsSpan span(TestOptions(/*expected_streams=*/1));
+
+  auto impl = std::make_shared<DefaultRowReader>(
+      mock, kAppProfile, kTableName, bigtable::RowSet(),
+      bigtable::RowReader::NO_ROWS_LIMIT, bigtable::Filter::PassAllFilter(),
+      false, retry_.clone(), backoff_.clone(), false,
+      std::make_shared<OperationContext>());
+  auto reader = bigtable_internal::MakeRowReader(std::move(impl));
+
+  auto it = reader.begin();
+  ASSERT_NE(it, reader.end());
+  ASSERT_STATUS_OK(*it);
+  EXPECT_EQ(live_streams, 1);
+
+  reader.Cancel();
+  EXPECT_EQ(live_streams, 0);
+}
+
+TEST_F(DefaultRowReaderTest, ReleasesStreamBeforeRetryBackoffAndNextRequest) {
+  int live_streams = 0;
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, ReadRows)
+      .WillOnce([&live_streams](auto, auto const&, auto const&, auto const&) {
+        EXPECT_EQ(live_streams, 0);
+        auto stream = std::make_unique<TrackingReadRowsStream>(&live_streams);
+        EXPECT_CALL(*stream, Read)
+            .WillOnce(Return(Status(StatusCode::kUnavailable, "try again")));
+        return stream;
+      })
+      .WillOnce([&live_streams](auto, auto const&, auto const&, auto const&) {
+        EXPECT_EQ(live_streams, 0);
+        auto stream = std::make_unique<TrackingReadRowsStream>(&live_streams);
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([](google::bigtable::v2::ReadRowsResponse* r) {
+              *r = MalformedResponse();
+              return std::nullopt;
+            });
+        return stream;
+      })
+      .WillOnce([&live_streams](auto, auto const&, auto const&, auto const&) {
+        EXPECT_EQ(live_streams, 0);
+        auto stream = std::make_unique<TrackingReadRowsStream>(&live_streams);
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([](google::bigtable::v2::ReadRowsResponse* r) {
+              *r = MakeRow("r1");
+              return std::nullopt;
+            })
+            .WillOnce(Return(Status{}));
+        return stream;
+      });
+
+  MockFunction<void(ms)> mock_sleeper;
+  EXPECT_CALL(mock_sleeper, Call).Times(2).WillRepeatedly([&live_streams](ms) {
+    EXPECT_EQ(live_streams, 0);
+  });
+
+  auto retry = std::make_unique<MockDataRetryPolicy>();
+  EXPECT_CALL(*retry, OnFailure).Times(2).WillRepeatedly(Return(true));
+
+  internal::OptionsSpan span(TestOptions(/*expected_streams=*/3));
+
+  auto impl = std::make_shared<DefaultRowReader>(
+      mock, kAppProfile, kTableName, bigtable::RowSet(),
+      bigtable::RowReader::NO_ROWS_LIMIT, bigtable::Filter::PassAllFilter(),
+      false, std::move(retry), backoff_.clone(), false,
+      std::make_shared<OperationContext>(), mock_sleeper.AsStdFunction());
+  auto reader = bigtable_internal::MakeRowReader(std::move(impl));
+  EXPECT_THAT(StatusOrRowKeys(reader), ElementsAre(IsOkAndHolds("r1")));
+  EXPECT_EQ(live_streams, 0);
+}
+
 }  // namespace
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
 }  // namespace bigtable_internal

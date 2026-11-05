@@ -18,6 +18,7 @@
 #include "google/cloud/internal/async_streaming_read_rpc.h"
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace google {
 namespace cloud {
@@ -90,7 +91,11 @@ class AsyncStreamingReadImpl
   void Finish() {
     auto self = this->shared_from_this();
     auto finish = stream_->Finish();
-    finish.then([self](future<Status> f) { self->on_finish_(f.get()); });
+    finish.then([self](future<Status> f) {
+      auto status = f.get();
+      self->stream_.reset();
+      self->on_finish_(std::move(status));
+    });
   }
 
   std::unique_ptr<internal::AsyncStreamingReadRpc<Response>> stream_;
