@@ -115,7 +115,7 @@ class OperationLatency : public TableSchemaMetric {
   TableDataLabels data_labels_;
   opentelemetry::nostd::shared_ptr<opentelemetry::metrics::Histogram<double>>
       operation_latencies_;
-  OperationContext::Clock::time_point operation_start_;
+  std::optional<OperationContext::Clock::time_point> operation_start_;
 };
 
 class AttemptLatency : public TableSchemaMetric {
@@ -263,7 +263,7 @@ class ApplicationBlockingLatency : public TableSchemaMetric {
   TableDataLabels data_labels_;
   opentelemetry::nostd::shared_ptr<opentelemetry::metrics::Histogram<double>>
       application_blocking_latencies_;
-  OperationContext::Clock::time_point element_delivery_time_;
+  std::optional<OperationContext::Clock::time_point> element_delivery_time_;
   std::vector<LatencyDuration> pending_latencies_;
 };
 

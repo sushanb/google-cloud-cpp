@@ -959,9 +959,16 @@ class QueryPlanRefreshingPartialResultSource
             std::move(query_plan_refresh_retry_policy), std::move(options)));
   }
 
-  ~QueryPlanRefreshingPartialResultSource() override = default;
+  ~QueryPlanRefreshingPartialResultSource() override {
+    source_.reset();
+    if (operation_started_) {
+      internal::OptionsSpan span(options_);
+      operation_context_->OnDone(last_status_);
+    }
+  }
 
   StatusOr<bigtable::QueryRow> NextRow() override {
+    operation_started_ = true;
     StatusOr<bigtable::QueryRow> row;
     do {
       if (!query_plan_valid_) source_ = std::nullopt;
@@ -969,6 +976,7 @@ class QueryPlanRefreshingPartialResultSource
         UpdateSource();
       }
       row = (**source_)->NextRow();
+      last_status_ = row.status();
       if (ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(row.status())) {
         query_plan_valid_ = false;
         query_plan_->Invalidate(row.status(),
@@ -1017,7 +1025,10 @@ class QueryPlanRefreshingPartialResultSource
             options_->get<bigtable::DataRetryPolicyOption>()->clone(),
             options_->get<bigtable::DataBackoffPolicyOption>()->clone(),
             operation_context_);
-        if (source_->ok()) return;
+        if (source_->ok()) {
+          last_status_ = Status{};
+          return;
+        }
 
         last_status_ = source_->status();
         if (ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(
@@ -1062,6 +1073,7 @@ class QueryPlanRefreshingPartialResultSource
       source_;
   StatusOr<google::bigtable::v2::PrepareQueryResponse> query_plan_data_;
   bool query_plan_valid_ = false;
+  bool operation_started_ = false;
   Status last_status_;
 };
 
@@ -1108,7 +1120,8 @@ bigtable::RowStream DataConnectionImpl::ExecuteQuery(
         retry_policy_prototype->clone(), backoff_policy_prototype->clone());
 
     return PartialResultSetSource::Create(std::move(metadata),
-                                          operation_context, std::move(resume));
+                                          operation_context, std::move(resume),
+                                          /*invoke_on_done=*/false);
   };
 
   auto operation_context = operation_context_factory_->ExecuteQuery(
