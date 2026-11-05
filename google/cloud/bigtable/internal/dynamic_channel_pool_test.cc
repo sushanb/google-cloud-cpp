@@ -79,7 +79,18 @@ class DynamicChannelPoolTestWrapper {
   }
 
   void SetRemoveChannelPollTimer(promise<void>& p) {
+    pool_->remove_channel_poll_scheduled_ = true;
     pool_->remove_channel_poll_timer_ = p.get_future();
+  }
+
+  std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> const& channels()
+      const {
+    return pool_->channels_;
+  }
+
+  std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> const&
+  draining_channels() const {
+    return pool_->draining_channels_;
   }
 
   std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> const&
@@ -720,8 +731,8 @@ TEST_F(DynamicChannelPoolTest, RemoveChannelsSomeChannelsDrained) {
 
   wrapper.RemoveChannels();
   ASSERT_THAT(d.size(), Eq(2));
-  EXPECT_THAT(d[0]->instant_outstanding_rpcs(), testing_util::IsOkAndHolds(2));
-  EXPECT_THAT(d[1]->instant_outstanding_rpcs(), testing_util::IsOkAndHolds(1));
+  EXPECT_THAT(d[0]->instant_outstanding_rpcs(), testing_util::IsOkAndHolds(1));
+  EXPECT_THAT(d[1]->instant_outstanding_rpcs(), testing_util::IsOkAndHolds(2));
 
   fake_cq_impl_->SimulateCompletion(false);
 }
@@ -1257,6 +1268,223 @@ TEST_F(DynamicChannelPoolTest, TransportType) {
       stub_factory_fn.AsStdFunction(), sizing_policy,
       TransportType::kDirectPath);
   EXPECT_THAT(pool_direct->transport_type(), Eq(TransportType::kDirectPath));
+}
+
+TEST_F(DynamicChannelPoolTest,
+       RemoveChannelsMultiPollWhenRpcOutlivesFirstTimer) {
+  auto instance_name =
+      bigtable::InstanceResource(Project("my-project"), "my-instance")
+          .FullName();
+  auto refresh_state = std::make_shared<ConnectionRefreshState>(
+      fake_cq_impl_, std::chrono::milliseconds(1),
+      std::chrono::milliseconds(10));
+  MockFunction<StatusOr<std::shared_ptr<ChannelUsage<BigtableStub>>>(
+      std::uint32_t, std::string const&, StubManager::Priming)>
+      stub_factory_fn;
+  EXPECT_CALL(stub_factory_fn, Call).Times(0);
+
+  std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> channels;
+  channels.push_back(std::make_shared<ChannelUsage<BigtableStub>>(
+      std::make_shared<MockBigtableStub>(), 1));
+  channels.push_back(std::make_shared<ChannelUsage<BigtableStub>>(
+      std::make_shared<MockBigtableStub>(), 1));
+  channels.push_back(std::make_shared<ChannelUsage<BigtableStub>>(
+      std::make_shared<MockBigtableStub>(), 1));
+
+  DynamicChannelPoolSizingPolicy sizing_policy;
+  sizing_policy.minimum_channel_pool_size = 2;
+  sizing_policy.maximum_channel_pool_size = 4;
+  sizing_policy.minimum_average_outstanding_rpcs_per_channel = 5;
+
+  auto pool = DynamicChannelPool<BigtableStub>::Create(
+      instance_name, CompletionQueue(fake_cq_impl_), std::move(channels),
+      refresh_state, stub_factory_fn.AsStdFunction(), sizing_policy,
+      TransportType::kCloudPath);
+  DynamicChannelPoolTestWrapper wrapper(pool);
+
+  // Expire the initial decrease cooldown timer.
+  ASSERT_THAT(fake_cq_impl_->size(), Eq(1U));
+  fake_cq_impl_->SimulateCompletion(true);
+  ASSERT_THAT(fake_cq_impl_->size(), Eq(0U));
+
+  // Trigger scale-down of one channel that still has 1 active RPC.
+  (void)pool->GetChannelRandomTwoLeastUsed();
+  EXPECT_THAT(pool->size(), Eq(2U));
+  ASSERT_THAT(wrapper.draining_channels().size(), Eq(1U));
+  std::weak_ptr<ChannelUsage<BigtableStub>> weak_draining =
+      wrapper.draining_channels()[0];
+  EXPECT_THAT(wrapper.draining_channels()[0]->outstanding_rpcs(), Eq(1));
+  ASSERT_THAT(fake_cq_impl_->size(), Eq(2U));
+
+  // First poll timer fires while the RPC is still in flight; poll timer
+  // re-arms.
+  fake_cq_impl_->SimulateCompletion(true);
+  ASSERT_THAT(wrapper.draining_channels().size(), Eq(1U));
+  EXPECT_NE(weak_draining.lock(), nullptr);
+  ASSERT_THAT(fake_cq_impl_->size(), Eq(1U));
+
+  // Second poll timer fires while the RPC is still in flight; poll timer
+  // re-arms.
+  fake_cq_impl_->SimulateCompletion(true);
+  ASSERT_THAT(wrapper.draining_channels().size(), Eq(1U));
+  EXPECT_NE(weak_draining.lock(), nullptr);
+  ASSERT_THAT(fake_cq_impl_->size(), Eq(1U));
+
+  // Complete the in-flight RPC; the next poll timer removes the channel.
+  wrapper.draining_channels()[0]->ReleaseStub();
+  EXPECT_THAT(wrapper.draining_channels()[0]->outstanding_rpcs(), Eq(0));
+  fake_cq_impl_->SimulateCompletion(true);
+  EXPECT_THAT(wrapper.draining_channels(), IsEmpty());
+  EXPECT_EQ(weak_draining.lock(), nullptr);
+  EXPECT_THAT(fake_cq_impl_->size(), Eq(0U));
+
+  fake_cq_impl_->SimulateCompletion(false);
+}
+
+TEST_F(DynamicChannelPoolTest,
+       ScheduleRemoveChannelsRearmsAfterCompletedDrain) {
+  auto instance_name =
+      bigtable::InstanceResource(Project("my-project"), "my-instance")
+          .FullName();
+  auto refresh_state = std::make_shared<ConnectionRefreshState>(
+      fake_cq_impl_, std::chrono::milliseconds(1),
+      std::chrono::milliseconds(10));
+  MockFunction<StatusOr<std::shared_ptr<ChannelUsage<BigtableStub>>>(
+      std::uint32_t, std::string const&, StubManager::Priming)>
+      stub_factory_fn;
+  EXPECT_CALL(stub_factory_fn, Call).Times(0);
+
+  std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> channels;
+  for (int i = 0; i < 4; ++i) {
+    channels.push_back(std::make_shared<ChannelUsage<BigtableStub>>(
+        std::make_shared<MockBigtableStub>(), 0));
+  }
+
+  DynamicChannelPoolSizingPolicy sizing_policy;
+  sizing_policy.minimum_channel_pool_size = 2;
+  sizing_policy.maximum_channel_pool_size = 4;
+  sizing_policy.minimum_average_outstanding_rpcs_per_channel = 5;
+
+  auto pool = DynamicChannelPool<BigtableStub>::Create(
+      instance_name, CompletionQueue(fake_cq_impl_), std::move(channels),
+      refresh_state, stub_factory_fn.AsStdFunction(), sizing_policy,
+      TransportType::kCloudPath);
+  DynamicChannelPoolTestWrapper wrapper(pool);
+
+  // Expire initial decrease cooldown timer.
+  ASSERT_THAT(fake_cq_impl_->size(), Eq(1U));
+  fake_cq_impl_->SimulateCompletion(true);
+  ASSERT_THAT(fake_cq_impl_->size(), Eq(0U));
+
+  // First scale-down drain completes.
+  (void)pool->GetChannelRandomTwoLeastUsed();
+  EXPECT_THAT(pool->size(), Eq(3U));
+  ASSERT_THAT(wrapper.draining_channels().size(), Eq(1U));
+  std::weak_ptr<ChannelUsage<BigtableStub>> weak_first =
+      wrapper.draining_channels()[0];
+  ASSERT_THAT(fake_cq_impl_->size(), Eq(2U));
+  fake_cq_impl_->SimulateCompletion(true);
+  EXPECT_THAT(wrapper.draining_channels(), IsEmpty());
+  EXPECT_EQ(weak_first.lock(), nullptr);
+  ASSERT_THAT(fake_cq_impl_->size(), Eq(0U));
+
+  // Second scale-down after a completed drain must schedule a new poll timer.
+  (void)pool->GetChannelRandomTwoLeastUsed();
+  EXPECT_THAT(pool->size(), Eq(2U));
+  ASSERT_THAT(wrapper.draining_channels().size(), Eq(1U));
+  std::weak_ptr<ChannelUsage<BigtableStub>> weak_second =
+      wrapper.draining_channels()[0];
+  ASSERT_THAT(fake_cq_impl_->size(), Eq(2U));
+  fake_cq_impl_->SimulateCompletion(true);
+  EXPECT_THAT(wrapper.draining_channels(), IsEmpty());
+  EXPECT_EQ(weak_second.lock(), nullptr);
+  ASSERT_THAT(fake_cq_impl_->size(), Eq(0U));
+
+  // Bad-channel eviction after completed drains must also schedule a poll
+  // timer.
+  std::weak_ptr<ChannelUsage<BigtableStub>> weak_evicted =
+      wrapper.channels()[0];
+  wrapper.channels()[0]->set_last_refresh_status(
+      internal::UnavailableError("refresh failed"));
+  (void)pool->GetChannelRandomTwoLeastUsed();
+  EXPECT_THAT(pool->size(), Eq(1U));
+  ASSERT_THAT(wrapper.draining_channels().size(), Eq(1U));
+  ASSERT_THAT(fake_cq_impl_->size(), Eq(1U));
+  fake_cq_impl_->SimulateCompletion(true);
+  EXPECT_THAT(wrapper.draining_channels(), IsEmpty());
+  EXPECT_EQ(weak_evicted.lock(), nullptr);
+  EXPECT_THAT(fake_cq_impl_->size(), Eq(0U));
+
+  fake_cq_impl_->SimulateCompletion(false);
+}
+
+TEST_F(DynamicChannelPoolTest,
+       RemoveChannelsRetainsUnhealthyChannelUntilOutstandingRpcsFinish) {
+  auto instance_name =
+      bigtable::InstanceResource(Project("my-project"), "my-instance")
+          .FullName();
+  auto refresh_state = std::make_shared<ConnectionRefreshState>(
+      fake_cq_impl_, std::chrono::milliseconds(1),
+      std::chrono::milliseconds(10));
+  MockFunction<StatusOr<std::shared_ptr<ChannelUsage<BigtableStub>>>(
+      std::uint32_t, std::string const&, StubManager::Priming)>
+      stub_factory_fn;
+  EXPECT_CALL(stub_factory_fn, Call).Times(0);
+
+  auto bad_channel = std::make_shared<ChannelUsage<BigtableStub>>(
+      std::make_shared<MockBigtableStub>(), 0);
+  (void)bad_channel->AcquireStub();
+  bad_channel->set_last_refresh_status(
+      internal::UnavailableError("ping and warm failed"));
+  EXPECT_THAT(bad_channel->instant_outstanding_rpcs(),
+              testing_util::StatusIs(StatusCode::kUnavailable));
+  EXPECT_THAT(bad_channel->outstanding_rpcs(), Eq(1));
+  std::weak_ptr<ChannelUsage<BigtableStub>> weak_bad = bad_channel;
+
+  auto good_channel = std::make_shared<ChannelUsage<BigtableStub>>(
+      std::make_shared<MockBigtableStub>(), 0);
+
+  std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> channels;
+  channels.push_back(std::move(bad_channel));
+  channels.push_back(good_channel);
+
+  DynamicChannelPoolSizingPolicy sizing_policy;
+  sizing_policy.minimum_channel_pool_size = 2;
+  sizing_policy.maximum_channel_pool_size = 4;
+
+  auto pool = DynamicChannelPool<BigtableStub>::Create(
+      instance_name, CompletionQueue(fake_cq_impl_), std::move(channels),
+      refresh_state, stub_factory_fn.AsStdFunction(), sizing_policy,
+      TransportType::kCloudPath);
+  DynamicChannelPoolTestWrapper wrapper(pool);
+
+  ASSERT_THAT(fake_cq_impl_->size(), Eq(1U));
+  fake_cq_impl_->SimulateCompletion(true);
+  ASSERT_THAT(fake_cq_impl_->size(), Eq(0U));
+
+  auto selected = pool->GetChannelRandomTwoLeastUsed();
+  EXPECT_THAT(selected.channel, Eq(good_channel));
+  EXPECT_THAT(pool->size(), Eq(1U));
+  ASSERT_THAT(wrapper.draining_channels().size(), Eq(1U));
+  EXPECT_THAT(wrapper.draining_channels()[0], Eq(weak_bad.lock()));
+  ASSERT_THAT(fake_cq_impl_->size(), Eq(1U));
+
+  // Poll timer fires while the unhealthy channel still has 1 active RPC.
+  fake_cq_impl_->SimulateCompletion(true);
+  ASSERT_THAT(wrapper.draining_channels().size(), Eq(1U));
+  EXPECT_NE(weak_bad.lock(), nullptr);
+  EXPECT_THAT(wrapper.draining_channels()[0]->outstanding_rpcs(), Eq(1));
+  ASSERT_THAT(fake_cq_impl_->size(), Eq(1U));
+
+  // Once ReleaseStub() drops outstanding_rpcs() to 0, the next poll removes it.
+  wrapper.draining_channels()[0]->ReleaseStub();
+  EXPECT_THAT(wrapper.draining_channels()[0]->outstanding_rpcs(), Eq(0));
+  fake_cq_impl_->SimulateCompletion(true);
+  EXPECT_THAT(wrapper.draining_channels(), IsEmpty());
+  EXPECT_EQ(weak_bad.lock(), nullptr);
+  EXPECT_THAT(fake_cq_impl_->size(), Eq(0U));
+
+  fake_cq_impl_->SimulateCompletion(false);
 }
 
 }  // namespace
