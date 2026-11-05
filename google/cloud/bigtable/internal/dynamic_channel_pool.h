@@ -25,6 +25,7 @@
 #include "google/cloud/completion_queue.h"
 #include "google/cloud/internal/random.h"
 #include "google/cloud/version.h"
+#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <memory>
@@ -326,45 +327,38 @@ class DynamicChannelPool
   // remove_channel_polling_interval with a callback that executes
   // RemoveChannels.
   void ScheduleRemoveChannels(std::scoped_lock<std::mutex> const&) {
-    if (remove_channel_poll_timer_.valid()) return;
-    std::weak_ptr<DynamicChannelPool<T>> foo = this->shared_from_this();
+    if (remove_channel_poll_scheduled_) return;
+    remove_channel_poll_scheduled_ = true;
+    std::weak_ptr<DynamicChannelPool<T>> weak = this->shared_from_this();
     remove_channel_poll_timer_ =
         cq_.MakeRelativeTimer(sizing_policy_.remove_channel_polling_interval)
             .then(
-                [weak = std::move(foo)](
+                [weak = std::move(weak)](
                     future<StatusOr<std::chrono::system_clock::time_point>> f) {
+                  auto self = weak.lock();
+                  if (!self) return;
                   if (f.get().ok()) {
-                    if (auto self = weak.lock()) {
-                      self->RemoveChannels();
-                    }
+                    self->RemoveChannels();
+                  } else {
+                    std::scoped_lock lk(self->mu_);
+                    self->remove_channel_poll_scheduled_ = false;
                   }
                 });
   }
 
-  // Locks the mutex, reverse sorts draining_channels_, calling pop_back until
-  // either draining_channels_ is empty or a channel with outstanding_rpcs is
-  // encountered. Calls ScheduleRemoveChannels if draining_channels_ is
-  // non-empty.
+  // Locks the mutex, resets remove_channel_poll_scheduled_, and removes any
+  // channels in draining_channels_ whose outstanding_rpcs() has reached zero.
+  // Calls ScheduleRemoveChannels if draining_channels_ remains non-empty.
   void RemoveChannels() {
     std::scoped_lock lk(mu_);
-    std::sort(draining_channels_.begin(), draining_channels_.end(),
-              [](std::shared_ptr<ChannelUsage<T>> const& a,
-                 std::shared_ptr<ChannelUsage<T>> const& b) {
-                auto rpcs_a = a->instant_outstanding_rpcs();
-                auto rpcs_b = b->instant_outstanding_rpcs();
-                if (!rpcs_a.ok()) return false;
-                if (!rpcs_b.ok()) return true;
-                return *rpcs_a > *rpcs_b;
-              });
-    while (!draining_channels_.empty()) {
-      auto outstanding_rpcs =
-          draining_channels_.back()->instant_outstanding_rpcs();
-      if (outstanding_rpcs.ok() && *outstanding_rpcs > 0) {
-        ScheduleRemoveChannels(lk);
-        return;
-      }
-
-      draining_channels_.pop_back();
+    remove_channel_poll_scheduled_ = false;
+    draining_channels_.erase(
+        std::remove_if(
+            draining_channels_.begin(), draining_channels_.end(),
+            [](auto const& ch) { return ch->outstanding_rpcs() == 0; }),
+        draining_channels_.end());
+    if (!draining_channels_.empty()) {
+      ScheduleRemoveChannels(lk);
     }
   }
 
@@ -454,6 +448,7 @@ class DynamicChannelPool
   std::size_t num_pending_channels_ = 0;
   bigtable::experimental::DynamicChannelPoolSizingPolicy sizing_policy_;
   std::vector<std::shared_ptr<ChannelUsage<T>>> draining_channels_;
+  bool remove_channel_poll_scheduled_ = false;
   future<void> remove_channel_poll_timer_;
   future<StatusOr<std::chrono::system_clock::time_point>>
       pool_size_decrease_cooldown_timer_;
