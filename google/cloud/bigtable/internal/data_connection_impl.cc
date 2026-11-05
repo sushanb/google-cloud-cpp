@@ -349,8 +349,19 @@ std::vector<bigtable::FailedMutation> DataConnectionImpl::BulkApply(
     if (!mutator.HasPendingMutations()) break;
     if (!retry) retry = retry_policy(*current);
     if (!backoff) backoff = backoff_policy(*current);
-    auto delay = internal::Backoff(status, "BulkApply", *retry, *backoff,
-                                   Idempotency::kIdempotent,
+    // Remaining pending mutations are guaranteed to be retryable (for example,
+    // entries that received explicit transient per-entry errors before the
+    // stream terminated with a non-retryable status). Account for the retry
+    // attempt in the retry policy instead of aborting on the stream status.
+    bool const server_retryable =
+        enable_server_retries(*current) &&
+        google::cloud::internal::GetRetryInfo(status).has_value();
+    auto const backoff_status =
+        (!server_retryable && SafeGrpcRetry::IsPermanentFailure(status))
+            ? Status(StatusCode::kUnavailable, status.message())
+            : status;
+    auto delay = internal::Backoff(backoff_status, "BulkApply", *retry,
+                                   *backoff, Idempotency::kIdempotent,
                                    enable_server_retries(*current));
     if (!delay) break;
     std::this_thread::sleep_for(*delay);

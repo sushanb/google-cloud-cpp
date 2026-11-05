@@ -850,6 +850,126 @@ TEST_F(BulkMutatorTest, BigtableCookies) {
   status = mutator.MakeOneRequest(*mock, limiter, Options{});
   EXPECT_THAT(status, StatusIs(StatusCode::kPermissionDenied));
 }
+
+TEST_F(BulkMutatorTest, UnconfirmedIdempotentFailedOnPermanentStreamError) {
+  BulkMutation mut(IdempotentMutation("r0-ok"),
+                   IdempotentMutation("r1-transient"),
+                   IdempotentMutation("r2-unconfirmed"),
+                   NonIdempotentMutation("r3-non-idempotent"));
+
+  auto expect_r2 = [](v2::MutateRowsRequest const& r) {
+    ASSERT_EQ(1, r.entries_size());
+    EXPECT_EQ("r1-transient", r.entries(0).row_key());
+  };
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, MutateRows)
+      .WillOnce([this](auto context, auto const&,
+                       google::bigtable::v2::MutateRowsRequest const& request,
+                       auto const&) {
+        metadata_fixture_.SetServerMetadata(*context, {});
+        EXPECT_THAT(request, HasCorrectResourceNames());
+        EXPECT_EQ(4, request.entries_size());
+        auto stream = std::make_unique<MockMutateRowsStream>();
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([](google::bigtable::v2::MutateRowsResponse* r) {
+              *r = MakeResponse({{0, grpc::StatusCode::OK},
+                                 {1, grpc::StatusCode::UNAVAILABLE},
+                                 {3, grpc::StatusCode::UNAVAILABLE}});
+              return std::nullopt;
+            })
+            .WillOnce(
+                Return(Status(StatusCode::kDeadlineExceeded, "stream fail")));
+        return stream;
+      })
+      .WillOnce([this, expect_r2](
+                    auto context, auto const&,
+                    google::bigtable::v2::MutateRowsRequest const& request,
+                    auto const&) {
+        metadata_fixture_.SetServerMetadata(*context, {});
+        EXPECT_THAT(request, HasCorrectResourceNames());
+        expect_r2(request);
+        auto stream = std::make_unique<MockMutateRowsStream>();
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([](google::bigtable::v2::MutateRowsResponse* r) {
+              *r = MakeResponse({{0, grpc::StatusCode::OK}});
+              return std::nullopt;
+            })
+            .WillOnce(Return(Status()));
+        return stream;
+      });
+
+  auto policy = DefaultIdempotentMutationPolicy();
+  bigtable_internal::BulkMutator mutator(
+      kAppProfile, kTableName, *policy, std::move(mut),
+      std::make_shared<bigtable_internal::OperationContext>());
+
+  bigtable_internal::NoopMutateRowsLimiter limiter;
+  auto status = mutator.MakeOneRequest(*mock, limiter, Options{});
+  EXPECT_THAT(status, StatusIs(StatusCode::kDeadlineExceeded));
+  EXPECT_TRUE(mutator.HasPendingMutations());
+
+  status = mutator.MakeOneRequest(*mock, limiter, Options{});
+  EXPECT_STATUS_OK(status);
+  EXPECT_FALSE(mutator.HasPendingMutations());
+
+  auto failures = std::move(mutator).OnRetryDone();
+  ASSERT_EQ(2UL, failures.size());
+  EXPECT_EQ(3, failures[0].original_index());
+  EXPECT_THAT(failures[0].status(), StatusIs(StatusCode::kUnavailable));
+  EXPECT_EQ(2, failures[1].original_index());
+  EXPECT_THAT(failures[1].status(), StatusIs(StatusCode::kDeadlineExceeded));
+}
+
+TEST_F(BulkMutatorTest, UnconfirmedIdempotentRetriedWithServerRetryInfo) {
+  BulkMutation mut(IdempotentMutation("r0"));
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, MutateRows)
+      .WillOnce([this](auto context, auto const&,
+                       google::bigtable::v2::MutateRowsRequest const&,
+                       auto const&) {
+        metadata_fixture_.SetServerMetadata(*context, {});
+        auto status =
+            google::cloud::internal::PermissionDeniedError("try again");
+        google::cloud::internal::SetRetryInfo(
+            status, google::cloud::internal::RetryInfo{0_ms});
+        auto stream = std::make_unique<MockMutateRowsStream>();
+        EXPECT_CALL(*stream, Read).WillOnce(Return(status));
+        return stream;
+      })
+      .WillOnce([this](auto context, auto const&,
+                       google::bigtable::v2::MutateRowsRequest const& request,
+                       auto const&) {
+        metadata_fixture_.SetServerMetadata(*context, {});
+        EXPECT_EQ(1, request.entries_size());
+        EXPECT_EQ("r0", request.entries(0).row_key());
+        auto stream = std::make_unique<MockMutateRowsStream>();
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([](google::bigtable::v2::MutateRowsResponse* r) {
+              *r = MakeResponse({{0, grpc::StatusCode::OK}});
+              return std::nullopt;
+            })
+            .WillOnce(Return(Status()));
+        return stream;
+      });
+
+  auto policy = DefaultIdempotentMutationPolicy();
+  bigtable_internal::BulkMutator mutator(
+      kAppProfile, kTableName, *policy, std::move(mut),
+      std::make_shared<bigtable_internal::OperationContext>());
+
+  bigtable_internal::NoopMutateRowsLimiter limiter;
+  auto const opts = Options{}.set<EnableServerRetriesOption>(true);
+  auto status = mutator.MakeOneRequest(*mock, limiter, opts);
+  EXPECT_THAT(status, StatusIs(StatusCode::kPermissionDenied));
+  EXPECT_TRUE(mutator.HasPendingMutations());
+
+  status = mutator.MakeOneRequest(*mock, limiter, opts);
+  EXPECT_STATUS_OK(status);
+  EXPECT_FALSE(mutator.HasPendingMutations());
+  EXPECT_THAT(std::move(mutator).OnRetryDone(), IsEmpty());
+}
 }  // namespace
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
 }  // namespace bigtable

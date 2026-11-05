@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "google/cloud/bigtable/internal/bulk_mutator.h"
+#include "google/cloud/bigtable/internal/retry_traits.h"
 #include "google/cloud/bigtable/rpc_retry_policy.h"
 #include "google/cloud/bigtable/table.h"
 #include "google/cloud/grpc_options.h"
@@ -132,6 +133,9 @@ void BulkMutatorState::OnFinish(Status finish_status,
   bool const retryable =
       enable_server_retries &&
       google::cloud::internal::GetRetryInfo(last_status_).has_value();
+  bool const stream_retryable =
+      last_status_.ok() || !SafeGrpcRetry::IsPermanentFailure(last_status_) ||
+      retryable;
 
   int index = 0;
   for (auto& annotation : annotations_) {
@@ -141,7 +145,8 @@ void BulkMutatorState::OnFinish(Status finish_status,
     }
     // If there are any mutations with unknown state, they need to be handled.
     auto& original = *mutations_.mutable_entries(index);
-    if (retryable || annotation.idempotency == Idempotency::kIdempotent) {
+    if (retryable || (stream_retryable &&
+                      annotation.idempotency == Idempotency::kIdempotent)) {
       // If the mutation was retryable, move it to the pending mutations to try
       // again, along with their index.
       pending_mutations_.add_entries()->Swap(&original);
