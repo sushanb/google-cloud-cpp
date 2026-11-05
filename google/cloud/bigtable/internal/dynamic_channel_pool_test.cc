@@ -341,6 +341,7 @@ TEST_F(DynamicChannelPoolTest, ScheduleAddChannelsPoolUndersized) {
   std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> channels;
   DynamicChannelPoolSizingPolicy sizing_policy;
   sizing_policy.minimum_channel_pool_size = 10;
+  sizing_policy.maximum_channel_pool_size = 10;
 
   MockFunction<StatusOr<std::shared_ptr<ChannelUsage<BigtableStub>>>(
       std::uint32_t, std::string const&, StubManager::Priming)>
@@ -374,16 +375,60 @@ TEST_F(DynamicChannelPoolTest, ScheduleAddChannelsPoolUndersized) {
   }
 
   {
-    EXPECT_CALL(*mock_cq_impl_, RunAsync).Times(1);
-    auto test_fn = [](std::vector<int> const& new_channel_ids) {
-      EXPECT_THAT(new_channel_ids,
-                  ::testing::ElementsAreArray(
-                      {10, 11, 12, 13, 14, 15, 16, 17, 18, 19}));
-    };
+    // Pending channels already satisfy minimum_channel_pool_size (and
+    // maximum_channel_pool_size), so no duplicate channels are scheduled.
+    EXPECT_CALL(*mock_cq_impl_, RunAsync).Times(0);
+    MockFunction<void(std::vector<int> const&)> test_fn;
+    EXPECT_CALL(test_fn, Call).Times(0);
     auto lk = wrapper.CreateLock();
-    wrapper.ScheduleAddChannels(lk, test_fn);
-    EXPECT_THAT(wrapper.num_pending_channels(), Eq(20));
+    wrapper.ScheduleAddChannels(lk, test_fn.AsStdFunction());
+    EXPECT_THAT(wrapper.num_pending_channels(), Eq(10));
   }
+}
+
+TEST_F(DynamicChannelPoolTest, ScheduleAddChannelsPoolUndersizedWithPending) {
+  auto instance_name =
+      bigtable::InstanceResource(Project("my-project"), "my-instance")
+          .FullName();
+  auto refresh_state = std::make_shared<ConnectionRefreshState>(
+      fake_cq_impl_, std::chrono::milliseconds(1),
+      std::chrono::milliseconds(10));
+
+  std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> channels;
+  channels.push_back(std::make_shared<ChannelUsage<BigtableStub>>(
+      std::make_shared<MockBigtableStub>(), 0));
+  channels.push_back(std::make_shared<ChannelUsage<BigtableStub>>(
+      std::make_shared<MockBigtableStub>(), 0));
+  DynamicChannelPoolSizingPolicy sizing_policy;
+  sizing_policy.minimum_channel_pool_size = 6;
+
+  MockFunction<StatusOr<std::shared_ptr<ChannelUsage<BigtableStub>>>(
+      std::uint32_t, std::string const&, StubManager::Priming)>
+      stub_factory_fn;
+
+  EXPECT_CALL(*mock_cq_impl_, MakeRelativeTimer)
+      .WillOnce([&](std::chrono::nanoseconds ns) {
+        EXPECT_THAT(ns.count(),
+                    Eq(std::chrono::nanoseconds(
+                           sizing_policy.pool_size_decrease_cooldown_interval)
+                           .count()));
+        return make_ready_future(StatusOr(std::chrono::system_clock::now()));
+      });
+
+  auto pool = DynamicChannelPool<BigtableStub>::Create(
+      instance_name, CompletionQueue(mock_cq_impl_), channels, refresh_state,
+      stub_factory_fn.AsStdFunction(), sizing_policy,
+      TransportType::kCloudPath);
+  DynamicChannelPoolTestWrapper wrapper(pool);
+  wrapper.set_num_pending_channels(2);
+
+  EXPECT_CALL(*mock_cq_impl_, RunAsync).Times(1);
+  auto test_fn = [](std::vector<int> const& new_channel_ids) {
+    EXPECT_THAT(new_channel_ids, ::testing::ElementsAreArray({2, 3}));
+  };
+  auto lk = wrapper.CreateLock();
+  wrapper.ScheduleAddChannels(lk, test_fn);
+  EXPECT_THAT(wrapper.num_pending_channels(), Eq(4));
 }
 
 TEST_F(DynamicChannelPoolTest, ScheduleAddChannelsPoolAtMax) {
@@ -423,15 +468,15 @@ TEST_F(DynamicChannelPoolTest, ScheduleAddChannelsPoolAtMax) {
       TransportType::kCloudPath);
   DynamicChannelPoolTestWrapper wrapper(pool);
 
-  EXPECT_CALL(*mock_cq_impl_, RunAsync).Times(1);
-  auto test_fn = [](std::vector<int> const& new_channel_ids) {
-    EXPECT_THAT(new_channel_ids, IsEmpty());
-  };
+  EXPECT_CALL(*mock_cq_impl_, RunAsync).Times(0);
+  MockFunction<void(std::vector<int> const&)> test_fn;
+  EXPECT_CALL(test_fn, Call).Times(0);
 
   {
     auto lk = wrapper.CreateLock();
-    wrapper.ScheduleAddChannels(lk, test_fn);
+    wrapper.ScheduleAddChannels(lk, test_fn.AsStdFunction());
   }
+  EXPECT_THAT(wrapper.num_pending_channels(), Eq(0));
 }
 
 TEST_F(DynamicChannelPoolTest, ScheduleAddChannelsPoolBelowMax) {
@@ -1257,6 +1302,123 @@ TEST_F(DynamicChannelPoolTest, TransportType) {
       stub_factory_fn.AsStdFunction(), sizing_policy,
       TransportType::kDirectPath);
   EXPECT_THAT(pool_direct->transport_type(), Eq(TransportType::kDirectPath));
+}
+
+TEST_F(DynamicChannelPoolTest, CheckChannelPoolHealthConcurrentScaleUpBounded) {
+  auto instance_name =
+      bigtable::InstanceResource(Project("my-project"), "my-instance")
+          .FullName();
+  auto refresh_state = std::make_shared<ConnectionRefreshState>(
+      fake_cq_impl_, std::chrono::milliseconds(1),
+      std::chrono::milliseconds(10));
+  MockFunction<StatusOr<std::shared_ptr<ChannelUsage<BigtableStub>>>(
+      std::uint32_t, std::string const&, StubManager::Priming)>
+      stub_factory_fn;
+
+  EXPECT_CALL(*mock_cq_impl_, MakeRelativeTimer)
+      .WillRepeatedly([&](std::chrono::nanoseconds) {
+        return cq_.MakeRelativeTimer(std::chrono::seconds(600));
+      });
+
+  {
+    // Undersized pool: concurrent health checks while replacement channels are
+    // still pending must not schedule duplicate batches past minimum size.
+    std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> channels;
+    channels.push_back(std::make_shared<ChannelUsage<BigtableStub>>(
+        std::make_shared<MockBigtableStub>(), 0));
+
+    DynamicChannelPoolSizingPolicy sizing_policy;
+    sizing_policy.minimum_channel_pool_size = 4;
+    sizing_policy.maximum_channel_pool_size = 8;
+
+    auto pool = DynamicChannelPool<BigtableStub>::Create(
+        instance_name, CompletionQueue(mock_cq_impl_), channels, refresh_state,
+        stub_factory_fn.AsStdFunction(), sizing_policy,
+        TransportType::kCloudPath);
+    DynamicChannelPoolTestWrapper wrapper(pool);
+
+    EXPECT_CALL(*mock_cq_impl_, RunAsync).Times(1);
+    for (int i = 0; i < 5; ++i) {
+      auto lock = wrapper.CreateLock();
+      wrapper.CheckPoolChannelHealth(lock);
+    }
+    EXPECT_THAT(wrapper.num_pending_channels(), Eq(3));
+  }
+
+  {
+    // High-load pool: concurrent health checks while scale-up channels are
+    // pending must never exceed maximum_channel_pool_size.
+    std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> channels;
+    channels.push_back(std::make_shared<ChannelUsage<BigtableStub>>(
+        std::make_shared<MockBigtableStub>(), 200));
+    channels.push_back(std::make_shared<ChannelUsage<BigtableStub>>(
+        std::make_shared<MockBigtableStub>(), 200));
+
+    DynamicChannelPoolSizingPolicy sizing_policy;
+    sizing_policy.minimum_channel_pool_size = 2;
+    sizing_policy.maximum_channel_pool_size = 4;
+    sizing_policy.maximum_average_outstanding_rpcs_per_channel = 25;
+
+    auto pool = DynamicChannelPool<BigtableStub>::Create(
+        instance_name, CompletionQueue(mock_cq_impl_), channels, refresh_state,
+        stub_factory_fn.AsStdFunction(), sizing_policy,
+        TransportType::kCloudPath);
+    DynamicChannelPoolTestWrapper wrapper(pool);
+
+    EXPECT_CALL(*mock_cq_impl_, RunAsync).Times(2);
+    for (int i = 0; i < 10; ++i) {
+      auto lock = wrapper.CreateLock();
+      wrapper.CheckPoolChannelHealth(lock);
+    }
+    EXPECT_THAT(pool->size() + wrapper.num_pending_channels(),
+                Eq(sizing_policy.maximum_channel_pool_size));
+  }
+
+  fake_cq_impl_->SimulateCompletion(false);
+}
+
+TEST_F(DynamicChannelPoolTest, SizingPolicyNormalizesMaxPoolSize) {
+  auto instance_name =
+      bigtable::InstanceResource(Project("my-project"), "my-instance")
+          .FullName();
+  auto refresh_state = std::make_shared<ConnectionRefreshState>(
+      fake_cq_impl_, std::chrono::milliseconds(1),
+      std::chrono::milliseconds(10));
+  std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> channels;
+  MockFunction<StatusOr<std::shared_ptr<ChannelUsage<BigtableStub>>>(
+      std::uint32_t, std::string const&, StubManager::Priming)>
+      stub_factory_fn;
+
+  EXPECT_CALL(*mock_cq_impl_, MakeRelativeTimer)
+      .WillRepeatedly([&](std::chrono::nanoseconds) {
+        return make_ready_future(StatusOr(std::chrono::system_clock::now()));
+      });
+
+  {
+    DynamicChannelPoolSizingPolicy sizing_policy;
+    sizing_policy.minimum_channel_pool_size = 6;
+    sizing_policy.maximum_channel_pool_size = 0;
+    auto pool = DynamicChannelPool<BigtableStub>::Create(
+        instance_name, CompletionQueue(mock_cq_impl_), channels, refresh_state,
+        stub_factory_fn.AsStdFunction(), sizing_policy,
+        TransportType::kCloudPath);
+    EXPECT_THAT(pool->sizing_policy().minimum_channel_pool_size, Eq(6));
+    EXPECT_THAT(pool->sizing_policy().maximum_channel_pool_size, Eq(12));
+  }
+
+  {
+    DynamicChannelPoolSizingPolicy sizing_policy;
+    sizing_policy.minimum_channel_pool_size = 6;
+    sizing_policy.maximum_channel_pool_size = 3;
+    auto pool = DynamicChannelPool<BigtableStub>::Create(
+        instance_name, CompletionQueue(mock_cq_impl_), channels, refresh_state,
+        stub_factory_fn.AsStdFunction(), sizing_policy,
+        TransportType::kCloudPath);
+    EXPECT_THAT(pool->sizing_policy().minimum_channel_pool_size, Eq(6));
+    EXPECT_THAT(pool->sizing_policy().maximum_channel_pool_size, Eq(6));
+  }
+
+  fake_cq_impl_->SimulateCompletion(false);
 }
 
 }  // namespace

@@ -25,10 +25,17 @@
 #include "google/cloud/completion_queue.h"
 #include "google/cloud/internal/random.h"
 #include "google/cloud/version.h"
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <numeric>
+#include <random>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace google {
@@ -186,6 +193,13 @@ class DynamicChannelPool
         sizing_policy_(std::move(sizing_policy)),
         next_channel_id_(static_cast<std::uint32_t>(channels_.size())),
         transport_type_(transport_type) {
+    if (sizing_policy_.maximum_channel_pool_size == 0) {
+      sizing_policy_.maximum_channel_pool_size =
+          2 * sizing_policy_.minimum_channel_pool_size;
+    }
+    sizing_policy_.maximum_channel_pool_size =
+        (std::max)(sizing_policy_.minimum_channel_pool_size,
+                   sizing_policy_.maximum_channel_pool_size);
     std::scoped_lock lk(mu_);
     SetSizeDecreaseCooldownTimer(lk);
   }
@@ -277,16 +291,18 @@ class DynamicChannelPool
       std::scoped_lock<std::mutex> const&,
       std::function<void(std::vector<int> const&)> const& test_fn = nullptr) {
     constexpr std::size_t kOneAddedChannel = 1;
-    std::size_t num_channels_to_add;
+    std::size_t const effective_size = channels_.size() + num_pending_channels_;
+    std::size_t num_channels_to_add = 0;
     // If we're undersized due to bad channels, get us back to the minimum size.
-    if (channels_.size() < sizing_policy_.minimum_channel_pool_size) {
+    if (effective_size < sizing_policy_.minimum_channel_pool_size) {
       num_channels_to_add =
-          sizing_policy_.minimum_channel_pool_size - channels_.size();
-    } else {
+          sizing_policy_.minimum_channel_pool_size - effective_size;
+    } else if (effective_size < sizing_policy_.maximum_channel_pool_size) {
       num_channels_to_add =
-          std::min(sizing_policy_.maximum_channel_pool_size - channels_.size(),
-                   kOneAddedChannel);
+          (std::min)(sizing_policy_.maximum_channel_pool_size - effective_size,
+                     kOneAddedChannel);
     }
+    if (num_channels_to_add == 0) return;
     num_pending_channels_ += num_channels_to_add;
     std::vector<int> new_channel_ids;
     new_channel_ids.reserve(num_channels_to_add);
@@ -406,19 +422,22 @@ class DynamicChannelPool
   // appropriate. If ScheduleRemoveChannel is called the resize_cooldown_timer
   // is also set.
   void CheckPoolChannelHealth(std::scoped_lock<std::mutex> const& lk) {
-    int average_rpcs_per_channel =
-        channels_.empty()
+    std::size_t const effective_size = channels_.size() + num_pending_channels_;
+    int const average_rpcs_per_channel =
+        (channels_.empty() || effective_size == 0)
             ? 0
-            : std::accumulate(channels_.begin(), channels_.end(), 0,
-                              [](int a, auto const& b) {
-                                auto rpcs_b = b->instant_outstanding_rpcs();
-                                return a + (rpcs_b.ok() ? *rpcs_b : 0);
-                              }) /
-                  static_cast<int>(channels_.size() + num_pending_channels_);
-    if (channels_.size() < sizing_policy_.minimum_channel_pool_size ||
+            : static_cast<int>(
+                  std::accumulate(channels_.begin(), channels_.end(),
+                                  std::int64_t{0},
+                                  [](std::int64_t a, auto const& b) {
+                                    auto rpcs_b = b->instant_outstanding_rpcs();
+                                    return a + (rpcs_b.ok() ? *rpcs_b : 0);
+                                  }) /
+                  static_cast<std::int64_t>(effective_size));
+    if (effective_size < sizing_policy_.minimum_channel_pool_size ||
         (average_rpcs_per_channel >
              sizing_policy_.maximum_average_outstanding_rpcs_per_channel &&
-         channels_.size() < sizing_policy_.maximum_channel_pool_size)) {
+         effective_size < sizing_policy_.maximum_channel_pool_size)) {
       // Channel/stub creation is expensive, instead of making the current RPC
       // wait on this, use an existing channel right now, and schedule a channel
       // to be added.
