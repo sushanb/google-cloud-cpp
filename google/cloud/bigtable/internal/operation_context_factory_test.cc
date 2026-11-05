@@ -22,6 +22,8 @@
 #include "google/cloud/monitoring/v3/metric_connection.h"
 #include <gmock/gmock.h>
 #include <chrono>
+#include <future>
+#include <mutex>
 
 namespace google {
 namespace cloud {
@@ -190,12 +192,18 @@ TEST(MetricsOperationContextFactoryTest, PrepareQuery) {
 
   auto mock_metric = std::make_shared<MockMetric const>();
   EXPECT_CALL(*mock_metric, clone)
-      .WillOnce(
-          [&](TableResourceLabels const&, TableDataLabels const& data_labels) {
-            EXPECT_THAT(data_labels.method, Eq("PrepareQuery"));
-            EXPECT_THAT(data_labels.streaming, Eq("false"));
-            return std::make_unique<MockMetric>();
-          });
+      .WillOnce([&](TableResourceLabels const& resource_labels,
+                    TableDataLabels const& data_labels) {
+        EXPECT_THAT(resource_labels.project_id, Eq("my-project"));
+        EXPECT_THAT(resource_labels.instance, Eq("my-instance"));
+        EXPECT_THAT(resource_labels.table, Eq("<unspecified>"));
+        EXPECT_THAT(resource_labels.cluster, IsEmpty());
+        EXPECT_THAT(resource_labels.zone, IsEmpty());
+        EXPECT_THAT(data_labels.method, Eq("PrepareQuery"));
+        EXPECT_THAT(data_labels.streaming, Eq("false"));
+        EXPECT_THAT(data_labels.app_profile, Eq(app_profile));
+        return std::make_unique<MockMetric>();
+      });
 
   MetricsOperationContextFactory factory({}, mock_metric);
   std::shared_ptr<OperationContext> operation_context =
@@ -208,12 +216,18 @@ TEST(MetricsOperationContextFactoryTest, ExecuteQuery) {
 
   auto mock_metric = std::make_shared<MockMetric const>();
   EXPECT_CALL(*mock_metric, clone)
-      .WillOnce(
-          [&](TableResourceLabels const&, TableDataLabels const& data_labels) {
-            EXPECT_THAT(data_labels.method, Eq("ExecuteQuery"));
-            EXPECT_THAT(data_labels.streaming, Eq("true"));
-            return std::make_unique<MockMetric>();
-          });
+      .WillOnce([&](TableResourceLabels const& resource_labels,
+                    TableDataLabels const& data_labels) {
+        EXPECT_THAT(resource_labels.project_id, Eq("my-project"));
+        EXPECT_THAT(resource_labels.instance, Eq("my-instance"));
+        EXPECT_THAT(resource_labels.table, Eq("<unspecified>"));
+        EXPECT_THAT(resource_labels.cluster, IsEmpty());
+        EXPECT_THAT(resource_labels.zone, IsEmpty());
+        EXPECT_THAT(data_labels.method, Eq("ExecuteQuery"));
+        EXPECT_THAT(data_labels.streaming, Eq("true"));
+        EXPECT_THAT(data_labels.app_profile, Eq(app_profile));
+        return std::make_unique<MockMetric>();
+      });
 
   MetricsOperationContextFactory factory({}, mock_metric);
   std::shared_ptr<OperationContext> operation_context =
@@ -400,30 +414,84 @@ TEST(MetricsOperationContextFactoryTest,
 
 TEST(MetricsOperationContextFactoryTest, InitializeProviderInstanceLevelRpc) {
   auto mock_conn = std::make_shared<MockMetricServiceConnection>();
+  std::mutex mu;
+  bool saw_prepare_query = false;
+  bool saw_execute_query = false;
+  bool saw_client_metric = false;
+  std::once_flag all_seen_once;
+  std::promise<void> all_seen;
+  auto all_seen_future = all_seen.get_future();
 
   EXPECT_CALL(*mock_conn, CreateServiceTimeSeries)
       .WillRepeatedly(
-          [](google::monitoring::v3::CreateTimeSeriesRequest const& request) {
+          [&](google::monitoring::v3::CreateTimeSeriesRequest const& request) {
             EXPECT_THAT(request.name(), Eq("projects/my-project"));
             for (auto const& ts : request.time_series()) {
-              EXPECT_THAT(ts.resource().type(), Eq("bigtable_client_raw"));
-              EXPECT_THAT(ts.resource().labels().at("project_id"),
-                          Eq("my-project"));
-              EXPECT_THAT(ts.resource().labels().at("instance"),
-                          Eq("my-instance"));
+              auto const& res_labels = ts.resource().labels();
+              auto get_res_label = [&](char const* key) {
+                auto it = res_labels.find(key);
+                return it == res_labels.end() ? std::string{} : it->second;
+              };
+
+              if (res_labels.find("table") != res_labels.end()) {
+                EXPECT_THAT(ts.resource().type(), Eq("bigtable_client_raw"));
+                EXPECT_THAT(get_res_label("project_id"), Eq("my-project"));
+                EXPECT_THAT(get_res_label("instance"), Eq("my-instance"));
+                EXPECT_THAT(get_res_label("table"), Eq("<unspecified>"));
+                EXPECT_THAT(get_res_label("cluster"), Eq("<unspecified>"));
+                EXPECT_THAT(get_res_label("zone"), Eq("global"));
+                EXPECT_TRUE(ts.metric().labels().find("table") ==
+                            ts.metric().labels().end());
+
+                auto method_it = ts.metric().labels().find("method");
+                if (method_it != ts.metric().labels().end()) {
+                  std::lock_guard<std::mutex> lk(mu);
+                  if (method_it->second == "PrepareQuery") {
+                    saw_prepare_query = true;
+                  } else if (method_it->second == "ExecuteQuery") {
+                    saw_execute_query = true;
+                  }
+                }
+              } else {
+                EXPECT_THAT(ts.resource().type(), Eq("bigtable_client"));
+                EXPECT_THAT(get_res_label("project_id"), Eq("my-project"));
+                EXPECT_THAT(get_res_label("instance"), Eq("my-instance"));
+                EXPECT_THAT(get_res_label("app_profile"), Eq("my-app-profile"));
+                std::lock_guard<std::mutex> lk(mu);
+                saw_client_metric = true;
+              }
+            }
+
+            std::lock_guard<std::mutex> lk(mu);
+            if (saw_prepare_query && saw_execute_query && saw_client_metric) {
+              std::call_once(all_seen_once, [&] { all_seen.set_value(); });
             }
             return Status();
           });
 
   auto options =
-      Options{}.set<bigtable::MetricsPeriodOption>(std::chrono::seconds(60));
+      Options{}.set<bigtable::MetricsPeriodOption>(std::chrono::seconds(1));
   {
     MetricsOperationContextFactory factory("test-uid", mock_conn, options);
-    std::shared_ptr<OperationContext> op = factory.ExecuteQuery(
+    std::shared_ptr<OperationContext> prepare_op = factory.PrepareQuery(
         "projects/my-project/instances/my-instance", "my-app-profile");
-    ASSERT_THAT(op, NotNull());
-    op->OnDone(Status());
+    ASSERT_THAT(prepare_op, NotNull());
+    prepare_op->OnDone(Status());
+    prepare_op->StubSelection(
+        StubSelectionParams{1, ChannelPoolLbPolicy::kRoundRobin,
+                            TransportType::kCloudPath, RpcType::kUnary});
+
+    std::shared_ptr<OperationContext> execute_op = factory.ExecuteQuery(
+        "projects/my-project/instances/my-instance", "my-app-profile");
+    ASSERT_THAT(execute_op, NotNull());
+    execute_op->OnDone(Status());
+
+    EXPECT_THAT(all_seen_future.wait_for(std::chrono::seconds(10)),
+                Eq(std::future_status::ready));
   }
+  EXPECT_TRUE(saw_prepare_query);
+  EXPECT_TRUE(saw_execute_query);
+  EXPECT_TRUE(saw_client_metric);
 }
 
 TEST(MetricsOperationContextFactoryTest, InitializeProviderWithoutConnection) {

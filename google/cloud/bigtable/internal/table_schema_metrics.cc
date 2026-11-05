@@ -49,7 +49,7 @@ LabelMap IntoLabelMap(TableResourceLabels const& r, TableDataLabels const& d,
   LabelMap labels = {
       {"project_id", r.project_id},
       {"instance", r.instance},
-      {"table", r.table},
+      {"table", r.table.empty() ? "<unspecified>" : r.table},
       {"cluster", r.cluster.empty() ? "<unspecified>" : r.cluster},
       {"zone", r.zone.empty() ? "global" : r.zone}};
 
