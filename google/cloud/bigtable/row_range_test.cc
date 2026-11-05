@@ -161,6 +161,52 @@ TEST(RowRangeTest, ContainsPrefixWithFFFF) {
   EXPECT_FALSE(range.Contains(std::string("\x00\x00\x00\x00\x00\x01", 6)));
 }
 
+TEST(RowRangeTest, PrefixTrailingFFExcludesOutOfPrefixKeys) {
+  auto range_single = RowRange::Prefix(std::string("a\xFF", 2));
+  EXPECT_EQ(btproto::RowRange::kStartKeyClosed,
+            range_single.as_proto().start_key_case());
+  EXPECT_EQ(std::string("a\xFF", 2),
+            range_single.as_proto().start_key_closed());
+  EXPECT_EQ(btproto::RowRange::kEndKeyOpen,
+            range_single.as_proto().end_key_case());
+  EXPECT_EQ("b", range_single.as_proto().end_key_open());
+  EXPECT_FALSE(range_single.Contains("a"));
+  EXPECT_FALSE(range_single.Contains(std::string("a\xFE", 2)));
+  EXPECT_TRUE(range_single.Contains(std::string("a\xFF", 2)));
+  EXPECT_TRUE(range_single.Contains(std::string("a\xFF\x00", 3)));
+  EXPECT_TRUE(range_single.Contains(std::string("a\xFF\xFF", 3)));
+  EXPECT_FALSE(range_single.Contains("b"));
+  EXPECT_FALSE(range_single.Contains(std::string("b\x00", 2)));
+  auto intersect_b = range_single.Intersect(RowRange::Closed("b", "b"));
+  EXPECT_FALSE(std::get<0>(intersect_b));
+
+  std::string const prefix_multi("\xA0\xFF\xFF", 3);
+  auto range_multi = RowRange::Prefix(prefix_multi);
+  EXPECT_EQ(btproto::RowRange::kStartKeyClosed,
+            range_multi.as_proto().start_key_case());
+  EXPECT_EQ(prefix_multi, range_multi.as_proto().start_key_closed());
+  EXPECT_EQ(btproto::RowRange::kEndKeyOpen,
+            range_multi.as_proto().end_key_case());
+  EXPECT_EQ(std::string("\xA1", 1), range_multi.as_proto().end_key_open());
+  EXPECT_FALSE(range_multi.Contains(std::string("\xA0\xFF\xFE", 3)));
+  EXPECT_TRUE(range_multi.Contains(prefix_multi));
+  EXPECT_TRUE(range_multi.Contains(std::string("\xA0\xFF\xFF\x00", 4)));
+  EXPECT_TRUE(range_multi.Contains(std::string("\xA0\xFF\xFF\xFF", 4)));
+  EXPECT_FALSE(range_multi.Contains(std::string("\xA1", 1)));
+  EXPECT_FALSE(range_multi.Contains(std::string("\xA1\x00", 2)));
+  EXPECT_FALSE(range_multi.Contains(std::string("\xA1\x00\x00", 3)));
+  auto intersect_a1 =
+      range_multi.Intersect(RowRange::StartingAt(std::string("\xA1", 1)));
+  EXPECT_FALSE(std::get<0>(intersect_a1));
+
+  auto range_7f = RowRange::Prefix(std::string("\x7F\xFF", 2));
+  EXPECT_EQ(std::string("\x80", 1), range_7f.as_proto().end_key_open());
+  EXPECT_TRUE(range_7f.Contains(std::string("\x7F\xFF", 2)));
+  EXPECT_TRUE(range_7f.Contains(std::string("\x7F\xFF\x00", 3)));
+  EXPECT_FALSE(range_7f.Contains(std::string("\x80", 1)));
+  EXPECT_FALSE(range_7f.Contains(std::string("\x80\x00", 2)));
+}
+
 TEST(RowRangeTest, ContainsStartingAt) {
   auto range = RowRange::StartingAt("foo");
   EXPECT_FALSE(range.Contains(""));
