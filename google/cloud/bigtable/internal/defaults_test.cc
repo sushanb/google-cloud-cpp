@@ -629,6 +629,30 @@ TEST(EndpointEnvTest, CbtDirectPathFalseOverridesCloudDirectPath) {
   EXPECT_FALSE(IsDirectPath(opts));
 }
 
+TEST(EndpointEnvTest,
+     DirectPathFallbackToCloudPathOverridesEnvVarsAndModeOption) {
+  ScopedEnvironment emulator("BIGTABLE_EMULATOR_HOST", std::nullopt);
+  ScopedEnvironment direct_path("GOOGLE_CLOUD_ENABLE_DIRECT_PATH", "bigtable");
+  ScopedEnvironment cbt_direct_path("CBT_ENABLE_DIRECTPATH", "true");
+
+  Options opts =
+      Options{}
+          .set<experimental::DirectPathModeOption>(
+              experimental::DirectPathMode::kEnabled)
+          .set<google::cloud::internal::UniverseDomainOption>("ud.net");
+  EXPECT_TRUE(IsDirectPath(opts));
+
+  opts.set<
+      ::google::cloud::bigtable_internal::DirectPathFallbackToCloudPathOption>(
+      true);
+  EXPECT_FALSE(IsDirectPath(opts));
+
+  Options const defaulted = DefaultDataOptions(opts);
+  EXPECT_FALSE(IsDirectPath(defaulted));
+  EXPECT_EQ("bigtable.ud.net", defaulted.get<EndpointOption>());
+  EXPECT_EQ("bigtable.ud.net", defaulted.get<AuthorityOption>());
+}
+
 TEST(EndpointEnvTest, DirectPathTimeoutDefaults) {
   ScopedEnvironment emulator("BIGTABLE_EMULATOR_HOST", std::nullopt);
   Options const opts = DefaultOptions();

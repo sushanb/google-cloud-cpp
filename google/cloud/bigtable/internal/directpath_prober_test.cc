@@ -407,13 +407,81 @@ TEST(DirectPathProberTest, ProbeWithPeerAuthenticatedDirectPathIpv6) {
 
   StatusOr<DirectPathProbeResult> const result = DirectPathProber::Probe(
       nullptr, instance, Options{}, CompletionQueue{}, mock_stub,
-      "ipv6:[2607:f8b0:4000:800::200a]:443", auth_ctx);
+      "ipv6:[2001:4860:8040::1]:443", auth_ctx);
 
   ASSERT_THAT(result, IsOk());
   EXPECT_THAT(
       *result,
       AllOf(ProbeSuccess(Eq(true)), ProbeIpPreference(Eq(IpPreference::kIpv6)),
-            ProbePeerAddress(Eq("ipv6:[2607:f8b0:4000:800::200a]:443"))));
+            ProbePeerAddress(Eq("ipv6:[2001:4860:8040::1]:443"))));
+}
+
+TEST(DirectPathProberTest, ProbeWithPeerAuthenticatedDirectPathIpv6MaxSubnet) {
+  auto mock_stub = std::make_shared<bigtable::testing::MockBigtableStub>();
+  EXPECT_CALL(*mock_stub, PingAndWarm)
+      .WillRepeatedly([](grpc::ClientContext&, Options const&,
+                         google::bigtable::v2::PingAndWarmRequest const&,
+                         bigtable_internal::OperationContext&) {
+        return google::bigtable::v2::PingAndWarmResponse{};
+      });
+
+  auto auth_ctx =
+      std::make_shared<FakeAuthContext>(true, std::vector<std::string>{"ssl"});
+  bigtable::InstanceResource const instance(Project("test-proj"), "test-inst");
+
+  for (std::string const& peer : {
+           std::string{"ipv6:[2001:4860:807f:ffff:ffff:ffff:ffff:ffff]:443"},
+           std::string{"ipv6:2001:4860:8040::1"},
+           std::string{"ipv6:[2001:4860:8040::1%eth0]:443"},
+           std::string{"ipv6:[::ffff:34.126.1.1]:443"},
+       }) {
+    StatusOr<DirectPathProbeResult> const result =
+        DirectPathProber::Probe(nullptr, instance, Options{}, CompletionQueue{},
+                                mock_stub, peer, auth_ctx);
+    ASSERT_THAT(result, IsOk()) << peer;
+    EXPECT_THAT(*result, AllOf(ProbeSuccess(Eq(true)),
+                               ProbeIpPreference(Eq(IpPreference::kIpv6)),
+                               ProbePeerAddress(Eq(peer))))
+        << peer;
+  }
+}
+
+TEST(DirectPathProberTest, ProbeWithPeerAuthenticatedNonDirectPathIpv6) {
+  auto mock_stub = std::make_shared<bigtable::testing::MockBigtableStub>();
+  EXPECT_CALL(*mock_stub, PingAndWarm)
+      .WillRepeatedly([](grpc::ClientContext&, Options const&,
+                         google::bigtable::v2::PingAndWarmRequest const&,
+                         bigtable_internal::OperationContext&) {
+        return google::bigtable::v2::PingAndWarmResponse{};
+      });
+
+  auto auth_ctx =
+      std::make_shared<FakeAuthContext>(true, std::vector<std::string>{"ssl"});
+  bigtable::InstanceResource const instance(Project("test-proj"), "test-inst");
+
+  for (std::string const& peer : {
+           // Public Google GFE IPv6 address (must NOT match DirectPath).
+           std::string{"ipv6:[2607:f8b0:4000:800::200a]:443"},
+           // Immediately below 2001:4860:8040::/42.
+           std::string{"ipv6:[2001:4860:803f:ffff:ffff:ffff:ffff:ffff]:443"},
+           // Immediately above 2001:4860:8040::/42.
+           std::string{"ipv6:[2001:4860:8080::1]:443"},
+           // IPv4-mapped IPv6 outside 34.126.0.0/18.
+           std::string{"ipv6:[::ffff:34.126.64.1]:443"},
+           // Malformed IPv6 peers.
+           std::string{"ipv6:[invalid]:443"},
+           std::string{"ipv6:[2001:4860:8040::1::2]:443"},
+           std::string{"ipv6:[2001:4860:8040::1]:99999"},
+       }) {
+    StatusOr<DirectPathProbeResult> const result =
+        DirectPathProber::Probe(nullptr, instance, Options{}, CompletionQueue{},
+                                mock_stub, peer, auth_ctx);
+    ASSERT_THAT(result, IsOk()) << peer;
+    EXPECT_THAT(*result, AllOf(ProbeSuccess(Eq(false)),
+                               ProbeIpPreference(Eq(IpPreference::kNone)),
+                               ProbePeerAddress(Eq(peer))))
+        << peer;
+  }
 }
 
 TEST(DirectPathProberTest, ProbeWithPeerAuthenticatedNonDirectPathIpv4) {

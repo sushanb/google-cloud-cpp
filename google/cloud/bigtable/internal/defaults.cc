@@ -75,11 +75,13 @@ Options DefaultConnectionRefreshOptions(Options opts) {
     opts.set<MinConnectionRefreshOption>(kDefaultMinRefreshPeriod);
     opts.set<MaxConnectionRefreshOption>(kDefaultMaxRefreshPeriod);
   } else if (has_min && !has_max) {
-    opts.set<MaxConnectionRefreshOption>((std::max)(
-        opts.get<MinConnectionRefreshOption>(), kDefaultMaxRefreshPeriod));
+    opts.set<MaxConnectionRefreshOption>(
+        (std::max)(opts.get<MinConnectionRefreshOption>(),
+                   kDefaultMaxRefreshPeriod));
   } else if (!has_min && has_max) {
-    opts.set<MinConnectionRefreshOption>((std::min)(
-        opts.get<MaxConnectionRefreshOption>(), kDefaultMinRefreshPeriod));
+    opts.set<MinConnectionRefreshOption>(
+        (std::min)(opts.get<MaxConnectionRefreshOption>(),
+                   kDefaultMinRefreshPeriod));
   } else {
     // If the range is invalid, use the greater value as both the min and max
     auto const p = opts.get<MinConnectionRefreshOption>();
@@ -128,6 +130,10 @@ int DefaultConnectionPoolSize() {
 }
 
 bool IsDirectPath(Options const& options) {
+  if (options.get<::google::cloud::bigtable_internal::
+                      DirectPathFallbackToCloudPathOption>()) {
+    return false;
+  }
   std::optional<std::string> const direct_path =
       google::cloud::internal::GetEnv("GOOGLE_CLOUD_ENABLE_DIRECT_PATH");
   // Bigtable specific env var for Direct Path support used by all clients.
