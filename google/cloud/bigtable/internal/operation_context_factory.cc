@@ -59,9 +59,9 @@ TableResourceLabels TableResourceLabelsFromInstanceName(
   // projects/<project>/instances/<instance>
   std::vector<std::string_view> name_parts = absl::StrSplit(instance_name, '/');
   if (name_parts.size() < 4) return {};
-  TableResourceLabels resource_labels = {std::string(name_parts[1]),
-                                         std::string(name_parts[3]), "",
-                                         "" /*=cluster*/, "" /*=zone*/};
+  TableResourceLabels resource_labels = {
+      std::string(name_parts[1]), std::string(name_parts[3]),
+      "<unspecified>" /*=table*/, "" /*=cluster*/, "" /*=zone*/};
   return resource_labels;
 }
 
