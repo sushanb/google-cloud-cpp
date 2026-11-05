@@ -14,6 +14,7 @@
 
 #include "google/cloud/bigtable/internal/data_connection_impl.h"
 #include "google/cloud/bigtable/data_connection.h"
+#include "google/cloud/bigtable/internal/bigtable_metadata_decorator.h"
 #include "google/cloud/bigtable/internal/crc32c.h"
 #include "google/cloud/bigtable/internal/defaults.h"
 #include "google/cloud/bigtable/internal/operation_context.h"
@@ -49,6 +50,7 @@
 #include <gmock/gmock.h>
 #include <grpcpp/client_context.h>
 #include <chrono>
+#include <map>
 
 namespace google {
 namespace cloud {
@@ -2434,6 +2436,81 @@ TEST_F(DataConnectionTest, SampleRowsRetryInfoIgnored) {
       CallOptions().set<EnableServerRetriesOption>(false));
   auto samples = conn->SampleRows(kTableName);
   EXPECT_THAT(samples, StatusIs(StatusCode::kPermissionDenied));
+}
+
+TEST_F(DataConnectionTest, SampleRowsForwardsOptions) {
+  auto mock = std::make_shared<MockBigtableStub>();
+  auto const custom_headers = CustomHeadersOption::Type{
+      {"x-custom-header", "custom-value"},
+  };
+  auto verify_attempt = [this](grpc::ClientContext& context,
+                               Options const& options,
+                               v2::SampleRowKeysRequest const& request) {
+    EXPECT_EQ(options.get<UserProjectOption>(), "test-user-project");
+    EXPECT_EQ(options.get<AuthorityOption>(), "custom-authority.example.com");
+    EXPECT_EQ(options.get<QuotaUserOption>(), "test-quota-user");
+    EXPECT_EQ(options.get<FieldMaskOption>(), "row_key,offset_bytes");
+    EXPECT_THAT(options.get<CustomHeadersOption>(),
+                ElementsAre(Pair("x-custom-header", "custom-value")));
+    EXPECT_EQ(kAppProfile, request.app_profile_id());
+    EXPECT_EQ(kTableName, request.table_name());
+
+    auto headers = metadata_fixture_.GetMetadata(context);
+    EXPECT_THAT(headers,
+                Contains(Pair("x-goog-user-project", "test-user-project")));
+    EXPECT_THAT(headers,
+                Contains(Pair("x-goog-quota-user", "test-quota-user")));
+    EXPECT_THAT(headers,
+                Contains(Pair("x-goog-fieldmask", "row_key,offset_bytes")));
+    EXPECT_THAT(headers, Contains(Pair("x-custom-header", "custom-value")));
+  };
+
+  EXPECT_CALL(*mock, SampleRowKeys)
+      .WillOnce(
+          [&verify_attempt](
+              std::shared_ptr<grpc::ClientContext> context,
+              Options const& options, v2::SampleRowKeysRequest const& request,
+              std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            verify_attempt(*context, options, request);
+            auto stream = std::make_unique<MockSampleRowKeysStream>();
+            EXPECT_CALL(*stream, Read).WillOnce(Return(TransientError()));
+            return stream;
+          })
+      .WillOnce(
+          [&verify_attempt](
+              std::shared_ptr<grpc::ClientContext> context,
+              Options const& options, v2::SampleRowKeysRequest const& request,
+              std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            verify_attempt(*context, options, request);
+            auto stream = std::make_unique<MockSampleRowKeysStream>();
+            EXPECT_CALL(*stream, Read)
+                .WillOnce([](google::bigtable::v2::SampleRowKeysResponse* r) {
+                  *r = MakeSampleRowsResponse("row1", 42);
+                  return std::nullopt;
+                })
+                .WillOnce(Return(Status{}));
+            return stream;
+          });
+
+  MockFunction<void(grpc::ClientContext&)> mock_setup;
+  EXPECT_CALL(mock_setup, Call).Times(2);
+
+  auto decorated = std::make_shared<BigtableMetadata>(
+      std::move(mock), std::multimap<std::string, std::string>{});
+  auto conn = TestConnection(std::move(decorated));
+  internal::OptionsSpan span(
+      CallOptionsWithoutClientContextSetup()
+          .set<internal::GrpcSetupOption>(mock_setup.AsStdFunction())
+          .set<UserProjectOption>("test-user-project")
+          .set<AuthorityOption>("custom-authority.example.com")
+          .set<QuotaUserOption>("test-quota-user")
+          .set<FieldMaskOption>("row_key,offset_bytes")
+          .set<CustomHeadersOption>(custom_headers));
+  auto samples = conn->SampleRows(kTableName);
+  ASSERT_STATUS_OK(samples);
+  auto actual = RowKeySampleVectors(*samples);
+  EXPECT_THAT(actual.offset_bytes, ElementsAre(42));
+  EXPECT_THAT(actual.row_keys, ElementsAre("row1"));
 }
 
 // The `AsyncRowSampler` is tested extensively in `async_row_sampler_test.cc`.
