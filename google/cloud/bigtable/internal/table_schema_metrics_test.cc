@@ -258,6 +258,106 @@ TEST(GetPeerInfoFromMetadata, InvalidBase64Trailers) {
   }
 }
 
+TEST(GetPeerInfoFromMetadata, MultipleHeadersInitialSkipsInvalid) {
+  std::string const invalid_proto{"\x12\x7f", 2};
+  google::bigtable::v2::PeerInfo unused;
+  ASSERT_FALSE(unused.ParseFromString(invalid_proto));
+
+  google::bigtable::v2::PeerInfo peer_info;
+  peer_info.set_transport_type(
+      google::bigtable::v2::PeerInfo::TRANSPORT_TYPE_DIRECT_ACCESS);
+  peer_info.set_application_frontend_region("my-region");
+  peer_info.set_application_frontend_subzone("my-subzone");
+
+  grpc::ClientContext client_context;
+  RpcMetadata server_metadata;
+  server_metadata.headers.emplace("bigtable-peer-info", "invalid-base64!");
+  server_metadata.headers.emplace("bigtable-peer-info",
+                                  absl::WebSafeBase64Escape(invalid_proto));
+  server_metadata.headers.emplace(
+      "bigtable-peer-info",
+      absl::WebSafeBase64Escape(peer_info.SerializeAsString()));
+  SetServerMetadata(client_context, server_metadata);
+
+  auto result = GetPeerInfoFromServerMetadata(client_context);
+  ASSERT_TRUE(result);
+  EXPECT_THAT(result->transport_type(),
+              Eq(google::bigtable::v2::PeerInfo::TRANSPORT_TYPE_DIRECT_ACCESS));
+  EXPECT_THAT(result->application_frontend_region(), Eq("my-region"));
+  EXPECT_THAT(result->application_frontend_subzone(), Eq("my-subzone"));
+}
+
+TEST(GetPeerInfoFromMetadata, InvalidProtobufInInitialFallsBackToTrailers) {
+  std::string const invalid_proto{"\x12\x7f", 2};
+  google::bigtable::v2::PeerInfo unused;
+  ASSERT_FALSE(unused.ParseFromString(invalid_proto));
+
+  google::bigtable::v2::PeerInfo peer_info;
+  peer_info.set_transport_type(
+      google::bigtable::v2::PeerInfo::TRANSPORT_TYPE_DIRECT_ACCESS);
+  peer_info.set_application_frontend_region("trailer-region");
+  peer_info.set_application_frontend_subzone("trailer-subzone");
+
+  grpc::ClientContext client_context;
+  RpcMetadata server_metadata;
+  server_metadata.headers.emplace("bigtable-peer-info",
+                                  absl::WebSafeBase64Escape(invalid_proto));
+  server_metadata.trailers.emplace(
+      "bigtable-peer-info",
+      absl::WebSafeBase64Escape(peer_info.SerializeAsString()));
+  SetServerMetadata(client_context, server_metadata);
+
+  auto result = GetPeerInfoFromServerMetadata(client_context);
+  ASSERT_TRUE(result);
+  EXPECT_THAT(result->transport_type(),
+              Eq(google::bigtable::v2::PeerInfo::TRANSPORT_TYPE_DIRECT_ACCESS));
+  EXPECT_THAT(result->application_frontend_region(), Eq("trailer-region"));
+  EXPECT_THAT(result->application_frontend_subzone(), Eq("trailer-subzone"));
+}
+
+TEST(GetPeerInfoFromMetadata, InvalidProtobufOnlyReturnsNullopt) {
+  std::string const invalid_proto{"\x12\x7f", 2};
+  google::bigtable::v2::PeerInfo unused;
+  ASSERT_FALSE(unused.ParseFromString(invalid_proto));
+
+  grpc::ClientContext client_context;
+  RpcMetadata server_metadata;
+  server_metadata.headers.emplace("bigtable-peer-info",
+                                  absl::WebSafeBase64Escape(invalid_proto));
+  SetServerMetadata(client_context, server_metadata);
+
+  EXPECT_THAT(GetPeerInfoFromServerMetadata(client_context), Eq(std::nullopt));
+}
+
+TEST(GetPeerInfoFromMetadata, MultipleHeadersTrailersSkipsInvalid) {
+  std::string const invalid_proto{"\x12\x7f", 2};
+  google::bigtable::v2::PeerInfo unused;
+  ASSERT_FALSE(unused.ParseFromString(invalid_proto));
+
+  google::bigtable::v2::PeerInfo peer_info;
+  peer_info.set_transport_type(
+      google::bigtable::v2::PeerInfo::TRANSPORT_TYPE_DIRECT_ACCESS);
+  peer_info.set_application_frontend_region("trailer-region");
+  peer_info.set_application_frontend_subzone("trailer-subzone");
+
+  grpc::ClientContext client_context;
+  RpcMetadata server_metadata;
+  server_metadata.trailers.emplace("bigtable-peer-info", "invalid-base64!");
+  server_metadata.trailers.emplace("bigtable-peer-info",
+                                   absl::WebSafeBase64Escape(invalid_proto));
+  server_metadata.trailers.emplace(
+      "bigtable-peer-info",
+      absl::WebSafeBase64Escape(peer_info.SerializeAsString()));
+  SetServerMetadata(client_context, server_metadata);
+
+  auto result = GetPeerInfoFromServerMetadata(client_context);
+  ASSERT_TRUE(result);
+  EXPECT_THAT(result->transport_type(),
+              Eq(google::bigtable::v2::PeerInfo::TRANSPORT_TYPE_DIRECT_ACCESS));
+  EXPECT_THAT(result->application_frontend_region(), Eq("trailer-region"));
+  EXPECT_THAT(result->application_frontend_subzone(), Eq("trailer-subzone"));
+}
+
 void SetClusterZone(grpc::ClientContext& client_context) {
   CreateServerMetadata(client_context,
                        CreateServerMetadataOptions{false, true});
@@ -1524,6 +1624,64 @@ TEST(GetServerLatencyFromInitialMetadata, NoGfePresent) {
   EXPECT_FALSE(result);
 }
 
+TEST(GetServerLatencyFromInitialMetadata, MultipleServerTimingHeaders) {
+  grpc::ClientContext client_context;
+  RpcMetadata server_metadata;
+  server_metadata.headers.emplace("server-timing", "proxy; dur=1.2");
+  server_metadata.headers.emplace("server-timing", "gfet4t7; dur=42.5");
+  SetServerMetadata(client_context, server_metadata);
+
+  EXPECT_TRUE(HasServerTiming(client_context));
+  auto result = GetServerLatencyFromInitialMetadata(client_context);
+  ASSERT_TRUE(result);
+  EXPECT_THAT(*result, Eq(42.5));
+}
+
+TEST(GetServerLatencyFromInitialMetadata,
+     MultipleHeadersReturnsFirstValidNonNegativeGfe) {
+  grpc::ClientContext client_context;
+  RpcMetadata server_metadata;
+  server_metadata.headers.emplace("server-timing", "gfet4t7; dur=invalid");
+  server_metadata.headers.emplace("server-timing", "gfet4t7; dur=-5.0");
+  server_metadata.headers.emplace("server-timing", "gfet4t7; dur=10.5ms");
+  server_metadata.headers.emplace("server-timing",
+                                  "gfet4t7; desc=frontend; dur=18.25");
+  server_metadata.headers.emplace("server-timing", "gfet4t7; dur=99.0");
+  SetServerMetadata(client_context, server_metadata);
+
+  auto result = GetServerLatencyFromInitialMetadata(client_context);
+  ASSERT_TRUE(result);
+  EXPECT_THAT(*result, Eq(18.25));
+}
+
+TEST(GetServerLatencyFromInitialMetadata, NegativeOrMalformedDurValues) {
+  {
+    grpc::ClientContext client_context;
+    RpcMetadata server_metadata;
+    server_metadata.headers.emplace("server-timing", "gfet4t7; dur=-1.5");
+    SetServerMetadata(client_context, server_metadata);
+    EXPECT_THAT(GetServerLatencyFromInitialMetadata(client_context),
+                Eq(std::nullopt));
+  }
+  {
+    grpc::ClientContext client_context;
+    RpcMetadata server_metadata;
+    server_metadata.headers.emplace("server-timing", "gfet4t7; dur=nan");
+    SetServerMetadata(client_context, server_metadata);
+    EXPECT_THAT(GetServerLatencyFromInitialMetadata(client_context),
+                Eq(std::nullopt));
+  }
+  {
+    grpc::ClientContext client_context;
+    RpcMetadata server_metadata;
+    server_metadata.headers.emplace("server-timing", "gfet4t7; dur=0");
+    SetServerMetadata(client_context, server_metadata);
+    auto result = GetServerLatencyFromInitialMetadata(client_context);
+    ASSERT_TRUE(result);
+    EXPECT_THAT(*result, Eq(0.0));
+  }
+}
+
 TEST(ServerLatency, SingleSuccess) {
   auto mock_histogram = std::make_unique<MockHistogram<double>>();
   EXPECT_CALL(
@@ -1818,6 +1976,82 @@ TEST(ServerLatency, NoServerTiming) {
 
   grpc::ClientContext client_context;
   SetClusterZone(client_context);
+  auto otel_context = opentelemetry::context::RuntimeContext::GetCurrent();
+  auto clock = std::make_shared<FakeSteadyClock>();
+  clone->PostCall(otel_context, client_context,
+                  {clock->Now(), Status{StatusCode::kOk, "ok"}});
+}
+
+TEST(ServerLatency, MultipleServerTimingHeaders) {
+  auto mock_histogram = std::make_unique<MockHistogram<double>>();
+  EXPECT_CALL(
+      *mock_histogram,
+      Record(A<double>(), A<opentelemetry::common::KeyValueIterable const&>(),
+             A<opentelemetry::context::Context const&>()))
+      .WillOnce([](double value,
+                   opentelemetry::common::KeyValueIterable const& attributes,
+                   opentelemetry::context::Context const&) {
+        EXPECT_THAT(value, Eq(42.5));
+        EXPECT_THAT(
+            MakeAttributesMap(attributes),
+            UnorderedElementsAre(
+                Pair("project_id", "my-project-id"),
+                Pair("instance", "my-instance"), Pair("cluster", "my-cluster"),
+                Pair("table", "my-table"), Pair("zone", "my-zone"),
+                Pair("method", "my-method"), Pair("streaming", "my-streaming"),
+                Pair("status", "OK"), Pair("client_name", "my-client-name"),
+                Pair("client_uid", "my-client-uid"),
+                Pair("app_profile", "my-app-profile")));
+      });
+
+  opentelemetry::nostd::shared_ptr<MockMeter> mock_meter =
+      std::make_shared<MockMeter>();
+  EXPECT_CALL(*mock_meter, CreateDoubleHistogram)
+      .WillOnce([mock = std::move(mock_histogram)](
+                    opentelemetry::nostd::string_view name,
+                    opentelemetry::nostd::string_view,
+                    opentelemetry::nostd::string_view) mutable {
+        EXPECT_THAT(name, Eq("server_latencies"));
+        return std::move(mock);
+      });
+
+  opentelemetry::nostd::shared_ptr<MockMeterProvider> mock_provider =
+      std::make_shared<MockMeterProvider>();
+  EXPECT_CALL(*mock_provider, GetMeter)
+#if OPENTELEMETRY_ABI_VERSION_NO >= 2
+      .WillOnce([&](opentelemetry::nostd::string_view scope,
+                    opentelemetry::nostd::string_view scope_version,
+                    opentelemetry::nostd::string_view,
+                    opentelemetry::common::KeyValueIterable const*) mutable {
+#else
+      .WillOnce([&](opentelemetry::nostd::string_view scope,
+                    opentelemetry::nostd::string_view scope_version,
+                    opentelemetry::nostd::string_view) mutable {
+#endif
+        EXPECT_THAT(scope, Eq("my-instrument-scope"));
+        EXPECT_THAT(scope_version, Eq("v1"));
+        return mock_meter;
+      });
+
+  ServerLatency server_latency("my-instrument-scope", mock_provider);
+  TableResourceLabels resource_labels{"my-project-id", "my-instance",
+                                      "my-table", "", ""};
+  TableDataLabels data_labels{"my-method",      "my-streaming",
+                              "my-client-name", "my-client-uid",
+                              "my-app-profile", ""};
+  auto clone = server_latency.clone(resource_labels, data_labels);
+
+  grpc::ClientContext client_context;
+  google::bigtable::v2::ResponseParams response_params;
+  response_params.set_cluster_id("my-cluster");
+  response_params.set_zone_id("my-zone");
+  RpcMetadata server_metadata;
+  server_metadata.headers.emplace("server-timing", "proxy; dur=1.2");
+  server_metadata.headers.emplace("server-timing", "gfet4t7; dur=42.5");
+  server_metadata.trailers.emplace("x-goog-ext-425905942-bin",
+                                   response_params.SerializeAsString());
+  SetServerMetadata(client_context, server_metadata);
+
   auto otel_context = opentelemetry::context::RuntimeContext::GetCurrent();
   auto clock = std::make_shared<FakeSteadyClock>();
   clone->PostCall(otel_context, client_context,

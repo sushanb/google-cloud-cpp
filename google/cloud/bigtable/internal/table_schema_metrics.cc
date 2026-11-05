@@ -27,8 +27,11 @@
 #include <opentelemetry/context/runtime_context.h>
 #include <opentelemetry/metrics/meter.h>
 #include <algorithm>
+#include <cmath>
 #include <map>
+#include <optional>
 #include <set>
+#include <string>
 #include <string_view>
 
 namespace google {
@@ -37,6 +40,23 @@ namespace bigtable_internal {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace {
 auto constexpr kMeterInstrumentationScopeVersion = "v1";
+
+std::optional<google::bigtable::v2::PeerInfo> ExtractPeerInfoFromMultimap(
+    std::multimap<grpc::string_ref, grpc::string_ref> const& metadata) {
+  auto [begin, end] = metadata.equal_range("bigtable-peer-info");
+  for (auto it = begin; it != end; ++it) {
+    std::string decoded;
+    if (!absl::WebSafeBase64Unescape(
+            std::string_view{it->second.data(), it->second.size()}, &decoded)) {
+      continue;
+    }
+    google::bigtable::v2::PeerInfo peer_info;
+    if (peer_info.ParseFromString(decoded)) {
+      return peer_info;
+    }
+  }
+  return std::nullopt;
+}
 }  // namespace
 
 // TODO(#15329): Refactor how we're handling different data labels for
@@ -123,60 +143,45 @@ GetResponseParamsFromTrailingMetadata(
 std::optional<google::bigtable::v2::PeerInfo> GetPeerInfoFromServerMetadata(
     grpc::ClientContext const& client_context) {
   // The peer info is sent in the initial metadata and encoded in WebSafeBase64.
-  std::string decoded;
-  auto const& init_metadata = client_context.GetServerInitialMetadata();
-  auto iter_init = init_metadata.find("bigtable-peer-info");
-  if (iter_init == init_metadata.end() ||
-      !absl::WebSafeBase64Unescape(
-          std::string_view{iter_init->second.data(), iter_init->second.size()},
-          &decoded)) {
-    // Find it in trailing metadata if not found in initial metadata or failed
-    // to decode.
-    auto const& trailing_metadata = client_context.GetServerTrailingMetadata();
-    auto iter_trailing = trailing_metadata.find("bigtable-peer-info");
-    if (iter_trailing == trailing_metadata.end() ||
-        !absl::WebSafeBase64Unescape(
-            std::string_view{iter_trailing->second.data(),
-                             iter_trailing->second.size()},
-            &decoded)) {
-      return std::nullopt;
-    }
+  if (auto peer_info = ExtractPeerInfoFromMultimap(
+          client_context.GetServerInitialMetadata())) {
+    return peer_info;
   }
-  google::bigtable::v2::PeerInfo p;
-  if (p.ParseFromString(decoded)) return p;
-  return std::nullopt;
+  // Find it in trailing metadata if not found or invalid in initial metadata.
+  return ExtractPeerInfoFromMultimap(
+      client_context.GetServerTrailingMetadata());
 }
 
 std::optional<double> GetServerLatencyFromInitialMetadata(
     grpc::ClientContext const& client_context) {
   auto const& initial_metadata = client_context.GetServerInitialMetadata();
-  auto it = initial_metadata.find("server-timing");
-  if (it == initial_metadata.end()) {
-    return std::nullopt;
-  }
+  auto [begin, end] = initial_metadata.equal_range("server-timing");
 
-  std::string_view value(it->second.data(), it->second.length());
+  for (auto it = begin; it != end; ++it) {
+    std::string_view value(it->second.data(), it->second.length());
 
-  for (std::string_view entry : absl::StrSplit(value, ',')) {
-    entry = absl::StripAsciiWhitespace(entry);
-    std::vector<std::string_view> parts = absl::StrSplit(entry, ';');
-    if (parts.empty()) {
-      continue;
-    }
+    for (std::string_view entry : absl::StrSplit(value, ',')) {
+      entry = absl::StripAsciiWhitespace(entry);
+      std::vector<std::string_view> parts = absl::StrSplit(entry, ';');
+      if (parts.empty()) {
+        continue;
+      }
 
-    std::string_view metric_name = absl::StripAsciiWhitespace(parts[0]);
-    if (metric_name == "gfet4t7") {
-      // Look for the "dur" parameter within its parts.
-      for (size_t i = 1; i < parts.size(); ++i) {
-        std::string_view param = absl::StripAsciiWhitespace(parts[i]);
-        if (absl::ConsumePrefix(&param, "dur=")) {
-          double dur_value;
-          auto result = absl::from_chars(
-              param.data(), param.data() + param.size(), dur_value);
-          if (result.ec == std::errc()) {
-            return dur_value;
+      std::string_view metric_name = absl::StripAsciiWhitespace(parts[0]);
+      if (metric_name == "gfet4t7") {
+        // Look for the "dur" parameter within its parts.
+        for (size_t i = 1; i < parts.size(); ++i) {
+          std::string_view param = absl::StripAsciiWhitespace(parts[i]);
+          if (absl::ConsumePrefix(&param, "dur=")) {
+            double dur_value;
+            auto result = absl::from_chars(
+                param.data(), param.data() + param.size(), dur_value);
+            if (result.ec == std::errc() &&
+                result.ptr == param.data() + param.size() &&
+                std::isfinite(dur_value) && dur_value >= 0.0) {
+              return dur_value;
+            }
           }
-          return std::nullopt;
         }
       }
     }
