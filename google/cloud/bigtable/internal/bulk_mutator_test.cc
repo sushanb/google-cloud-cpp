@@ -850,6 +850,40 @@ TEST_F(BulkMutatorTest, BigtableCookies) {
   status = mutator.MakeOneRequest(*mock, limiter, Options{});
   EXPECT_THAT(status, StatusIs(StatusCode::kPermissionDenied));
 }
+
+TEST_F(BulkMutatorTest, StateOnFinishServerRetries) {
+  auto policy = DefaultIdempotentMutationPolicy();
+  auto retry_status =
+      google::cloud::internal::ResourceExhaustedError("try again");
+  google::cloud::internal::SetRetryInfo(
+      retry_status, google::cloud::internal::RetryInfo{10_ms});
+
+  bigtable_internal::BulkMutatorState state_enabled(
+      kAppProfile, kTableName, *policy,
+      BulkMutation(NonIdempotentMutation("r0"), NonIdempotentMutation("r1")));
+  auto const& req1 = state_enabled.BeforeStart();
+  ASSERT_EQ(2, req1.entries_size());
+  state_enabled.OnRead(MakeResponse({{0, grpc::StatusCode::OK}}));
+  state_enabled.OnFinish(retry_status, /*enable_server_retries=*/true);
+  EXPECT_TRUE(state_enabled.HasPendingMutations());
+  auto const& req2 = state_enabled.BeforeStart();
+  ASSERT_EQ(1, req2.entries_size());
+  EXPECT_EQ("r1", req2.entries(0).row_key());
+  state_enabled.OnRead(MakeResponse({{0, grpc::StatusCode::OK}}));
+  state_enabled.OnFinish(Status{}, /*enable_server_retries=*/true);
+  EXPECT_FALSE(state_enabled.HasPendingMutations());
+  EXPECT_THAT(std::move(state_enabled).OnRetryDone(), IsEmpty());
+
+  bigtable_internal::BulkMutatorState state_disabled(
+      kAppProfile, kTableName, *policy,
+      BulkMutation(NonIdempotentMutation("r0"), NonIdempotentMutation("r1")));
+  (void)state_disabled.BeforeStart();
+  state_disabled.OnRead(MakeResponse({{0, grpc::StatusCode::OK}}));
+  state_disabled.OnFinish(retry_status, /*enable_server_retries=*/false);
+  EXPECT_FALSE(state_disabled.HasPendingMutations());
+  EXPECT_THAT(std::move(state_disabled).OnRetryDone(),
+              ElementsAre(FailedMutation(retry_status, 1)));
+}
 }  // namespace
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
 }  // namespace bigtable

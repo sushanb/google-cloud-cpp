@@ -99,7 +99,7 @@ void AsyncBulkApplier::OnRead(
 
 void AsyncBulkApplier::OnFinish(Status const& status) {
   operation_context_->PostCall(*client_context_, status);
-  state_.OnFinish(status);
+  state_.OnFinish(status, enable_server_retries_);
 
   if (!state_.HasPendingMutations()) {
     SetPromise();
