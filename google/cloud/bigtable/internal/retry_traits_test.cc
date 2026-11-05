@@ -18,6 +18,7 @@
 #include "google/rpc/error_details.pb.h"
 #include "google/rpc/status.pb.h"
 #include <gmock/gmock.h>
+#include <string>
 
 namespace google {
 namespace cloud {
@@ -87,6 +88,98 @@ TEST(QueryPlanRefreshRetry, QueryPlanNotExpiredStatusPayload) {
                        status.SerializeAsString());
   EXPECT_FALSE(ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(
       query_plan_not_expired_violation));
+  EXPECT_FALSE(ExecuteQueryPlanRefreshRetry::ShouldInvalidateQueryPlan(
+      query_plan_not_expired_violation));
+}
+
+TEST(QueryPlanRefreshRetry, QueryPlanFailPermanentlyNoStatusPayload) {
+  auto fail_permanently = internal::FailedPreconditionError(
+      "Do not retry: PREPARED_QUERY_EXPIRED_FAIL_PERMANENTLY");
+  EXPECT_FALSE(
+      ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(fail_permanently));
+  EXPECT_FALSE(
+      ExecuteQueryPlanRefreshRetry::IsTransientFailure(fail_permanently));
+  EXPECT_TRUE(
+      ExecuteQueryPlanRefreshRetry::IsPermanentFailure(fail_permanently));
+  EXPECT_TRUE(ExecuteQueryPlanRefreshRetry::ShouldInvalidateQueryPlan(
+      fail_permanently));
+}
+
+TEST(QueryPlanRefreshRetry, QueryPlanFailPermanentlyStatusPayload) {
+  auto fail_permanently = internal::FailedPreconditionError(
+      "Do not retry: PREPARED_QUERY_EXPIRED_FAIL_PERMANENTLY");
+  google::rpc::PreconditionFailure_Violation violation;
+  violation.set_type("PREPARED_QUERY_EXPIRED_FAIL_PERMANENTLY");
+  violation.set_description("Do not retry or resume this ExecuteQuery request");
+  google::rpc::PreconditionFailure precondition;
+  *precondition.add_violations() = violation;
+  google::rpc::Status status;
+  status.set_code(9);
+  status.set_message("Do not retry: PREPARED_QUERY_EXPIRED");
+  google::protobuf::Any any;
+  ASSERT_TRUE(any.PackFrom(precondition));
+  *status.add_details() = any;
+  internal::SetPayload(fail_permanently,
+                       google::cloud::internal::StatusPayloadGrpcProto(),
+                       status.SerializeAsString());
+
+  EXPECT_FALSE(
+      ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(fail_permanently));
+  EXPECT_FALSE(
+      ExecuteQueryPlanRefreshRetry::IsTransientFailure(fail_permanently));
+  EXPECT_TRUE(ExecuteQueryPlanRefreshRetry::ShouldInvalidateQueryPlan(
+      fail_permanently));
+
+  // Structured PreconditionFailure violation takes precedence even if the text
+  // message contains the substring "PREPARED_QUERY_EXPIRED".
+  auto message_mentions_expired =
+      internal::FailedPreconditionError("PREPARED_QUERY_EXPIRED");
+  internal::SetPayload(message_mentions_expired,
+                       google::cloud::internal::StatusPayloadGrpcProto(),
+                       status.SerializeAsString());
+  EXPECT_FALSE(ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(
+      message_mentions_expired));
+  EXPECT_TRUE(ExecuteQueryPlanRefreshRetry::ShouldInvalidateQueryPlan(
+      message_mentions_expired));
+}
+
+TEST(QueryPlanRefreshRetry, MarkNonRetryableAfterResumeToken) {
+  auto query_plan_expired =
+      internal::FailedPreconditionError("failed precondition");
+  google::rpc::PreconditionFailure_Violation violation;
+  violation.set_type("PREPARED_QUERY_EXPIRED");
+  violation.set_description("The prepared query has expired.");
+  google::rpc::PreconditionFailure precondition;
+  *precondition.add_violations() = violation;
+  google::rpc::Status status;
+  status.set_code(9);
+  status.set_message("failed precondition");
+  google::protobuf::Any any;
+  ASSERT_TRUE(any.PackFrom(precondition));
+  *status.add_details() = any;
+  auto serialized = status.SerializeAsString();
+  internal::SetPayload(query_plan_expired,
+                       google::cloud::internal::StatusPayloadGrpcProto(),
+                       serialized);
+
+  EXPECT_TRUE(
+      ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(query_plan_expired));
+  EXPECT_TRUE(ExecuteQueryPlanRefreshRetry::ShouldInvalidateQueryPlan(
+      query_plan_expired));
+
+  ExecuteQueryPlanRefreshRetry::MarkNonRetryableAfterResumeToken(
+      query_plan_expired);
+  EXPECT_EQ(query_plan_expired.code(), StatusCode::kFailedPrecondition);
+  EXPECT_EQ(
+      internal::GetPayload(query_plan_expired,
+                           google::cloud::internal::StatusPayloadGrpcProto()),
+      serialized);
+  EXPECT_FALSE(
+      ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(query_plan_expired));
+  EXPECT_FALSE(
+      ExecuteQueryPlanRefreshRetry::IsTransientFailure(query_plan_expired));
+  EXPECT_TRUE(ExecuteQueryPlanRefreshRetry::ShouldInvalidateQueryPlan(
+      query_plan_expired));
 }
 
 }  // namespace

@@ -37,6 +37,8 @@
 #include "google/cloud/credentials.h"
 #include "google/cloud/grpc_options.h"
 #include "google/cloud/internal/async_streaming_read_rpc_impl.h"
+#include "google/cloud/internal/make_status.h"
+#include "google/cloud/internal/status_payload_keys.h"
 #include "google/cloud/internal/time_utils.h"
 #include "google/cloud/status_or.h"
 #include "google/cloud/testing_util/fake_completion_queue_impl.h"
@@ -45,10 +47,16 @@
 #include "google/cloud/testing_util/status_matchers.h"
 #include "google/cloud/testing_util/validate_metadata.h"
 #include "absl/strings/substitute.h"
+#include "google/rpc/error_details.pb.h"
+#include "google/rpc/status.pb.h"
 #include <google/protobuf/text_format.h>
 #include <gmock/gmock.h>
 #include <grpcpp/client_context.h>
 #include <chrono>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace google {
 namespace cloud {
@@ -106,6 +114,44 @@ Status QueryPlanError() {
   return Status(StatusCode::kFailedPrecondition,
                 "oops! PREPARED_QUERY_EXPIRED");
 }
+
+Status MakePreconditionViolationStatus(std::string const& violation_type,
+                                       std::string const& message) {
+  auto s = internal::FailedPreconditionError(message);
+  google::rpc::PreconditionFailure_Violation violation;
+  violation.set_type(violation_type);
+  violation.set_description(message);
+  google::rpc::PreconditionFailure precondition;
+  *precondition.add_violations() = violation;
+  google::rpc::Status proto;
+  proto.set_code(9);
+  proto.set_message(message);
+  google::protobuf::Any any;
+  if (any.PackFrom(precondition)) {
+    *proto.add_details() = any;
+    internal::SetPayload(s, google::cloud::internal::StatusPayloadGrpcProto(),
+                         proto.SerializeAsString());
+  }
+  return s;
+}
+
+class CountingBackoffPolicy : public BackoffPolicy {
+ public:
+  explicit CountingBackoffPolicy(std::shared_ptr<int> completions)
+      : completions_(std::move(completions)) {}
+
+  std::unique_ptr<BackoffPolicy> clone() const override {
+    return std::make_unique<CountingBackoffPolicy>(completions_);
+  }
+
+  std::chrono::milliseconds OnCompletion() override {
+    ++(*completions_);
+    return std::chrono::milliseconds(0);
+  }
+
+ private:
+  std::shared_ptr<int> completions_;
+};
 
 bigtable::SingleRowMutation IdempotentMutation(std::string const& row_key) {
   return bigtable::SingleRowMutation(
@@ -4046,6 +4092,503 @@ TEST_F(DataConnectionTest, AsyncPrepareQueryFailsOnInvalidType) {
   auto prepared_query = conn->AsyncPrepareQuery(params).get();
   EXPECT_THAT(prepared_query,
               StatusIs(StatusCode::kInternal, "Column type cannot be empty"));
+
+  fake_cq_impl->SimulateCompletion(false);
+}
+
+TEST_F(DataConnectionTest,
+       ExecuteQueryNextRowPlanRefreshZeroErrorBudgetDoesNotSpin) {
+  auto mock = std::make_shared<MockBigtableStub>();
+  auto fake_cq_impl = std::make_shared<FakeCompletionQueueImpl>();
+
+  auto constexpr kResultMetadataText = R"pb(
+    proto_schema {
+      columns {
+        name: "row_key"
+        type { string_type {} }
+      }
+      columns {
+        name: "value"
+        type { string_type {} }
+      }
+    }
+  )pb";
+  v2::PrepareQueryResponse initial_pq;
+  initial_pq.set_prepared_query("test-pq-id-initial");
+  ASSERT_TRUE(google::protobuf::TextFormat::ParseFromString(
+      kResultMetadataText, initial_pq.mutable_metadata()));
+  *initial_pq.mutable_valid_until() = internal::ToProtoTimestamp(
+      std::chrono::system_clock::now() + std::chrono::seconds(3600));
+
+  v2::PrepareQueryResponse refreshed_pq = initial_pq;
+  refreshed_pq.set_prepared_query("test-pq-id-refreshed");
+
+  using RefreshReturnType = StatusOr<v2::PrepareQueryResponse>;
+  MockFunction<future<RefreshReturnType>()> refresh_fn;
+  // Not called during the first ExecuteQuery (0 retries), then called on the
+  // subsequent ExecuteQuery because the shared PreparedQuery was invalidated.
+  EXPECT_CALL(refresh_fn, Call).WillOnce([&]() {
+    return make_ready_future(make_status_or(refreshed_pq));
+  });
+
+  EXPECT_CALL(*mock, ExecuteQuery)
+      .WillOnce(
+          [&](auto, auto const&, v2::ExecuteQueryRequest const& request,
+              std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ(request.prepared_query(), "test-pq-id-initial");
+            auto stream = std::make_unique<MockExecuteQueryStream>();
+            EXPECT_CALL(*stream, Read)
+                .WillOnce([&](v2::ExecuteQueryResponse* r) {
+                  // Frame 1: uncheckpointed batch (no resume_token), so
+                  // Create() succeeds and Frame 2 runs inside NextRow().
+                  MakeResponse(*r->mutable_results(), {"r1", "v1"},
+                               std::nullopt, false);
+                  return std::nullopt;
+                })
+                .WillOnce(Return(MakePreconditionViolationStatus(
+                    "PREPARED_QUERY_EXPIRED", "PREPARED_QUERY_EXPIRED")));
+            return stream;
+          })
+      .WillOnce(
+          [&](auto, auto const&, v2::ExecuteQueryRequest const& request,
+              std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ(request.prepared_query(), "test-pq-id-refreshed");
+            auto stream = std::make_unique<MockExecuteQueryStream>();
+            EXPECT_CALL(*stream, Read)
+                .WillOnce([&](v2::ExecuteQueryResponse* r) {
+                  MakeResponse(*r->mutable_results(), {"r2", "v2"},
+                               "sentinel-token", false);
+                  return std::nullopt;
+                })
+                .WillOnce(Return(Status{}));
+            return stream;
+          });
+
+  auto completions = std::make_shared<int>(0);
+  auto options =
+      CallOptions()
+          .set<
+              bigtable::experimental::ExecuteQueryPlanRefreshRetryPolicyOption>(
+              bigtable::experimental::
+                  ExecuteQueryPlanRefreshLimitedErrorCountRetryPolicy(0)
+                      .clone())
+          .set<DataBackoffPolicyOption>(
+              std::make_shared<CountingBackoffPolicy>(completions));
+  auto conn = TestConnection(std::move(mock));
+  internal::OptionsSpan span(std::move(options));
+
+  Project p("test-project");
+  bigtable::SqlStatement statement("SELECT * FROM the-table");
+  bigtable::InstanceResource instance(p, "test-instance");
+  auto query_plan =
+      QueryPlan::Create(CompletionQueue(fake_cq_impl), std::move(initial_pq),
+                        refresh_fn.AsStdFunction());
+  bigtable::PreparedQuery prepared_query(instance, statement,
+                                         std::move(query_plan));
+
+  // First ExecuteQuery must fail immediately without spinning or sleeping.
+  auto row_stream = conn->ExecuteQuery({prepared_query.BindParameters({})});
+  std::vector<StatusOr<bigtable::QueryRow>> first_results;
+  for (auto const& row : row_stream) {
+    first_results.push_back(row);
+  }
+  ASSERT_EQ(first_results.size(), 1);
+  EXPECT_THAT(first_results[0], StatusIs(StatusCode::kFailedPrecondition));
+  EXPECT_THAT(
+      first_results[0].status().error_info().metadata(),
+      Contains(Pair("gcloud-cpp.retry.reason", "retry-policy-exhausted")));
+  EXPECT_EQ(*completions, 0);
+
+  // Second ExecuteQuery on the same PreparedQuery refreshes the invalidated
+  // plan and succeeds.
+  auto row_stream2 = conn->ExecuteQuery({prepared_query.BindParameters({})});
+  std::vector<StatusOr<bigtable::QueryRow>> second_results;
+  for (auto const& row : row_stream2) {
+    ASSERT_STATUS_OK(row);
+    second_results.push_back(row);
+  }
+  ASSERT_EQ(second_results.size(), 1);
+  EXPECT_THAT(second_results[0]->values().at(0).get<std::string>(),
+              IsOkAndHolds("r2"));
+
+  fake_cq_impl->SimulateCompletion(false);
+}
+
+TEST_F(DataConnectionTest,
+       ExecuteQueryNextRowPlanRefreshHonorsErrorLimitAndBackoff) {
+  auto mock = std::make_shared<MockBigtableStub>();
+  auto fake_cq_impl = std::make_shared<FakeCompletionQueueImpl>();
+
+  auto constexpr kResultMetadataText = R"pb(
+    proto_schema {
+      columns {
+        name: "row_key"
+        type { string_type {} }
+      }
+      columns {
+        name: "value"
+        type { string_type {} }
+      }
+    }
+  )pb";
+  v2::PrepareQueryResponse pq0;
+  pq0.set_prepared_query("test-pq-0");
+  ASSERT_TRUE(google::protobuf::TextFormat::ParseFromString(
+      kResultMetadataText, pq0.mutable_metadata()));
+  *pq0.mutable_valid_until() = internal::ToProtoTimestamp(
+      std::chrono::system_clock::now() + std::chrono::seconds(3600));
+
+  v2::PrepareQueryResponse pq1 = pq0;
+  pq1.set_prepared_query("test-pq-1");
+  v2::PrepareQueryResponse pq2 = pq0;
+  pq2.set_prepared_query("test-pq-2");
+
+  using RefreshReturnType = StatusOr<v2::PrepareQueryResponse>;
+  MockFunction<future<RefreshReturnType>()> refresh_fn;
+  EXPECT_CALL(refresh_fn, Call)
+      .WillOnce([&]() { return make_ready_future(make_status_or(pq1)); })
+      .WillOnce([&]() { return make_ready_future(make_status_or(pq2)); });
+
+  auto make_midstream_expired = [](std::string expected_pq) {
+    return [expected_pq = std::move(expected_pq)](
+               auto, auto const&, v2::ExecuteQueryRequest const& request,
+               std::shared_ptr<bigtable_internal::OperationContext> const&) {
+      EXPECT_EQ(request.prepared_query(), expected_pq);
+      auto stream = std::make_unique<MockExecuteQueryStream>();
+      EXPECT_CALL(*stream, Read)
+          .WillOnce([](v2::ExecuteQueryResponse* r) {
+            MakeResponse(*r->mutable_results(), {"r1", "v1"}, std::nullopt,
+                         false);
+            return std::nullopt;
+          })
+          .WillOnce(Return(MakePreconditionViolationStatus(
+              "PREPARED_QUERY_EXPIRED", "PREPARED_QUERY_EXPIRED")));
+      return stream;
+    };
+  };
+
+  EXPECT_CALL(*mock, ExecuteQuery)
+      .WillOnce(make_midstream_expired("test-pq-0"))
+      .WillOnce(make_midstream_expired("test-pq-1"))
+      .WillOnce(make_midstream_expired("test-pq-2"));
+
+  auto completions = std::make_shared<int>(0);
+  auto options =
+      CallOptions()
+          .set<
+              bigtable::experimental::ExecuteQueryPlanRefreshRetryPolicyOption>(
+              bigtable::experimental::
+                  ExecuteQueryPlanRefreshLimitedErrorCountRetryPolicy(2)
+                      .clone())
+          .set<DataBackoffPolicyOption>(
+              std::make_shared<CountingBackoffPolicy>(completions));
+  auto conn = TestConnection(std::move(mock));
+  internal::OptionsSpan span(std::move(options));
+
+  Project p("test-project");
+  bigtable::SqlStatement statement("SELECT * FROM the-table");
+  bigtable::InstanceResource instance(p, "test-instance");
+  auto query_plan =
+      QueryPlan::Create(CompletionQueue(fake_cq_impl), std::move(pq0),
+                        refresh_fn.AsStdFunction());
+  bigtable::PreparedQuery prepared_query(instance, statement,
+                                         std::move(query_plan));
+
+  auto row_stream = conn->ExecuteQuery({prepared_query.BindParameters({})});
+  std::vector<StatusOr<bigtable::QueryRow>> results;
+  for (auto const& row : row_stream) {
+    results.push_back(row);
+  }
+  ASSERT_EQ(results.size(), 1);
+  EXPECT_THAT(results[0], StatusIs(StatusCode::kFailedPrecondition));
+  EXPECT_THAT(
+      results[0].status().error_info().metadata(),
+      Contains(Pair("gcloud-cpp.retry.reason", "retry-policy-exhausted")));
+  // 2 plan-refresh retries -> 2 backoff sleeps before exhausting budget.
+  EXPECT_EQ(*completions, 2);
+
+  fake_cq_impl->SimulateCompletion(false);
+}
+
+TEST_F(DataConnectionTest,
+       ExecuteQueryFailPermanentlyInvalidatesPlanWithoutRetrying) {
+  auto mock = std::make_shared<MockBigtableStub>();
+  auto fake_cq_impl = std::make_shared<FakeCompletionQueueImpl>();
+
+  auto constexpr kResultMetadataText = R"pb(
+    proto_schema {
+      columns {
+        name: "row_key"
+        type { string_type {} }
+      }
+      columns {
+        name: "value"
+        type { string_type {} }
+      }
+    }
+  )pb";
+  v2::PrepareQueryResponse initial_pq;
+  initial_pq.set_prepared_query("test-pq-id-initial");
+  ASSERT_TRUE(google::protobuf::TextFormat::ParseFromString(
+      kResultMetadataText, initial_pq.mutable_metadata()));
+  *initial_pq.mutable_valid_until() = internal::ToProtoTimestamp(
+      std::chrono::system_clock::now() + std::chrono::seconds(3600));
+
+  v2::PrepareQueryResponse refreshed_pq = initial_pq;
+  refreshed_pq.set_prepared_query("test-pq-id-refreshed");
+
+  using RefreshReturnType = StatusOr<v2::PrepareQueryResponse>;
+  MockFunction<future<RefreshReturnType>()> refresh_fn;
+  EXPECT_CALL(refresh_fn, Call).WillOnce([&]() {
+    return make_ready_future(make_status_or(refreshed_pq));
+  });
+
+  EXPECT_CALL(*mock, ExecuteQuery)
+      .WillOnce(
+          [&](auto, auto const&, v2::ExecuteQueryRequest const& request,
+              std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ(request.prepared_query(), "test-pq-id-initial");
+            auto stream = std::make_unique<MockExecuteQueryStream>();
+            EXPECT_CALL(*stream, Read)
+                .WillOnce([&](v2::ExecuteQueryResponse* r) {
+                  MakeResponse(*r->mutable_results(), {"r1", "v1"},
+                               std::nullopt, false);
+                  return std::nullopt;
+                })
+                .WillOnce(Return(MakePreconditionViolationStatus(
+                    "PREPARED_QUERY_EXPIRED_FAIL_PERMANENTLY",
+                    "Do not retry: PREPARED_QUERY_EXPIRED_FAIL_PERMANENTLY")));
+            return stream;
+          })
+      .WillOnce(
+          [&](auto, auto const&, v2::ExecuteQueryRequest const& request,
+              std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ(request.prepared_query(), "test-pq-id-refreshed");
+            auto stream = std::make_unique<MockExecuteQueryStream>();
+            EXPECT_CALL(*stream, Read)
+                .WillOnce([&](v2::ExecuteQueryResponse* r) {
+                  MakeResponse(*r->mutable_results(), {"r2", "v2"},
+                               "sentinel-token", false);
+                  return std::nullopt;
+                })
+                .WillOnce(Return(Status{}));
+            return stream;
+          });
+
+  auto completions = std::make_shared<int>(0);
+  auto options = CallOptions().set<DataBackoffPolicyOption>(
+      std::make_shared<CountingBackoffPolicy>(completions));
+  auto conn = TestConnection(std::move(mock));
+  internal::OptionsSpan span(std::move(options));
+
+  Project p("test-project");
+  bigtable::SqlStatement statement("SELECT * FROM the-table");
+  bigtable::InstanceResource instance(p, "test-instance");
+  auto query_plan =
+      QueryPlan::Create(CompletionQueue(fake_cq_impl), std::move(initial_pq),
+                        refresh_fn.AsStdFunction());
+  bigtable::PreparedQuery prepared_query(instance, statement,
+                                         std::move(query_plan));
+
+  // First ExecuteQuery fails permanently with kFailedPrecondition without
+  // retrying, even though kNumRetries == 2.
+  auto row_stream = conn->ExecuteQuery({prepared_query.BindParameters({})});
+  std::vector<StatusOr<bigtable::QueryRow>> first_results;
+  for (auto const& row : row_stream) {
+    first_results.push_back(row);
+  }
+  ASSERT_EQ(first_results.size(), 1);
+  EXPECT_THAT(first_results[0], StatusIs(StatusCode::kFailedPrecondition));
+  EXPECT_EQ(*completions, 0);
+
+  // Subsequent ExecuteQuery on the same PreparedQuery uses a refreshed plan.
+  auto row_stream2 = conn->ExecuteQuery({prepared_query.BindParameters({})});
+  std::vector<StatusOr<bigtable::QueryRow>> second_results;
+  for (auto const& row : row_stream2) {
+    ASSERT_STATUS_OK(row);
+    second_results.push_back(row);
+  }
+  ASSERT_EQ(second_results.size(), 1);
+  EXPECT_THAT(second_results[0]->values().at(0).get<std::string>(),
+              IsOkAndHolds("r2"));
+
+  fake_cq_impl->SimulateCompletion(false);
+}
+
+TEST_F(DataConnectionTest,
+       ExecuteQueryPostResumeTokenPlanExpiryInvalidatesWithoutRetrying) {
+  auto mock = std::make_shared<MockBigtableStub>();
+  auto fake_cq_impl = std::make_shared<FakeCompletionQueueImpl>();
+
+  auto constexpr kResultMetadataText = R"pb(
+    proto_schema {
+      columns {
+        name: "row_key"
+        type { string_type {} }
+      }
+      columns {
+        name: "value"
+        type { string_type {} }
+      }
+    }
+  )pb";
+  v2::PrepareQueryResponse initial_pq;
+  initial_pq.set_prepared_query("test-pq-id-initial");
+  ASSERT_TRUE(google::protobuf::TextFormat::ParseFromString(
+      kResultMetadataText, initial_pq.mutable_metadata()));
+  *initial_pq.mutable_valid_until() = internal::ToProtoTimestamp(
+      std::chrono::system_clock::now() + std::chrono::seconds(3600));
+
+  v2::PrepareQueryResponse refreshed_pq = initial_pq;
+  refreshed_pq.set_prepared_query("test-pq-id-refreshed");
+
+  using RefreshReturnType = StatusOr<v2::PrepareQueryResponse>;
+  MockFunction<future<RefreshReturnType>()> refresh_fn;
+  EXPECT_CALL(refresh_fn, Call).WillOnce([&]() {
+    return make_ready_future(make_status_or(refreshed_pq));
+  });
+
+  EXPECT_CALL(*mock, ExecuteQuery)
+      .WillOnce(
+          [&](auto, auto const&, v2::ExecuteQueryRequest const& request,
+              std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ(request.prepared_query(), "test-pq-id-initial");
+            auto stream = std::make_unique<MockExecuteQueryStream>();
+            EXPECT_CALL(*stream, Read)
+                .WillOnce([&](v2::ExecuteQueryResponse* r) {
+                  // Frame 1 commits row 1 with a non-empty resume_token.
+                  MakeResponse(*r->mutable_results(), {"r1", "v1"}, "token-1",
+                               false);
+                  return std::nullopt;
+                })
+                .WillOnce(Return(MakePreconditionViolationStatus(
+                    "PREPARED_QUERY_EXPIRED", "PREPARED_QUERY_EXPIRED")));
+            return stream;
+          })
+      .WillOnce(
+          [&](auto, auto const&, v2::ExecuteQueryRequest const& request,
+              std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ(request.prepared_query(), "test-pq-id-refreshed");
+            auto stream = std::make_unique<MockExecuteQueryStream>();
+            EXPECT_CALL(*stream, Read)
+                .WillOnce([&](v2::ExecuteQueryResponse* r) {
+                  MakeResponse(*r->mutable_results(), {"r2", "v2"},
+                               "sentinel-token", false);
+                  return std::nullopt;
+                })
+                .WillOnce(Return(Status{}));
+            return stream;
+          });
+
+  auto completions = std::make_shared<int>(0);
+  auto options = CallOptions().set<DataBackoffPolicyOption>(
+      std::make_shared<CountingBackoffPolicy>(completions));
+  auto conn = TestConnection(std::move(mock));
+  internal::OptionsSpan span(std::move(options));
+
+  Project p("test-project");
+  bigtable::SqlStatement statement("SELECT * FROM the-table");
+  bigtable::InstanceResource instance(p, "test-instance");
+  auto query_plan =
+      QueryPlan::Create(CompletionQueue(fake_cq_impl), std::move(initial_pq),
+                        refresh_fn.AsStdFunction());
+  bigtable::PreparedQuery prepared_query(instance, statement,
+                                         std::move(query_plan));
+
+  // First ExecuteQuery yields row 1, then surfaces kFailedPrecondition without
+  // retrying the partially consumed stream.
+  auto row_stream = conn->ExecuteQuery({prepared_query.BindParameters({})});
+  std::vector<StatusOr<bigtable::QueryRow>> first_results;
+  for (auto const& row : row_stream) {
+    first_results.push_back(row);
+  }
+  ASSERT_EQ(first_results.size(), 2);
+  ASSERT_STATUS_OK(first_results[0]);
+  EXPECT_THAT(first_results[0]->values().at(0).get<std::string>(),
+              IsOkAndHolds("r1"));
+  EXPECT_THAT(first_results[1], StatusIs(StatusCode::kFailedPrecondition));
+  EXPECT_EQ(*completions, 0);
+
+  // Shared PreparedQuery was invalidated, so the next ExecuteQuery refreshes.
+  auto row_stream2 = conn->ExecuteQuery({prepared_query.BindParameters({})});
+  std::vector<StatusOr<bigtable::QueryRow>> second_results;
+  for (auto const& row : row_stream2) {
+    ASSERT_STATUS_OK(row);
+    second_results.push_back(row);
+  }
+  ASSERT_EQ(second_results.size(), 1);
+  EXPECT_THAT(second_results[0]->values().at(0).get<std::string>(),
+              IsOkAndHolds("r2"));
+
+  fake_cq_impl->SimulateCompletion(false);
+}
+
+TEST_F(DataConnectionTest,
+       ExecuteQueryTerminalRpcErrorNotMaskedByUncommittedRows) {
+  auto mock = std::make_shared<MockBigtableStub>();
+  auto fake_cq_impl = std::make_shared<FakeCompletionQueueImpl>();
+
+  auto constexpr kResultMetadataText = R"pb(
+    proto_schema {
+      columns {
+        name: "row_key"
+        type { string_type {} }
+      }
+      columns {
+        name: "value"
+        type { string_type {} }
+      }
+    }
+  )pb";
+  v2::PrepareQueryResponse pq_response;
+  pq_response.set_prepared_query("test-pq-id-54321");
+  ASSERT_TRUE(google::protobuf::TextFormat::ParseFromString(
+      kResultMetadataText, pq_response.mutable_metadata()));
+  *pq_response.mutable_valid_until() = internal::ToProtoTimestamp(
+      std::chrono::system_clock::now() + std::chrono::seconds(3600));
+
+  auto refresh_fn = []() {
+    return make_ready_future(StatusOr<v2::PrepareQueryResponse>(
+        Status{StatusCode::kUnimplemented, "not implemented"}));
+  };
+
+  EXPECT_CALL(*mock, ExecuteQuery)
+      .WillOnce(
+          [&](auto, auto const&, v2::ExecuteQueryRequest const&,
+              std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            auto stream = std::make_unique<MockExecuteQueryStream>();
+            EXPECT_CALL(*stream, Read)
+                .WillOnce([&](v2::ExecuteQueryResponse* r) {
+                  // Uncheckpointed batch buffered in buffered_rows_.
+                  MakeResponse(*r->mutable_results(), {"r1", "v1"},
+                               std::nullopt, false);
+                  return std::nullopt;
+                })
+                .WillOnce(Return(Status(StatusCode::kDeadlineExceeded,
+                                        "deadline exceeded")));
+            return stream;
+          });
+
+  auto conn = TestConnection(std::move(mock));
+  internal::OptionsSpan span(CallOptions());
+
+  Project p("test-project");
+  bigtable::SqlStatement statement("SELECT * FROM the-table");
+  bigtable::InstanceResource instance(p, "test-instance");
+  auto query_plan =
+      QueryPlan::Create(CompletionQueue(fake_cq_impl), std::move(pq_response),
+                        std::move(refresh_fn));
+  bigtable::PreparedQuery prepared_query(instance, statement,
+                                         std::move(query_plan));
+
+  auto row_stream = conn->ExecuteQuery({prepared_query.BindParameters({})});
+  std::vector<StatusOr<bigtable::QueryRow>> results;
+  for (auto const& row : row_stream) {
+    results.push_back(row);
+  }
+  ASSERT_EQ(results.size(), 1);
+  EXPECT_THAT(results[0],
+              StatusIs(StatusCode::kDeadlineExceeded, HasSubstr("deadline")));
 
   fake_cq_impl->SimulateCompletion(false);
 }

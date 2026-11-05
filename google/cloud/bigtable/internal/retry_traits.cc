@@ -23,29 +23,77 @@ namespace google {
 namespace cloud {
 namespace bigtable_internal {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
+namespace {
 
-bool ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(Status const& s) {
-  if (s.code() == StatusCode::kFailedPrecondition) {
-    if (absl::StrContains(s.message(), "PREPARED_QUERY_EXPIRED")) {
-      return true;
-    }
-    auto payload = google::cloud::internal::GetPayload(
-        s, google::cloud::internal::StatusPayloadGrpcProto());
-    google::rpc::Status proto;
-    if (payload && proto.ParseFromString(*payload)) {
-      google::rpc::PreconditionFailure failure;
-      for (google::protobuf::Any const& any : proto.details()) {
-        if (any.UnpackTo(&failure)) {
-          for (auto const& v : failure.violations()) {
-            if (absl::StrContains(v.type(), "PREPARED_QUERY_EXPIRED")) {
-              return true;
-            }
+constexpr char kNonRetryableAfterResumeTokenPayloadKey[] =
+    "gcloud-cpp.bigtable.query-plan-refresh.non-retryable";
+
+enum class QueryPlanExpirationKind {
+  kNotExpired,
+  kExpiredRetryable,
+  kExpiredPermanent,
+};
+
+QueryPlanExpirationKind ClassifyQueryPlanExpiration(Status const& s) {
+  if (s.code() != StatusCode::kFailedPrecondition) {
+    return QueryPlanExpirationKind::kNotExpired;
+  }
+  auto payload = google::cloud::internal::GetPayload(
+      s, google::cloud::internal::StatusPayloadGrpcProto());
+  google::rpc::Status proto;
+  if (payload && proto.ParseFromString(*payload)) {
+    bool has_precondition_violations = false;
+    bool has_permanent_expiry = false;
+    google::rpc::PreconditionFailure failure;
+    for (google::protobuf::Any const& any : proto.details()) {
+      if (any.UnpackTo(&failure)) {
+        for (auto const& v : failure.violations()) {
+          has_precondition_violations = true;
+          if (v.type() == "PREPARED_QUERY_EXPIRED") {
+            return QueryPlanExpirationKind::kExpiredRetryable;
+          }
+          if (v.type() == "PREPARED_QUERY_EXPIRED_FAIL_PERMANENTLY") {
+            has_permanent_expiry = true;
           }
         }
       }
     }
+    if (has_permanent_expiry) {
+      return QueryPlanExpirationKind::kExpiredPermanent;
+    }
+    if (has_precondition_violations) {
+      return QueryPlanExpirationKind::kNotExpired;
+    }
   }
-  return false;
+  if (absl::StrContains(s.message(),
+                        "PREPARED_QUERY_EXPIRED_FAIL_PERMANENTLY")) {
+    return QueryPlanExpirationKind::kExpiredPermanent;
+  }
+  if (absl::StrContains(s.message(), "PREPARED_QUERY_EXPIRED")) {
+    return QueryPlanExpirationKind::kExpiredRetryable;
+  }
+  return QueryPlanExpirationKind::kNotExpired;
+}
+
+}  // namespace
+
+bool ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(Status const& s) {
+  if (google::cloud::internal::GetPayload(
+          s, kNonRetryableAfterResumeTokenPayloadKey)
+          .has_value()) {
+    return false;
+  }
+  return ClassifyQueryPlanExpiration(s) ==
+         QueryPlanExpirationKind::kExpiredRetryable;
+}
+
+bool ExecuteQueryPlanRefreshRetry::ShouldInvalidateQueryPlan(Status const& s) {
+  return ClassifyQueryPlanExpiration(s) != QueryPlanExpirationKind::kNotExpired;
+}
+
+void ExecuteQueryPlanRefreshRetry::MarkNonRetryableAfterResumeToken(Status& s) {
+  google::cloud::internal::SetPayload(
+      s, kNonRetryableAfterResumeTokenPayloadKey, "true");
 }
 
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END

@@ -14,6 +14,7 @@
 
 #include "google/cloud/bigtable/internal/partial_result_set_source.h"
 #include "google/cloud/bigtable/internal/crc32c.h"
+#include "google/cloud/bigtable/internal/retry_traits.h"
 #include "google/cloud/bigtable/mocks/mock_query_row.h"
 #include "google/cloud/bigtable/options.h"
 #include "google/cloud/bigtable/query_row.h"
@@ -24,6 +25,8 @@
 #include "google/cloud/bigtable/internal/table_schema_metrics.h"
 #include "google/cloud/testing_util/fake_clock.h"
 #endif
+#include "google/cloud/internal/make_status.h"
+#include "google/cloud/internal/retry_loop_helpers.h"
 #include "google/cloud/options.h"
 #include "google/cloud/testing_util/is_proto_equal.h"
 #include "google/cloud/testing_util/status_matchers.h"
@@ -46,6 +49,8 @@ using ::google::cloud::testing_util::IsOk;
 using ::google::cloud::testing_util::StatusIs;
 using ::google::protobuf::TextFormat;
 using ::testing::_;
+using ::testing::Contains;
+using ::testing::Pair;
 using ::testing::Return;
 using ::testing::UnitTest;
 
@@ -604,6 +609,265 @@ TEST(PartialResultSetSourceTest, ResponseWithNoValues) {
 
   // At end of stream, we get an 'ok' response with an empty row.
   EXPECT_THAT((*reader)->NextRow(), IsValidAndEquals(bigtable::QueryRow{}));
+}
+
+TEST(PartialResultSetSourceTest, TerminalRpcErrorNotMaskedByBufferedRows) {
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_shared<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(0);
+  EXPECT_CALL(*mock_metric, PostCall).Times(0);
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce([](opentelemetry::context::Context const&,
+                   OnDoneParams const& p) -> void {
+        EXPECT_THAT(p.operation_status, StatusIs(StatusCode::kDeadlineExceeded,
+                                                 "context deadline exceeded"));
+      });
+  EXPECT_CALL(*mock_metric, ElementRequest).Times(1);
+  EXPECT_CALL(*mock_metric, ElementDelivery).Times(0);
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({mock_metric}, clock));
+#else
+  auto operation_context = std::make_shared<OperationContext>();
+#endif
+
+  auto constexpr kResultMetadataText = R"pb(
+    proto_schema {
+      columns {
+        name: "user_id"
+        type { string_type {} }
+      }
+    }
+  )pb";
+  google::bigtable::v2::ResultSetMetadata metadata;
+  ASSERT_TRUE(TextFormat::ParseFromString(kResultMetadataText, &metadata));
+
+  auto constexpr kProtoRowsText = R"pb(
+    values { string_value: "r1" }
+  )pb";
+  google::bigtable::v2::ProtoRows proto_rows;
+  ASSERT_TRUE(TextFormat::ParseFromString(kProtoRowsText, &proto_rows));
+  std::string binary_batch_data = proto_rows.SerializeAsString();
+  auto correct_checksum =
+      static_cast<uint32_t>(bigtable_internal::Crc32c(binary_batch_data));
+  // No resume_token: row is parsed into buffered_rows_ without committing.
+  std::string partial_result_set_text =
+      absl::Substitute(R"pb(
+                         proto_rows_batch: {
+                           batch_data: "$0",
+                         },
+                         reset: true,
+                         estimated_batch_size: 31,
+                         batch_checksum: $1
+                       )pb",
+                       binary_batch_data, correct_checksum);
+  google::bigtable::v2::PartialResultSet response;
+  ASSERT_TRUE(TextFormat::ParseFromString(partial_result_set_text, &response));
+
+  auto grpc_reader =
+      std::make_unique<bigtable_testing::MockPartialResultSetReader>();
+  EXPECT_CALL(*grpc_reader, Read(_, _))
+      .WillOnce([&response](std::optional<std::string> const&,
+                            UnownedPartialResultSet& result) {
+        result.result = response;
+        return true;
+      })
+      .WillOnce(Return(false));
+  EXPECT_CALL(*grpc_reader, Finish())
+      .WillOnce(ResultMock(
+          Status(StatusCode::kDeadlineExceeded, "context deadline exceeded")));
+  EXPECT_CALL(*grpc_reader, TryCancel()).Times(0);
+  grpc::ClientContext context;
+  EXPECT_CALL(*grpc_reader, context)
+      .WillRepeatedly([&]() -> grpc::ClientContext const& { return context; });
+
+  auto reader = CreatePartialResultSetSource(
+      metadata, std::move(operation_context), std::move(grpc_reader));
+  ASSERT_STATUS_OK(reader);
+  EXPECT_THAT((*reader)->NextRow(), StatusIs(StatusCode::kDeadlineExceeded,
+                                             "context deadline exceeded"));
+
+  // Also verify read_buffer_ (incomplete batch without batch_checksum) +
+  // exhausted retry metadata is preserved intact.
+  google::bigtable::v2::PartialResultSet partial_chunk;
+  partial_chunk.mutable_proto_rows_batch()->set_batch_data(
+      binary_batch_data.substr(0, 2));
+  auto grpc_reader2 =
+      std::make_unique<bigtable_testing::MockPartialResultSetReader>();
+  EXPECT_CALL(*grpc_reader2, Read(_, _))
+      .WillOnce([&partial_chunk](std::optional<std::string> const&,
+                                 UnownedPartialResultSet& result) {
+        result.result = partial_chunk;
+        return true;
+      })
+      .WillOnce(Return(false));
+  auto exhausted_status = internal::RetryLoopPolicyExhaustedError(
+      Status(StatusCode::kUnavailable, "try again"), "Read");
+  EXPECT_CALL(*grpc_reader2, Finish()).WillOnce(ResultMock(exhausted_status));
+  EXPECT_CALL(*grpc_reader2, TryCancel()).Times(0);
+  EXPECT_CALL(*grpc_reader2, context)
+      .WillRepeatedly([&]() -> grpc::ClientContext const& { return context; });
+
+  auto reader2 = CreatePartialResultSetSource(
+      metadata, std::make_shared<OperationContext>(), std::move(grpc_reader2));
+  ASSERT_STATUS_OK(reader2);
+  auto row2 = (*reader2)->NextRow();
+  EXPECT_THAT(row2, StatusIs(StatusCode::kUnavailable));
+  EXPECT_THAT(
+      row2.status().error_info().metadata(),
+      Contains(Pair("gcloud-cpp.retry.reason", "retry-policy-exhausted")));
+}
+
+TEST(PartialResultSetSourceTest,
+     OkStreamWithUncommittedRowsReturnsInternalError) {
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_shared<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(0);
+  EXPECT_CALL(*mock_metric, PostCall).Times(0);
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce([](opentelemetry::context::Context const&,
+                   OnDoneParams const& p) -> void {
+        EXPECT_THAT(p.operation_status,
+                    StatusIs(StatusCode::kInternal,
+                             "Stream ended with uncommitted rows."));
+      });
+  EXPECT_CALL(*mock_metric, ElementRequest).Times(1);
+  EXPECT_CALL(*mock_metric, ElementDelivery).Times(0);
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({mock_metric}, clock));
+#else
+  auto operation_context = std::make_shared<OperationContext>();
+#endif
+
+  auto constexpr kResultMetadataText = R"pb(
+    proto_schema {
+      columns {
+        name: "user_id"
+        type { string_type {} }
+      }
+    }
+  )pb";
+  google::bigtable::v2::ResultSetMetadata metadata;
+  ASSERT_TRUE(TextFormat::ParseFromString(kResultMetadataText, &metadata));
+
+  auto constexpr kProtoRowsText = R"pb(
+    values { string_value: "r1" }
+  )pb";
+  google::bigtable::v2::ProtoRows proto_rows;
+  ASSERT_TRUE(TextFormat::ParseFromString(kProtoRowsText, &proto_rows));
+  std::string binary_batch_data = proto_rows.SerializeAsString();
+  auto correct_checksum =
+      static_cast<uint32_t>(bigtable_internal::Crc32c(binary_batch_data));
+  std::string partial_result_set_text =
+      absl::Substitute(R"pb(
+                         proto_rows_batch: {
+                           batch_data: "$0",
+                         },
+                         reset: true,
+                         estimated_batch_size: 31,
+                         batch_checksum: $1
+                       )pb",
+                       binary_batch_data, correct_checksum);
+  google::bigtable::v2::PartialResultSet response;
+  ASSERT_TRUE(TextFormat::ParseFromString(partial_result_set_text, &response));
+
+  auto grpc_reader =
+      std::make_unique<bigtable_testing::MockPartialResultSetReader>();
+  EXPECT_CALL(*grpc_reader, Read(_, _))
+      .WillOnce([&response](std::optional<std::string> const&,
+                            UnownedPartialResultSet& result) {
+        result.result = response;
+        return true;
+      })
+      .WillOnce(Return(false));
+  EXPECT_CALL(*grpc_reader, Finish()).WillOnce(ResultMock(Status()));
+  EXPECT_CALL(*grpc_reader, TryCancel()).Times(0);
+  grpc::ClientContext context;
+  EXPECT_CALL(*grpc_reader, context)
+      .WillRepeatedly([&]() -> grpc::ClientContext const& { return context; });
+
+  auto reader = CreatePartialResultSetSource(
+      metadata, std::move(operation_context), std::move(grpc_reader));
+  ASSERT_STATUS_OK(reader);
+  EXPECT_THAT(
+      (*reader)->NextRow(),
+      StatusIs(StatusCode::kInternal, "Stream ended with uncommitted rows."));
+}
+
+TEST(PartialResultSetSourceTest,
+     QueryPlanExpiredAfterResumeTokenPreservesInvalidationWithoutRetry) {
+  auto operation_context = std::make_shared<OperationContext>();
+
+  auto constexpr kResultMetadataText = R"pb(
+    proto_schema {
+      columns {
+        name: "user_id"
+        type { string_type {} }
+      }
+    }
+  )pb";
+  google::bigtable::v2::ResultSetMetadata metadata;
+  ASSERT_TRUE(TextFormat::ParseFromString(kResultMetadataText, &metadata));
+
+  auto constexpr kProtoRowsText = R"pb(
+    values { string_value: "r1" }
+  )pb";
+  google::bigtable::v2::ProtoRows proto_rows;
+  ASSERT_TRUE(TextFormat::ParseFromString(kProtoRowsText, &proto_rows));
+  std::string binary_batch_data = proto_rows.SerializeAsString();
+  auto correct_checksum =
+      static_cast<uint32_t>(bigtable_internal::Crc32c(binary_batch_data));
+  std::string partial_result_set_text =
+      absl::Substitute(R"pb(
+                         proto_rows_batch: {
+                           batch_data: "$0",
+                         },
+                         resume_token: "AAAAAWVyZXN1bWVfdG9rZW4=",
+                         reset: true,
+                         estimated_batch_size: 31,
+                         batch_checksum: $1
+                       )pb",
+                       binary_batch_data, correct_checksum);
+  google::bigtable::v2::PartialResultSet response;
+  ASSERT_TRUE(TextFormat::ParseFromString(partial_result_set_text, &response));
+
+  auto grpc_reader =
+      std::make_unique<bigtable_testing::MockPartialResultSetReader>();
+  EXPECT_CALL(*grpc_reader, Read(_, _))
+      .WillOnce([&response](std::optional<std::string> const&,
+                            UnownedPartialResultSet& result) {
+        result.result = response;
+        return true;
+      })
+      .WillOnce([](std::optional<std::string> const& token,
+                   UnownedPartialResultSet&) {
+        EXPECT_EQ(token, "AAAAAWVyZXN1bWVfdG9rZW4=");
+        return false;
+      });
+  EXPECT_CALL(*grpc_reader, Finish())
+      .WillOnce(ResultMock(
+          internal::FailedPreconditionError("PREPARED_QUERY_EXPIRED")));
+  EXPECT_CALL(*grpc_reader, TryCancel()).Times(0);
+  grpc::ClientContext context;
+  EXPECT_CALL(*grpc_reader, context)
+      .WillRepeatedly([&]() -> grpc::ClientContext const& { return context; });
+
+  auto reader = CreatePartialResultSetSource(
+      metadata, std::move(operation_context), std::move(grpc_reader));
+  ASSERT_STATUS_OK(reader);
+  EXPECT_THAT((*reader)->NextRow(),
+              IsValidAndEquals(bigtable_mocks::MakeQueryRow(
+                  {{"user_id", bigtable::Value("r1")}})));
+
+  auto second_row = (*reader)->NextRow();
+  EXPECT_THAT(second_row, StatusIs(StatusCode::kFailedPrecondition));
+  EXPECT_TRUE(ExecuteQueryPlanRefreshRetry::ShouldInvalidateQueryPlan(
+      second_row.status()));
+  EXPECT_FALSE(
+      ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(second_row.status()));
 }
 
 }  // namespace
