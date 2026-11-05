@@ -14,6 +14,7 @@
 
 #include "google/cloud/bigtable/internal/partial_result_set_source.h"
 #include "google/cloud/bigtable/internal/crc32c.h"
+#include "google/cloud/bigtable/internal/retry_traits.h"
 #include "google/cloud/bigtable/options.h"
 #include "google/cloud/internal/make_status.h"
 #include "google/cloud/log.h"
@@ -146,15 +147,16 @@ Status PartialResultSetSource::ReadFromStream() {
 
   if (ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(last_status_)) {
     if (resume_token_ && !resume_token_->empty()) {
-      return internal::InternalError(
-          "Query plan expired during a retry attempt", GCP_ERROR_INFO());
+      ExecuteQueryPlanRefreshRetry::MarkNonRetryableAfterResumeToken(
+          last_status_);
     }
-  } else if (!buffered_rows_.empty() || !read_buffer_.empty()) {
+  } else if (last_status_.ok() &&
+             (!buffered_rows_.empty() || !read_buffer_.empty())) {
     // buffered_rows_ and read_buffer_ are expected to be empty because the last
     // successful read would have had a sentinel resume_token, causing
     // ProcessDataFromStream to commit them.
-    return internal::InternalError("Stream ended with uncommitted rows.",
-                                   GCP_ERROR_INFO());
+    last_status_ = internal::InternalError(
+        "Stream ended with uncommitted rows.", GCP_ERROR_INFO());
   }
 
   return last_status_;

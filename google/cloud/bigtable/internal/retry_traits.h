@@ -52,6 +52,8 @@ struct SafeGrpcRetry {
 // ExecuteQuery with QueryPlan refresh iterations.
 struct ExecuteQueryPlanRefreshRetry {
   static bool IsQueryPlanExpired(Status const& s);
+  static bool ShouldInvalidateQueryPlan(Status const& s);
+  static void MarkNonRetryableAfterResumeToken(Status& s);
   static bool IsOk(Status const& status) { return status.ok(); }
   static bool IsTransientFailure(Status const& status) {
     auto const code = status.code();

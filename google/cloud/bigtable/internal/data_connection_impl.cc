@@ -40,10 +40,14 @@
 #include "google/cloud/internal/getenv.h"
 #include "google/cloud/internal/make_status.h"
 #include "google/cloud/internal/retry_loop.h"
+#include "google/cloud/internal/retry_loop_helpers.h"
 #include "google/cloud/internal/streaming_read_rpc.h"
 #include "google/cloud/universe_domain_options.h"
 #include <memory>
+#include <optional>
 #include <string>
+#include <thread>
+#include <utility>
 
 namespace google {
 namespace cloud {
@@ -962,21 +966,40 @@ class QueryPlanRefreshingPartialResultSource
   ~QueryPlanRefreshingPartialResultSource() override = default;
 
   StatusOr<bigtable::QueryRow> NextRow() override {
-    StatusOr<bigtable::QueryRow> row;
-    do {
+    if (terminal_status_.has_value()) return *terminal_status_;
+    while (true) {
       if (!query_plan_valid_) source_ = std::nullopt;
       if (!source_.has_value() || !source_->ok()) {
         UpdateSource();
+        if (terminal_status_.has_value()) return *terminal_status_;
       }
-      row = (**source_)->NextRow();
-      if (ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(row.status())) {
+      auto row = (**source_)->NextRow();
+      if (row.ok()) return row;
+
+      if (ExecuteQueryPlanRefreshRetry::ShouldInvalidateQueryPlan(
+              row.status())) {
         query_plan_valid_ = false;
         query_plan_->Invalidate(row.status(),
                                 query_plan_data_->prepared_query());
       }
-    } while (!query_plan_refresh_retry_policy_->IsExhausted() &&
-             ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(row.status()));
-    return row;
+      if (!ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(row.status())) {
+        terminal_status_ = row.status();
+        return row;
+      }
+
+      last_status_ = row.status();
+      internal::OptionsSpan options_span(options_);
+      auto delay = internal::Backoff(
+          last_status_, __func__, *query_plan_refresh_retry_policy_,
+          *query_plan_backoff_policy_, Idempotency::kIdempotent,
+          false /* enable_server_retries */);
+      if (!delay) {
+        terminal_status_ = std::move(delay).status();
+        last_status_ = *terminal_status_;
+        return *terminal_status_;
+      }
+      std::this_thread::sleep_for(*delay);
+    }
   }
 
   std::optional<google::bigtable::v2::ResultSetMetadata> Metadata() override {
@@ -1020,13 +1043,14 @@ class QueryPlanRefreshingPartialResultSource
         if (source_->ok()) return;
 
         last_status_ = source_->status();
-        if (ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(
+        if (ExecuteQueryPlanRefreshRetry::ShouldInvalidateQueryPlan(
                 source_->status())) {
           query_plan_valid_ = false;
           query_plan_->Invalidate(source_->status(),
                                   query_plan_data_->prepared_query());
         }
         if (IsStatusMetadataIndicatingRetryPolicyExhausted(source_->status())) {
+          terminal_status_ = last_status_;
           source_ = std::make_unique<StatusOnlyResultSetSource>(last_status_);
           return;
         }
@@ -1044,8 +1068,9 @@ class QueryPlanRefreshingPartialResultSource
     auto retry_loop_error = internal::RetryLoopError(
         last_status_, __func__,
         query_plan_refresh_retry_policy_->IsExhausted());
+    terminal_status_ = retry_loop_error;
     source_ = std::make_unique<StatusOnlyResultSetSource>(retry_loop_error);
-    last_status_ = retry_loop_error;
+    last_status_ = std::move(retry_loop_error);
   }
 
   google::bigtable::v2::ExecuteQueryRequest request_;
@@ -1063,6 +1088,7 @@ class QueryPlanRefreshingPartialResultSource
   StatusOr<google::bigtable::v2::PrepareQueryResponse> query_plan_data_;
   bool query_plan_valid_ = false;
   Status last_status_;
+  std::optional<Status> terminal_status_;
 };
 
 bigtable::RowStream DataConnectionImpl::ExecuteQuery(
