@@ -23,6 +23,9 @@
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/message.h>
 #include <algorithm>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace google {
 namespace cloud {
@@ -330,6 +333,95 @@ std::ostream& MapStreamHelper(std::ostream& os,  // NOLINT(misc-no-recursion)
     delimiter = ", ";
   }
   return os << '}';
+}
+
+// NOLINTNEXTLINE(misc-no-recursion)
+bool TypeContainsMap(google::bigtable::v2::Type const& type) {
+  using google::bigtable::v2::Type;
+  switch (type.kind_case()) {
+    case Type::kMapType:
+      return true;
+    case Type::kArrayType:
+      return TypeContainsMap(type.array_type().element_type());
+    case Type::kStructType:
+      for (auto const& field : type.struct_type().fields()) {
+        if (TypeContainsMap(field.type())) return true;
+      }
+      return false;
+    default:
+      return false;
+  }
+}
+
+// NOLINTNEXTLINE(misc-no-recursion)
+void DedupProtoMaps(google::bigtable::v2::Type const& type,
+                    google::bigtable::v2::Value& value) {
+  if (Value::IsNullValue(value) || !value.has_array_value() ||
+      value.array_value().values().empty()) {
+    return;
+  }
+  using google::bigtable::v2::Type;
+  switch (type.kind_case()) {
+    case Type::kMapType: {
+      auto const& key_type = type.map_type().key_type();
+      auto const& value_type = type.map_type().value_type();
+      bool const key_has_map = TypeContainsMap(key_type);
+      bool const value_has_map = TypeContainsMap(value_type);
+      auto* array_val = value.mutable_array_value();
+      std::vector<google::bigtable::v2::Value> retained;
+      retained.reserve(array_val->values_size());
+      absl::flat_hash_set<std::string> keys;
+      for (int i = array_val->values_size() - 1; i >= 0; --i) {
+        auto& entry = *array_val->mutable_values(i);
+        if (!entry.has_array_value() ||
+            entry.array_value().values_size() != 2) {
+          retained.push_back(std::move(entry));
+          continue;
+        }
+        if (key_has_map) {
+          DedupProtoMaps(key_type,
+                         *entry.mutable_array_value()->mutable_values(0));
+        }
+        auto const& key = entry.array_value().values(0);
+        // TODO(#15766): Find a better way to hash these protos.
+        if (keys.insert(key.SerializeAsString()).second) {
+          if (value_has_map) {
+            DedupProtoMaps(value_type,
+                           *entry.mutable_array_value()->mutable_values(1));
+          }
+          retained.push_back(std::move(entry));
+        }
+      }
+      array_val->clear_values();
+      for (auto it = retained.rbegin(); it != retained.rend(); ++it) {
+        *array_val->add_values() = std::move(*it);
+      }
+      break;
+    }
+    case Type::kArrayType: {
+      auto const& elem_type = type.array_type().element_type();
+      if (!TypeContainsMap(elem_type)) return;
+      auto* array_val = value.mutable_array_value();
+      for (int i = 0; i < array_val->values_size(); ++i) {
+        DedupProtoMaps(elem_type, *array_val->mutable_values(i));
+      }
+      break;
+    }
+    case Type::kStructType: {
+      auto* array_val = value.mutable_array_value();
+      auto const n =
+          std::min(type.struct_type().fields_size(), array_val->values_size());
+      for (int i = 0; i < n; ++i) {
+        auto const& field_type = type.struct_type().fields(i).type();
+        if (TypeContainsMap(field_type)) {
+          DedupProtoMaps(field_type, *array_val->mutable_values(i));
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
 }
 }  // namespace
 
@@ -780,24 +872,8 @@ bool Value::is_null() const { return IsNullValue(value_); }
 // specified for the key, per:
 // https://github.com/googleapis/googleapis/blob/0eeb1be5b78a9c7e006ee57cde95349834ae9f3b/google/bigtable/v2/types.proto#L357
 void Value::DedupProtoMap() {
-  google::bigtable::v2::Value dedup_value;
-  absl::flat_hash_set<std::string> keys;
-  for (int i = value_.array_value().values_size() - 1; i >= 0; --i) {
-    auto map_value_proto = GetProtoValueArrayElement(value_, i);
-    if (!map_value_proto.has_array_value() ||
-        map_value_proto.array_value().values_size() != 2) {
-      continue;
-    }
-    auto const& key = map_value_proto.array_value().values(0);
-    // TODO(#15766): Find a better way to hash these protos.
-    if (keys.insert(key.SerializeAsString()).second) {
-      *dedup_value.mutable_array_value()->add_values() =
-          std::move(map_value_proto);
-    }
-  }
-  std::reverse(dedup_value.mutable_array_value()->mutable_values()->begin(),
-               dedup_value.mutable_array_value()->mutable_values()->end());
-  value_ = std::move(dedup_value);
+  if (!TypeContainsMap(type_)) return;
+  DedupProtoMaps(type_, value_);
 }
 
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
