@@ -145,6 +145,8 @@ std::variant<Status, bigtable::Row> DefaultRowReader::Advance() {
                                    *backoff_policy_, Idempotency::kIdempotent,
                                    enable_server_retries_);
     if (!delay) return std::move(delay).status();
+    stream_is_open_ = false;
+    stream_.reset();
     sleeper_(*delay);
 
     // If we reach this place, we failed and need to restart the call.
@@ -173,6 +175,7 @@ std::variant<Status, bigtable::Row> DefaultRowReader::AdvanceOrFail() {
     // finalize the parser and return OK with no rows unless something
     // fails during cleanup.
     stream_is_open_ = false;
+    stream_.reset();
     if (!last_status_.ok()) return last_status_;
     parser_->HandleEndOfStream(grpc_status);
     return MakeStatusFromRpcError(grpc_status);
@@ -199,7 +202,10 @@ void DefaultRowReader::Cancel() {
     operation_context_->OnDone(last_status_);
   }
   operation_cancelled_ = true;
-  if (!stream_is_open_) return;
+  if (!stream_is_open_) {
+    stream_.reset();
+    return;
+  }
   stream_->Cancel();
 
   // Also drain any data left unread
@@ -207,6 +213,7 @@ void DefaultRowReader::Cancel() {
   while (!stream_->Read(&response).has_value()) {
   }
 
+  stream_.reset();
   client_context_.reset();
   stream_is_open_ = false;
 }

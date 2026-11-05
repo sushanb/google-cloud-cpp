@@ -113,6 +113,43 @@ TEST(AsyncStreamingReadTest, CancelMidStream) {
       std::move(mock), on_read.AsStdFunction(), on_finish.AsStdFunction());
 }
 
+class TrackingAsyncStreamingReadRpc
+    : public StrictMock<MockAsyncStreamingReadRpc> {
+ public:
+  explicit TrackingAsyncStreamingReadRpc(int* live_streams)
+      : live_streams_(live_streams) {
+    ++(*live_streams_);
+  }
+  ~TrackingAsyncStreamingReadRpc() override { --(*live_streams_); }
+
+ private:
+  int* live_streams_;
+};
+
+TEST(AsyncStreamingReadTest, ReleasesStreamBeforeOnFinish) {
+  int live_streams = 0;
+  auto mock = std::make_unique<TrackingAsyncStreamingReadRpc>(&live_streams);
+  EXPECT_EQ(live_streams, 1);
+
+  StrictMock<MockFunction<future<bool>(FakeResponse)>> on_read;
+  StrictMock<MockFunction<void(Status)>> on_finish;
+
+  ::testing::InSequence s;
+  EXPECT_CALL(*mock, Start).WillOnce([] { return make_ready_future(true); });
+  EXPECT_CALL(*mock, Read).WillOnce([] {
+    return make_ready_future(std::optional<FakeResponse>{});
+  });
+  EXPECT_CALL(*mock, Finish).WillOnce([] {
+    return make_ready_future(Status(StatusCode::kUnavailable, "try again"));
+  });
+  EXPECT_CALL(on_finish, Call(StatusIs(StatusCode::kUnavailable)))
+      .WillOnce([&live_streams](Status const&) { EXPECT_EQ(live_streams, 0); });
+
+  PerformAsyncStreamingRead<FakeResponse>(
+      std::move(mock), on_read.AsStdFunction(), on_finish.AsStdFunction());
+  EXPECT_EQ(live_streams, 0);
+}
+
 }  // namespace
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
 }  // namespace bigtable_internal
