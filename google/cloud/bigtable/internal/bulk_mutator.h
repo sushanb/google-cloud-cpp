@@ -50,7 +50,7 @@ class BulkMutatorState {
   void OnRead(google::bigtable::v2::MutateRowsResponse response);
 
   /// Handle the result of a `Finish()` operation on the MutateRows() RPC.
-  void OnFinish(Status finish_status, bool enable_server_retries = false);
+  void OnFinish(Status finish_status, bool enable_server_retries);
 
   /// Terminate the retry loop and return all the failures.
   std::vector<bigtable::FailedMutation> OnRetryDone() &&;
