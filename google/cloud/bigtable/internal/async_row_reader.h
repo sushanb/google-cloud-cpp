@@ -133,7 +133,6 @@ class AsyncRowReader : public std::enable_shared_from_this<AsyncRowReader> {
   /// Parse the data from the response.
   Status ConsumeResponse(google::bigtable::v2::ReadRowsResponse response);
 
-  std::mutex mu_;
   CompletionQueue cq_;
   std::shared_ptr<BigtableStub> stub_;
   std::string app_profile_id_;
@@ -174,8 +173,6 @@ class AsyncRowReader : public std::enable_shared_from_this<AsyncRowReader> {
    * stored here (unless a different error had already been stored).
    */
   Status status_;
-  /// Tracks the level of recursion of TryGiveRowToUser
-  int recursion_level_ = 0;
   internal::ImmutableOptions options_;
   internal::CallContext call_context_;
   std::shared_ptr<grpc::ClientContext> client_context_;
