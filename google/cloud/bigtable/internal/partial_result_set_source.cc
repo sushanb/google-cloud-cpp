@@ -51,6 +51,7 @@ PartialResultSetSource::Create(
 
   // Do an initial read from the stream to determine the fate of the factory.
   auto status = source->ReadFromStream();
+  source->last_status_ = status;
 
   // Any error during parsing will be returned.
   if (!status.ok()) return status;
@@ -100,6 +101,7 @@ PartialResultSetSource::~PartialResultSetSource() {
 
 StatusOr<bigtable::QueryRow> PartialResultSetSource::NextRow() {
   operation_context_->ElementRequest(reader_->context());
+  if (!last_status_.ok()) return last_status_;
   while (rows_.empty()) {
     if (state_ == State::kFinished) {
       operation_context_->ElementDelivery(reader_->context());
@@ -146,15 +148,15 @@ Status PartialResultSetSource::ReadFromStream() {
 
   if (ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(last_status_)) {
     if (resume_token_ && !resume_token_->empty()) {
-      return internal::InternalError(
+      last_status_ = internal::InternalError(
           "Query plan expired during a retry attempt", GCP_ERROR_INFO());
     }
   } else if (!buffered_rows_.empty() || !read_buffer_.empty()) {
     // buffered_rows_ and read_buffer_ are expected to be empty because the last
     // successful read would have had a sentinel resume_token, causing
     // ProcessDataFromStream to commit them.
-    return internal::InternalError("Stream ended with uncommitted rows.",
-                                   GCP_ERROR_INFO());
+    last_status_ = internal::InternalError(
+        "Stream ended with uncommitted rows.", GCP_ERROR_INFO());
   }
 
   return last_status_;
@@ -180,7 +182,6 @@ Status PartialResultSetSource::ProcessDataFromStream(
 
   if (result.has_batch_checksum() && !read_buffer_.empty()) {
     if (bigtable_internal::Crc32c(read_buffer_) != result.batch_checksum()) {
-      state_ = State::kFinished;
       read_buffer_.clear();
       buffered_rows_.clear();
       return internal::InternalError("Unexpected checksum mismatch",
@@ -217,7 +218,6 @@ Status PartialResultSetSource::BufferProtoRows() {
     auto const& proto_values = proto_rows_.values();
 
     if (proto_values.size() % columns_size != 0) {
-      state_ = State::kFinished;
       return internal::InternalError(
           "The number of values in ProtoRows is not a multiple of the "
           "number of columns in the schema or received incomplete row",
