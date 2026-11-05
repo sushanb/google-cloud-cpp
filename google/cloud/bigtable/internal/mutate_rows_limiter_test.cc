@@ -21,7 +21,13 @@
 #include "google/cloud/testing_util/opentelemetry_matchers.h"
 #include "google/cloud/testing_util/scoped_log.h"
 #include <gmock/gmock.h>
+#include <atomic>
 #include <chrono>
+#include <future>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
 
 namespace google {
 namespace cloud {
@@ -350,6 +356,181 @@ TEST(MakeMutateRowsLimiter, TracingDisabledAsync) {
   for (auto i = 0; i != 5; ++i) {
     limiter->AsyncAcquire().get();
     EXPECT_THAT(span_catcher->GetSpans(), IsEmpty());
+  }
+}
+
+TEST(MutateRowsLimiter, OnWaitDoesNotHoldLock) {
+  auto clock = std::make_shared<FakeSteadyClock>();
+  std::promise<void> entered_on_wait;
+  std::promise<void> release_on_wait;
+  auto release_future = release_on_wait.get_future().share();
+  std::atomic<bool> block_first{true};
+
+  auto on_wait = [&](Clock::duration) {
+    if (block_first.exchange(false)) {
+      entered_on_wait.set_value();
+      release_future.wait();
+    }
+  };
+
+  ThrottlingMutateRowsLimiter limiter(
+      clock, on_wait, async_noop, std::chrono::milliseconds(100), kMinPeriod,
+      kMaxPeriod, kMinFactor, kMaxFactor);
+
+  std::thread blocked_acquirer([&] { limiter.Acquire(); });
+  entered_on_wait.get_future().wait();
+
+  EXPECT_EQ(absl::FromChrono(limiter.period()), absl::Milliseconds(100));
+  limiter.Acquire();
+  limiter.AsyncAcquire().get();
+  limiter.Update(MakeResponse(1.25, std::chrono::milliseconds(0)));
+  EXPECT_EQ(absl::FromChrono(limiter.period()), absl::Milliseconds(80));
+
+  release_on_wait.set_value();
+  blocked_acquirer.join();
+}
+
+TEST(MutateRowsLimiter, AsyncOnWaitDoesNotHoldLock) {
+  auto clock = std::make_shared<FakeSteadyClock>();
+  std::promise<void> entered_async_on_wait;
+  std::promise<void> release_async_on_wait;
+  auto release_future = release_async_on_wait.get_future().share();
+  std::atomic<bool> block_first{true};
+
+  auto async_on_wait = [&](Clock::duration) {
+    if (block_first.exchange(false)) {
+      entered_async_on_wait.set_value();
+      release_future.wait();
+    }
+    return make_ready_future();
+  };
+
+  ThrottlingMutateRowsLimiter limiter(
+      clock, noop, async_on_wait, std::chrono::milliseconds(100), kMinPeriod,
+      kMaxPeriod, kMinFactor, kMaxFactor);
+
+  std::thread blocked_acquirer([&] { limiter.AsyncAcquire().get(); });
+  entered_async_on_wait.get_future().wait();
+
+  EXPECT_EQ(absl::FromChrono(limiter.period()), absl::Milliseconds(100));
+  limiter.Acquire();
+  limiter.AsyncAcquire().get();
+  limiter.Update(MakeResponse(1.25, std::chrono::milliseconds(0)));
+  EXPECT_EQ(absl::FromChrono(limiter.period()), absl::Milliseconds(80));
+
+  release_async_on_wait.set_value();
+  blocked_acquirer.join();
+}
+
+TEST(MutateRowsLimiter, ConcurrentUpdatesDoNotCompoundWithinPeriod) {
+  auto constexpr kThreadCount = 8;
+  auto clock = std::make_shared<FakeSteadyClock>();
+  ThrottlingMutateRowsLimiter limiter(clock, noop, async_noop,
+                                      std::chrono::milliseconds(64), kMinPeriod,
+                                      kMaxPeriod, kMinFactor, kMaxFactor);
+
+  auto run_concurrent_updates = [&] {
+    std::promise<void> start;
+    auto start_future = start.get_future().share();
+    auto const response = MakeResponse(0.8, std::chrono::seconds(2));
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadCount);
+    for (auto i = 0; i != kThreadCount; ++i) {
+      threads.emplace_back([&] {
+        start_future.wait();
+        limiter.Update(response);
+      });
+    }
+    start.set_value();
+    for (auto& t : threads) {
+      t.join();
+    }
+  };
+
+  run_concurrent_updates();
+  EXPECT_EQ(absl::FromChrono(limiter.period()), absl::Milliseconds(80));
+
+  clock->AdvanceTime(std::chrono::seconds(2));
+  run_concurrent_updates();
+  EXPECT_EQ(absl::FromChrono(limiter.period()), absl::Milliseconds(100));
+}
+
+TEST(MutateRowsLimiter, ConcurrentAcquiresPreserveThrottlingSignal) {
+  auto constexpr kRounds = 20;
+  auto constexpr kThreadCount = 8;
+
+  for (auto round = 0; round != kRounds; ++round) {
+    auto clock = std::make_shared<FakeSteadyClock>();
+    ThrottlingMutateRowsLimiter limiter(
+        clock, noop, async_noop, std::chrono::milliseconds(100), kMinPeriod,
+        kMaxPeriod, kMinFactor, kMaxFactor);
+
+    std::promise<void> start;
+    auto start_future = start.get_future().share();
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadCount);
+    for (auto i = 0; i != kThreadCount; ++i) {
+      threads.emplace_back([&, i] {
+        start_future.wait();
+        if (i % 2 == 0) {
+          limiter.Acquire();
+        } else {
+          limiter.AsyncAcquire().get();
+        }
+      });
+    }
+    start.set_value();
+    for (auto& t : threads) {
+      t.join();
+    }
+
+    clock->AdvanceTime(std::chrono::seconds(10));
+    limiter.Acquire();
+    limiter.AsyncAcquire().get();
+
+    limiter.Update(MakeResponse(1.25, std::chrono::milliseconds(0)));
+    EXPECT_EQ(absl::FromChrono(limiter.period()), absl::Milliseconds(80));
+  }
+}
+
+TEST(MutateRowsLimiter, ThreadSafety) {
+  auto constexpr kIterations = 200;
+  auto clock = std::make_shared<FakeSteadyClock>();
+  ThrottlingMutateRowsLimiter limiter(clock, noop, async_noop,
+                                      std::chrono::milliseconds(50), kMinPeriod,
+                                      kMaxPeriod, kMinFactor, kMaxFactor);
+
+  auto const decrease = MakeResponse(0.8, std::chrono::milliseconds(1));
+  auto const increase = MakeResponse(1.25, std::chrono::milliseconds(1));
+
+  std::vector<std::thread> threads;
+  for (auto t = 0; t != 2; ++t) {
+    threads.emplace_back([&] {
+      for (auto i = 0; i != kIterations; ++i) {
+        limiter.Acquire();
+      }
+    });
+    threads.emplace_back([&] {
+      for (auto i = 0; i != kIterations; ++i) {
+        limiter.AsyncAcquire().get();
+      }
+    });
+    threads.emplace_back([&] {
+      for (auto i = 0; i != kIterations; ++i) {
+        clock->AdvanceTime(std::chrono::milliseconds(1));
+        limiter.Update(i % 2 == 0 ? decrease : increase);
+      }
+    });
+    threads.emplace_back([&] {
+      for (auto i = 0; i != kIterations; ++i) {
+        auto const p = absl::FromChrono(limiter.period());
+        EXPECT_GE(p, absl::FromChrono(kMinPeriod));
+        EXPECT_LE(p, absl::FromChrono(kMaxPeriod));
+      }
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
   }
 }
 
