@@ -106,7 +106,10 @@ class RateLimiter {
     std::lock_guard<std::mutex> lk(mu_);
     period_ = abs(period);
   }
-  Clock::duration period() const { return period_; }
+  Clock::duration period() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return period_;
+  }
 
  private:
   // Note that std::chrono::abs() is not available until C++17.
@@ -116,7 +119,7 @@ class RateLimiter {
         d >= std::chrono::duration<Rep, Period>::zero() ? d : -d);
   }
 
-  std::mutex mu_;
+  mutable std::mutex mu_;
   std::shared_ptr<Clock> clock_;
   // Over any `smoothing_interval_`, we must average <= 1 token per `period_`.
   Clock::duration smoothing_interval_;

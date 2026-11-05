@@ -20,6 +20,7 @@
 #include "google/cloud/internal/opentelemetry.h"
 #include "absl/time/time.h"
 #include <algorithm>
+#include <mutex>
 #include <thread>
 
 namespace google {
@@ -43,16 +44,24 @@ auto constexpr kMaxPeriod = std::chrono::seconds(10);
 }  // namespace
 
 void ThrottlingMutateRowsLimiter::Acquire() {
-  auto wait = limiter_.acquire(1);
-  throttled_since_last_update_ =
-      throttled_since_last_update_ || wait != Clock::duration::zero();
+  Clock::duration wait;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    wait = limiter_.acquire(1);
+    throttled_since_last_update_ =
+        throttled_since_last_update_ || wait != Clock::duration::zero();
+  }
   on_wait_(wait);
 }
 
 future<void> ThrottlingMutateRowsLimiter::AsyncAcquire() {
-  auto wait = limiter_.acquire(1);
-  throttled_since_last_update_ =
-      throttled_since_last_update_ || wait != Clock::duration::zero();
+  Clock::duration wait;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    wait = limiter_.acquire(1);
+    throttled_since_last_update_ =
+        throttled_since_last_update_ || wait != Clock::duration::zero();
+  }
   return async_on_wait_(wait);
 }
 
@@ -60,6 +69,7 @@ void ThrottlingMutateRowsLimiter::Update(
     google::bigtable::v2::MutateRowsResponse const& response) {
   if (!response.has_rate_limit_info()) return;
   auto const now = clock_->Now();
+  std::lock_guard<std::mutex> lk(mu_);
   if (now < next_update_) return;
   auto const& info = response.rate_limit_info();
   next_update_ = now + std::chrono::duration_cast<Clock::duration>(

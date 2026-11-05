@@ -25,6 +25,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
 
 namespace google {
 namespace cloud {
@@ -83,15 +84,19 @@ class ThrottlingMutateRowsLimiter : public MutateRowsLimiter {
       google::bigtable::v2::MutateRowsResponse const& response) override;
 
   // Exposed for testing
-  Clock::duration period() const { return limiter_.period(); }
+  Clock::duration period() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return limiter_.period();
+  }
 
  private:
+  mutable std::mutex mu_;
   std::shared_ptr<Clock> clock_;
-  RateLimiter limiter_;
+  RateLimiter limiter_;  // ABSL_GUARDED_BY(mu_)
   std::function<void(Clock::duration)> on_wait_;
   std::function<future<void>(Clock::duration)> async_on_wait_;
-  bool throttled_since_last_update_ = false;
-  Clock::time_point next_update_;
+  bool throttled_since_last_update_ = false;  // ABSL_GUARDED_BY(mu_)
+  Clock::time_point next_update_;             // ABSL_GUARDED_BY(mu_)
   Clock::duration min_period_;
   Clock::duration max_period_;
   double min_factor_;

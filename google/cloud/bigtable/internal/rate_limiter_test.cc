@@ -16,6 +16,9 @@
 #include "google/cloud/testing_util/fake_clock.h"
 #include "absl/time/time.h"
 #include <gmock/gmock.h>
+#include <chrono>
+#include <thread>
+#include <vector>
 
 namespace google {
 namespace cloud {
@@ -180,6 +183,40 @@ TEST(RateLimiter, ThreadSafety) {
   auto wait = limiter.acquire(1);
   EXPECT_EQ(absl::FromChrono(wait),
             absl::Seconds(kThreadCount * kAcquiresPerThread));
+}
+
+TEST(RateLimiter, ConcurrentPeriodAccess) {
+  auto constexpr kIterations = 500;
+  auto const p1 = std::chrono::milliseconds(100);
+  auto const p2 = std::chrono::milliseconds(200);
+
+  auto clock = std::make_shared<FakeSteadyClock>();
+  RateLimiter limiter(clock, p1);
+  RateLimiter const& const_limiter = limiter;
+
+  std::vector<std::thread> threads;
+  threads.emplace_back([&] {
+    for (auto i = 0; i != kIterations; ++i) {
+      limiter.set_period(i % 2 == 0 ? p1 : p2);
+    }
+  });
+  threads.emplace_back([&] {
+    for (auto i = 0; i != kIterations; ++i) {
+      (void)limiter.acquire(1);
+    }
+  });
+  for (auto r = 0; r != 4; ++r) {
+    threads.emplace_back([&] {
+      for (auto i = 0; i != kIterations; ++i) {
+        EXPECT_THAT(
+            absl::FromChrono(const_limiter.period()),
+            ::testing::AnyOf(absl::Milliseconds(100), absl::Milliseconds(200)));
+      }
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
 }
 
 }  // namespace
