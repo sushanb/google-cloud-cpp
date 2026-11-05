@@ -62,14 +62,17 @@ void ThrottlingMutateRowsLimiter::Update(
   auto const now = clock_->Now();
   if (now < next_update_) return;
   auto const& info = response.rate_limit_info();
-  next_update_ = now + std::chrono::duration_cast<Clock::duration>(
-                           std::chrono::seconds(info.period().seconds()) +
-                           std::chrono::nanoseconds(info.period().nanos()));
 
   // The effective QPS can lag behind the max QPS allowed by the rate limiter.
   // In such a case, we should not keep increasing the max QPS allowed. We
   // should only increase the ceiling if we are actually hitting that ceiling.
+  // Only advance `next_update_` when we actually adjust the rate limiter
+  // period, so skipped rate increases do not lock out subsequent updates.
   if (info.factor() > 1 && !throttled_since_last_update_) return;
+
+  next_update_ = now + std::chrono::duration_cast<Clock::duration>(
+                           std::chrono::seconds(info.period().seconds()) +
+                           std::chrono::nanoseconds(info.period().nanos()));
   throttled_since_last_update_ = false;
 
   auto factor = Clamp(info.factor(), min_factor_, max_factor_);

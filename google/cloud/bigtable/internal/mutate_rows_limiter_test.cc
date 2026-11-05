@@ -113,15 +113,33 @@ TEST(MutateRowsLimiter, NoRateIncreaseIfNoThrottlingSinceLastUpdate) {
       kMaxPeriod, kMinFactor, kMaxFactor);
   EXPECT_EQ(absl::FromChrono(limiter.period()), absl::Milliseconds(100));
 
-  limiter.Update(MakeResponse(1.25, std::chrono::milliseconds(0)));
+  // Unthrottled rate increases are ignored and must not advance `next_update_`.
+  limiter.Update(MakeResponse(1.25, std::chrono::seconds(10)));
   EXPECT_EQ(absl::FromChrono(limiter.period()), absl::Milliseconds(100));
 
-  InduceThrottling(limiter);
-  limiter.Update(MakeResponse(1.25, std::chrono::milliseconds(0)));
-  EXPECT_EQ(absl::FromChrono(limiter.period()), absl::Milliseconds(80));
+  // A subsequent rate decrease within those 10s must be honored immediately.
+  clock->AdvanceTime(std::chrono::seconds(1));
+  limiter.Update(MakeResponse(0.8, std::chrono::seconds(10)));
+  EXPECT_EQ(absl::FromChrono(limiter.period()), absl::Milliseconds(125));
 
-  limiter.Update(MakeResponse(1.25, std::chrono::milliseconds(0)));
-  EXPECT_EQ(absl::FromChrono(limiter.period()), absl::Milliseconds(80));
+  // Advance past the applied cooldown period. Another unthrottled rate increase
+  // is still ignored without advancing `next_update_`.
+  clock->AdvanceTime(std::chrono::seconds(10));
+  limiter.Update(MakeResponse(1.25, std::chrono::seconds(10)));
+  EXPECT_EQ(absl::FromChrono(limiter.period()), absl::Milliseconds(125));
+
+  // Once throttling occurs within those 10s, a rate increase is honored
+  // immediately and resets `throttled_since_last_update_`.
+  clock->AdvanceTime(std::chrono::seconds(1));
+  InduceThrottling(limiter);
+  limiter.Update(MakeResponse(1.25, std::chrono::seconds(10)));
+  EXPECT_EQ(absl::FromChrono(limiter.period()), absl::Milliseconds(100));
+
+  // After the cooldown expires without new throttling, another rate increase is
+  // ignored.
+  clock->AdvanceTime(std::chrono::seconds(10));
+  limiter.Update(MakeResponse(1.25, std::chrono::seconds(10)));
+  EXPECT_EQ(absl::FromChrono(limiter.period()), absl::Milliseconds(100));
 }
 
 TEST(MutateRowsLimiter, RateCanDecreaseIfNoThrottlingSinceLastUpdate) {
