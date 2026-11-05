@@ -17,10 +17,6 @@
 
 #include "google/cloud/options.h"
 #include "google/cloud/version.h"
-#include <memory>
-#include <mutex>
-#include <set>
-#include <string>
 
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_GRPC_OTEL_METRICS
 #include "google/cloud/monitoring/v3/metric_connection.h"
@@ -31,46 +27,18 @@
 #include <opentelemetry/sdk/metrics/export/periodic_exporting_metric_reader.h>
 #include <opentelemetry/sdk/metrics/push_metric_exporter.h>
 #include <opentelemetry/sdk/resource/resource.h>
+#include <atomic>
 #include <functional>
+#include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 #endif  // GOOGLE_CLOUD_CPP_BIGTABLE_WITH_GRPC_OTEL_METRICS
 
 namespace google {
 namespace cloud {
-namespace monitoring_v3 {
-GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
-class MetricServiceConnection;
-GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
-}  // namespace monitoring_v3
-
 namespace bigtable_internal {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
-
-/**
- * Thread-safe registry tracking registered channel authorities for gRPC
- * OpenTelemetry metrics.
- *
- * gRPC OpenTelemetry plugin registration (`BuildAndRegisterGlobal`) is
- * process-global per target channel authority. Once registered, gRPC maintains
- * the MeterProvider globally for the lifetime of the process.
- */
-class GrpcMetricsExporterRegistry {
- public:
-  static GrpcMetricsExporterRegistry& Singleton();
-
-  // Returns `true` if @p authority is newly registered, `false` if @p authority
-  // was already registered.
-  bool Register(std::string authority);
-
-  void Clear();
-
- private:
-  GrpcMetricsExporterRegistry() = default;
-
-  std::set<std::string> known_authorities_;
-  std::mutex mu_;
-};
 
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_GRPC_OTEL_METRICS
 struct MonitoredResourceResult {
@@ -103,26 +71,43 @@ struct GrpcMetricsPluginConfig {
   std::vector<std::string_view> enabled_metrics;
   std::vector<std::string_view> disabled_metrics;
   std::function<bool(std::string_view)> generic_method_filter;
-  std::function<bool(grpc::OpenTelemetryPluginBuilder::ChannelScope const&)>
-      channel_scope_filter;
 };
 
 GrpcMetricsPluginConfig MakeGrpcMetricsPluginConfig(
-    opentelemetry::sdk::resource::Resource detected_resource,
+    opentelemetry::sdk::resource::Resource const& detected_resource,
     std::shared_ptr<monitoring_v3::MetricServiceConnection> const& conn,
-    Options const& options, std::string const& client_uid);
+    Options const& options, std::string const& client_uid,
+    std::shared_ptr<std::atomic<bool>> export_enabled = nullptr);
 
 GrpcMetricsPluginConfig MakeGrpcMetricsPluginConfig(
     std::shared_ptr<monitoring_v3::MetricServiceConnection> const& conn,
-    Options const& options, std::string const& client_uid);
+    Options const& options, std::string const& client_uid,
+    std::shared_ptr<std::atomic<bool>> export_enabled = nullptr);
 
-void EnableGrpcMetrics(
+std::shared_ptr<grpc::experimental::OpenTelemetryPlugin> MakeGrpcMetricsPlugin(
+    GrpcMetricsPluginConfig config);
+
+std::shared_ptr<grpc::experimental::OpenTelemetryPlugin> MakeGrpcMetricsPlugin(
+    opentelemetry::sdk::resource::Resource const& detected_resource,
     std::shared_ptr<monitoring_v3::MetricServiceConnection> const& conn,
-    Options const& options, std::string const& client_uid);
-#else
-inline void EnableGrpcMetrics(
-    std::shared_ptr<monitoring_v3::MetricServiceConnection> const&,
-    Options const&, std::string const&) {}
+    Options const& options, std::string const& client_uid,
+    std::shared_ptr<std::atomic<bool>> export_enabled = nullptr);
+
+std::shared_ptr<grpc::experimental::OpenTelemetryPlugin> MakeGrpcMetricsPlugin(
+    std::shared_ptr<monitoring_v3::MetricServiceConnection> const& conn,
+    Options const& options, std::string const& client_uid,
+    std::shared_ptr<std::atomic<bool>> export_enabled = nullptr);
+
+Options WithGrpcMetricsPlugin(
+    Options options,
+    std::shared_ptr<grpc::experimental::OpenTelemetryPlugin> const& plugin);
+
+Options EnableGrpcMetricsForInstance(
+    opentelemetry::sdk::resource::Resource const& detected_resource,
+    std::shared_ptr<monitoring_v3::MetricServiceConnection> const& conn,
+    Options options, std::string_view instance_name,
+    std::string const& client_uid,
+    std::shared_ptr<std::atomic<bool>> export_enabled = nullptr);
 #endif  // GOOGLE_CLOUD_CPP_BIGTABLE_WITH_GRPC_OTEL_METRICS
 
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
