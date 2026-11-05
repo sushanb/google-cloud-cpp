@@ -1482,6 +1482,20 @@ TEST_F(DataConnectionTest, ReadRowsRetryInfoIgnored) {
   EXPECT_THAT(rows, ElementsAre(StatusIs(PermanentError().code())));
 }
 
+TEST_F(DataConnectionTest, ReadRowsNegativeRowsLimit) {
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, ReadRows).Times(0);
+
+  auto conn = TestConnection(std::move(mock));
+  internal::OptionsSpan span(CallOptions());
+  auto reader = conn->ReadRows(kTableName, TestRowSet(), -1, TestFilter());
+  std::vector<StatusOr<bigtable::Row>> rows;
+  for (auto const& row : reader) rows.push_back(row);
+  EXPECT_THAT(
+      rows, ElementsAre(StatusIs(StatusCode::kInvalidArgument,
+                                 HasSubstr("rows_limit cannot be negative"))));
+}
+
 TEST_F(DataConnectionTest, ReadRowEmpty) {
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
   auto mock_metric = std::make_unique<MockMetric>();
@@ -2807,6 +2821,26 @@ TEST_F(DataConnectionTest, AsyncReadRowsReverseScan) {
                       TestFilter());
 }
 
+TEST_F(DataConnectionTest, AsyncReadRowsNegativeRowsLimit) {
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, AsyncReadRows).Times(0);
+
+  MockFunction<future<bool>(bigtable::Row const&)> on_row;
+  EXPECT_CALL(on_row, Call).Times(0);
+
+  MockFunction<void(Status)> on_finish;
+  EXPECT_CALL(on_finish, Call).WillOnce([](Status const& status) {
+    EXPECT_THAT(status, StatusIs(StatusCode::kInvalidArgument,
+                                 HasSubstr("rows_limit cannot be negative")));
+  });
+
+  auto conn = TestConnection(std::move(mock));
+  internal::OptionsSpan span(CallOptions());
+  conn->AsyncReadRows(kTableName, on_row.AsStdFunction(),
+                      on_finish.AsStdFunction(), TestRowSet(), -1,
+                      TestFilter());
+}
+
 TEST_F(DataConnectionTest, AsyncReadRowEmpty) {
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
   auto mock_metric = std::make_unique<MockMetric>();
@@ -2860,8 +2894,12 @@ TEST_F(DataConnectionTest, AsyncReadRowSuccess) {
   auto mock_metric = std::make_unique<MockMetric>();
   EXPECT_CALL(*mock_metric, PreCall).Times(1);
   EXPECT_CALL(*mock_metric, PostCall).Times(1);
-  EXPECT_CALL(*mock_metric, OnDone).Times(1);
-  EXPECT_CALL(*mock_metric, ElementRequest).Times(0);
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce(
+          [](opentelemetry::context::Context const&, OnDoneParams const& p) {
+            EXPECT_STATUS_OK(p.operation_status);
+          });
+  EXPECT_CALL(*mock_metric, ElementRequest).Times(1);
   EXPECT_CALL(*mock_metric, ElementDelivery).Times(1);
   auto fake_metric = std::make_shared<CloningMetric>(std::move(mock_metric));
   auto clock = std::make_shared<testing_util::FakeSteadyClock>();
