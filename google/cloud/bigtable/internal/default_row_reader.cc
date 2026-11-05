@@ -18,6 +18,8 @@
 #include "google/cloud/grpc_options.h"
 #include "google/cloud/internal/make_status.h"
 #include "google/cloud/internal/retry_loop_helpers.h"
+#include <optional>
+#include <utility>
 #include <variant>
 
 namespace google {
@@ -48,6 +50,7 @@ DefaultRowReader::DefaultRowReader(
 void DefaultRowReader::MakeRequest() {
   response_ = {};
   processed_chunks_count_ = 0;
+  last_status_ = Status{};
 
   google::bigtable::v2::ReadRowsRequest request;
   request.set_table_name(table_name_);
@@ -122,6 +125,7 @@ std::variant<Status, bigtable::Row> DefaultRowReader::Advance() {
     // retry and we have no good value for rows_limit anyway.
     if (rows_limit_ != bigtable::RowReader::NO_ROWS_LIMIT &&
         rows_limit_ <= rows_count_) {
+      last_status_ = Status{};
       return Status{};
     }
 
@@ -139,12 +143,18 @@ std::variant<Status, bigtable::Row> DefaultRowReader::Advance() {
     }
 
     // If we receive an error, but the retryable set is empty, stop.
-    if (row_set_.IsEmpty()) return Status{};
+    if (row_set_.IsEmpty()) {
+      last_status_ = Status{};
+      return Status{};
+    }
 
     auto delay = internal::Backoff(status, "AsyncReadRows", *retry_policy_,
                                    *backoff_policy_, Idempotency::kIdempotent,
                                    enable_server_retries_);
-    if (!delay) return std::move(delay).status();
+    if (!delay) {
+      last_status_ = std::move(delay).status();
+      return last_status_;
+    }
     sleeper_(*delay);
 
     // If we reach this place, we failed and need to restart the call.
@@ -161,10 +171,16 @@ std::variant<Status, bigtable::Row> DefaultRowReader::AdvanceOrFail() {
           std::move(*(response_.mutable_chunks(processed_chunks_count_))),
           grpc_status);
       if (!grpc_status.ok()) {
-        auto status = MakeStatusFromRpcError(grpc_status);
-        operation_context_->PostCall(*client_context_, status);
+        last_status_ = MakeStatusFromRpcError(grpc_status);
+        stream_->Cancel();
+        google::bigtable::v2::ReadRowsResponse response;
+        while (!stream_->Read(&response).has_value()) {
+        }
+        response_ = {};
+        stream_is_open_ = false;
+        operation_context_->PostCall(*client_context_, last_status_);
         called_post_call_ = true;
-        return status;
+        return last_status_;
       }
       continue;
     }
@@ -175,13 +191,17 @@ std::variant<Status, bigtable::Row> DefaultRowReader::AdvanceOrFail() {
     stream_is_open_ = false;
     if (!last_status_.ok()) return last_status_;
     parser_->HandleEndOfStream(grpc_status);
-    return MakeStatusFromRpcError(grpc_status);
+    last_status_ = MakeStatusFromRpcError(grpc_status);
+    return last_status_;
   }
 
   // We have a complete row in the parser.
   bigtable::Row parsed_row = parser_->Next(grpc_status);
 
-  if (!grpc_status.ok()) return MakeStatusFromRpcError(grpc_status);
+  if (!grpc_status.ok()) {
+    last_status_ = MakeStatusFromRpcError(grpc_status);
+    return last_status_;
+  }
 
   ++rows_count_;
   last_read_row_key_ = parsed_row.row_key();
@@ -189,26 +209,35 @@ std::variant<Status, bigtable::Row> DefaultRowReader::AdvanceOrFail() {
 }
 
 void DefaultRowReader::Cancel() {
+  std::optional<Status> drain_status;
+  if (stream_is_open_) {
+    stream_->Cancel();
+
+    // Also drain any data left unread
+    google::bigtable::v2::ReadRowsResponse response;
+    while (!(drain_status = stream_->Read(&response)).has_value()) {
+    }
+    stream_is_open_ = false;
+  }
+
   // As the destructor also calls Cancel, we want to call OnDone exactly once.
   // If parser_ == nullptr, then we know no RPC was ever attempted.
   if (!operation_cancelled_ && parser_) {
     if (!called_post_call_) {
+      if (!drain_status || drain_status->ok()) {
+        last_status_ = internal::CancelledError(
+            "call cancelled",
+            GCP_ERROR_INFO().WithMetadata("gl-cpp.error.origin", "client"));
+      } else {
+        last_status_ = *std::move(drain_status);
+      }
       called_post_call_ = true;
       operation_context_->PostCall(*client_context_, last_status_);
     }
     operation_context_->OnDone(last_status_);
   }
   operation_cancelled_ = true;
-  if (!stream_is_open_) return;
-  stream_->Cancel();
-
-  // Also drain any data left unread
-  google::bigtable::v2::ReadRowsResponse response;
-  while (!stream_->Read(&response).has_value()) {
-  }
-
   client_context_.reset();
-  stream_is_open_ = false;
 }
 
 DefaultRowReader::~DefaultRowReader() {
