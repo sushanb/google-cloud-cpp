@@ -15,6 +15,7 @@
 #include "google/cloud/bigtable/internal/bigtable_random_two_least_used_decorator.h"
 #include "google/cloud/bigtable/internal/operation_context.h"
 #include "google/cloud/async_streaming_read_write_rpc.h"
+#include "google/cloud/future.h"
 #include "google/cloud/internal/async_streaming_read_rpc.h"
 #include "google/cloud/internal/streaming_read_rpc.h"
 #include <functional>
@@ -105,6 +106,40 @@ class AsyncStreamingReadWriteRpcTracking
   std::function<void()> on_destruction_;
 };
 
+class ScopedChannelRelease {
+ public:
+  explicit ScopedChannelRelease(
+      std::shared_ptr<ChannelUsage<BigtableStub>> channel)
+      : channel_(std::move(channel)) {}
+
+  ScopedChannelRelease(ScopedChannelRelease&& other) noexcept
+      : channel_(std::move(other.channel_)) {
+    other.channel_.reset();
+  }
+  ScopedChannelRelease& operator=(ScopedChannelRelease&& other) noexcept {
+    if (this != &other) {
+      Release();
+      channel_ = std::move(other.channel_);
+      other.channel_.reset();
+    }
+    return *this;
+  }
+  ScopedChannelRelease(ScopedChannelRelease const&) = delete;
+  ScopedChannelRelease& operator=(ScopedChannelRelease const&) = delete;
+
+  ~ScopedChannelRelease() { Release(); }
+
+  void Release() {
+    if (channel_ != nullptr) {
+      channel_->ReleaseStub();
+      channel_.reset();
+    }
+  }
+
+ private:
+  std::shared_ptr<ChannelUsage<BigtableStub>> channel_;
+};
+
 template <typename Response>
 Response UnaryHelper(std::shared_ptr<DynamicChannelPool<BigtableStub>>& pool,
                      bigtable_internal::OperationContext& oc,
@@ -115,9 +150,8 @@ Response UnaryHelper(std::shared_ptr<DynamicChannelPool<BigtableStub>>& pool,
       selection.outstanding_rpcs, ChannelPoolLbPolicy::kRandomTwoLeastUsed,
       pool->transport_type(), RpcType::kUnary});
   std::shared_ptr<BigtableStub> stub = selection.channel->AcquireStub();
-  Response result = fn(*stub);
-  selection.channel->ReleaseStub();
-  return result;
+  ScopedChannelRelease release_guard(std::move(selection.channel));
+  return fn(*stub);
 }
 
 template <typename Response>
@@ -133,9 +167,15 @@ Response AsyncHelper(std::shared_ptr<DynamicChannelPool<BigtableStub>>& pool,
         pool->transport_type(), RpcType::kUnary});
   }
   std::shared_ptr<BigtableStub> stub = selection.channel->AcquireStub();
+  ScopedChannelRelease release_guard(std::move(selection.channel));
   Response result = fn(*stub);
-  selection.channel->ReleaseStub();
-  return result;
+  if (!result.valid()) {
+    return result;
+  }
+  return result.then([guard = std::move(release_guard)](Response f) mutable {
+    guard.Release();
+    return f.get();
+  });
 }
 
 template <typename Response>
