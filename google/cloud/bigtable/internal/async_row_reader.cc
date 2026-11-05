@@ -28,6 +28,15 @@ namespace v2 = ::google::bigtable::v2;
 
 void AsyncRowReader::MakeRequest() {
   status_ = Status();
+  parser_failed_ = false;
+  if (rows_limit_ < 0) {
+    status_ = internal::InvalidArgumentError(
+        "rows_limit cannot be negative",
+        GCP_ERROR_INFO().WithMetadata("gl-cpp.error.origin", "client"));
+    whole_op_finished_ = true;
+    TryGiveRowToUser();
+    return;
+  }
   v2::ReadRowsRequest request;
 
   request.set_app_profile_id(app_profile_id_);
@@ -188,7 +197,8 @@ void AsyncRowReader::OnStreamFinished(Status status) {
   // number of rows and still receive an error (the parser can throw
   // an error at end of stream for example), there is no need to
   // retry and we have no good value for rows_limit anyway.
-  if (rows_limit_ != NO_ROWS_LIMIT && rows_limit_ <= rows_count_) {
+  if (!user_cancelled_ && !parser_failed_ && rows_limit_ != NO_ROWS_LIMIT &&
+      rows_limit_ > 0 && rows_limit_ <= rows_count_) {
     status_ = Status();
   }
 
@@ -206,13 +216,15 @@ void AsyncRowReader::OnStreamFinished(Status status) {
   }
 
   // If we receive an error, but the retryable set is empty, consider it a
-  // success.
-  if (row_set_.IsEmpty()) {
+  // success unless the user cancelled or the parser failed mid-stream.
+  if (!user_cancelled_ && !parser_failed_ && row_set_.IsEmpty()) {
     status_ = Status();
   }
 
-  if (status_.ok()) {
-    // We've successfully finished the scan.
+  if (status_.ok() || user_cancelled_ ||
+      (rows_limit_ != NO_ROWS_LIMIT && rows_limit_ > 0 &&
+       rows_limit_ <= rows_count_) ||
+      row_set_.IsEmpty()) {
     whole_op_finished_ = true;
     operation_context_->OnDone(status_);
     TryGiveRowToUser();
@@ -245,6 +257,7 @@ void AsyncRowReader::OnStreamFinished(Status status) {
 }
 
 void AsyncRowReader::Cancel(std::string const& reason) {
+  user_cancelled_ = true;
   ready_rows_ = std::queue<bigtable::Row>();
   auto continue_reading = std::move(continue_reading_);
   continue_reading_.reset();
@@ -283,10 +296,12 @@ Status AsyncRowReader::ConsumeResponse(
     grpc::Status status;
     parser_->HandleChunk(std::move(chunk), status);
     if (!status.ok()) {
+      parser_failed_ = true;
       return MakeStatusFromRpcError(status);
     }
     Status parser_status = DrainParser();
     if (!parser_status.ok()) {
+      parser_failed_ = true;
       return parser_status;
     }
   }
