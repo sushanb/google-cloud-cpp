@@ -22,6 +22,16 @@
 #include "google/cloud/testing_util/status_matchers.h"
 #include "google/cloud/testing_util/validate_metadata.h"
 #include <gmock/gmock.h>
+#include <algorithm>
+#include <cstddef>
+#include <future>
+#include <iterator>
+#include <memory>
+#include <queue>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
 namespace google {
 namespace cloud {
@@ -684,6 +694,186 @@ TEST_F(MutationBatcherTest, WaitForNoPendingEdgeCases) {
   EXPECT_EQ(no_more_pending0.wait_for(1_ms), std::future_status::ready);
   EXPECT_EQ(no_more_pending1.wait_for(1_ms), std::future_status::ready);
   EXPECT_EQ(no_more_pending2.wait_for(1_ms), std::future_status::ready);
+}
+
+TEST_F(MutationBatcherTest, CompletionContinuationCanWaitForNoPendingRequests) {
+  SingleRowMutation mut("foo", {bt::SetCell("fam", "col", 0_ms, "baz")});
+  MutationBatcher batcher(*table_);
+
+  ExpectInteraction({Exchange({mut}, {})});
+
+  auto admission_and_completion = batcher.AsyncApply(cq_, mut);
+  admission_and_completion.first.get();
+  EXPECT_EQ(1U, NumOperationsOutstanding());
+
+  auto no_more_pending = batcher.AsyncWaitForNoPendingRequests();
+  EXPECT_FALSE(no_more_pending.is_ready());
+
+  bool completion_callback_finished = false;
+  bool wait_inside_callback_ready = false;
+  admission_and_completion.second.then([&](future<Status> f) {
+    EXPECT_STATUS_OK(f.get());
+    auto inner_wait = batcher.AsyncWaitForNoPendingRequests();
+    wait_inside_callback_ready = inner_wait.is_ready();
+    inner_wait.get();
+    completion_callback_finished = true;
+  });
+
+  bool callback_finished_before_no_more_pending = false;
+  no_more_pending.then([&](future<void> f) {
+    f.get();
+    callback_finished_before_no_more_pending = completion_callback_finished;
+  });
+
+  FinishSingleItemStream();
+
+  EXPECT_TRUE(wait_inside_callback_ready);
+  EXPECT_TRUE(completion_callback_finished);
+  EXPECT_TRUE(callback_finished_before_no_more_pending);
+  EXPECT_EQ(0U, NumOperationsOutstanding());
+}
+
+TEST_F(MutationBatcherTest, CompletionContinuationCanApplyAtFlowControlLimit) {
+  std::vector<SingleRowMutation> mutations(
+      {SingleRowMutation("foo1", {bt::SetCell("fam", "col", 0_ms, "baz")}),
+       SingleRowMutation("foo2", {bt::SetCell("fam", "col", 0_ms, "baz")})});
+
+  MutationBatcher batcher(*table_, MutationBatcher::Options()
+                                       .SetMaxOutstandingMutations(1)
+                                       .SetMaxMutationsPerBatch(1)
+                                       .SetMaxBatches(1));
+
+  ExpectInteraction(
+      {Exchange({mutations[0]}, {0}), Exchange({mutations[1]}, {})});
+
+  auto first = batcher.AsyncApply(cq_, mutations[0]);
+  ASSERT_TRUE(first.first.is_ready());
+  first.first.get();
+  EXPECT_EQ(1U, NumOperationsOutstanding());
+
+  future<Status> second_completion;
+  bool second_admitted_immediately = false;
+  first.second.then([&](future<Status> f) {
+    EXPECT_THAT(f.get(), Not(IsOk()));
+    auto second = batcher.AsyncApply(cq_, mutations[1]);
+    second_admitted_immediately = second.first.is_ready();
+    second.first.get();
+    second_completion = std::move(second.second);
+  });
+
+  FinishSingleItemStream();
+
+  EXPECT_TRUE(second_admitted_immediately);
+  ASSERT_TRUE(second_completion.valid());
+  EXPECT_FALSE(second_completion.is_ready());
+  EXPECT_EQ(1U, NumOperationsOutstanding());
+
+  FinishSingleItemStream();
+
+  EXPECT_STATUS_OK(second_completion.get());
+  EXPECT_EQ(0U, NumOperationsOutstanding());
+}
+
+TEST_F(MutationBatcherTest,
+       CompletionContinuationObservesPendingAdmissionSatisfied) {
+  std::vector<SingleRowMutation> mutations(
+      {SingleRowMutation("foo1", {bt::SetCell("fam", "col", 0_ms, "baz")}),
+       SingleRowMutation("foo2", {bt::SetCell("fam", "col", 0_ms, "baz")})});
+
+  MutationBatcher batcher(*table_, MutationBatcher::Options()
+                                       .SetMaxOutstandingMutations(1)
+                                       .SetMaxMutationsPerBatch(1)
+                                       .SetMaxBatches(1));
+
+  ExpectInteraction(
+      {Exchange({mutations[0]}, {}), Exchange({mutations[1]}, {})});
+
+  auto first = batcher.AsyncApply(cq_, mutations[0]);
+  ASSERT_TRUE(first.first.is_ready());
+  first.first.get();
+
+  auto second = batcher.AsyncApply(cq_, mutations[1]);
+  EXPECT_FALSE(second.first.is_ready());
+
+  bool second_ready_in_first_callback = false;
+  first.second.then([&](future<Status> f) {
+    EXPECT_STATUS_OK(f.get());
+    second_ready_in_first_callback = second.first.is_ready();
+    second.first.get();
+  });
+
+  FinishSingleItemStream();
+
+  EXPECT_TRUE(second_ready_in_first_callback);
+  EXPECT_FALSE(second.second.is_ready());
+  EXPECT_EQ(1U, NumOperationsOutstanding());
+
+  FinishSingleItemStream();
+
+  EXPECT_STATUS_OK(second.second.get());
+  EXPECT_EQ(0U, NumOperationsOutstanding());
+}
+
+TEST_F(MutationBatcherTest, DestroyBatcherFromCompletionContinuation) {
+  std::vector<SingleRowMutation> mutations(
+      {SingleRowMutation("foo1", {bt::SetCell("fam", "col", 0_ms, "baz")}),
+       SingleRowMutation("foo2", {bt::SetCell("fam", "col", 0_ms, "baz")}),
+       SingleRowMutation("foo3", {bt::SetCell("fam", "col", 0_ms, "baz")})});
+
+  auto batcher = std::make_unique<MutationBatcher>(
+      *table_, MutationBatcher::Options().SetMaxBatches(1));
+
+  ExpectInteraction({Exchange({mutations[0]}, {}),
+                     Exchange({mutations[1], mutations[2]}, {0})});
+
+  auto state0 = Apply(*batcher, mutations[0]);
+  auto m1 = batcher->AsyncApply(cq_, mutations[1]);
+  auto m2 = batcher->AsyncApply(cq_, mutations[2]);
+  m1.first.get();
+  m2.first.get();
+
+  FinishSingleItemStream();
+  EXPECT_TRUE(state0->completed);
+  EXPECT_EQ(1U, NumOperationsOutstanding());
+
+  Status status1;
+  Status status2;
+  m1.second.then([&](future<Status> f) { status1 = f.get(); });
+  m2.second.then([&](future<Status> f) {
+    status2 = f.get();
+    batcher.reset();
+  });
+
+  FinishSingleItemStream();
+
+  EXPECT_EQ(nullptr, batcher);
+  EXPECT_THAT(status1, Not(IsOk()));
+  EXPECT_STATUS_OK(status2);
+  EXPECT_EQ(0U, NumOperationsOutstanding());
+}
+
+TEST_F(MutationBatcherTest,
+       DestroyBatcherAfterCompletionFutureGetMultiThreaded) {
+  SingleRowMutation mut("foo", {bt::SetCell("fam", "col", 0_ms, "baz")});
+  EXPECT_CALL(*mock_, AsyncBulkApply)
+      .WillRepeatedly([](std::string const&, BulkMutation) {
+        return make_ready_future(std::vector<FailedMutation>{});
+      });
+
+  for (int i = 0; i != 32; ++i) {
+    auto batcher = std::make_unique<MutationBatcher>(*table_);
+    auto admission_and_completion = batcher->AsyncApply(cq_, mut);
+    admission_and_completion.first.get();
+    ASSERT_EQ(1U, NumOperationsOutstanding());
+
+    auto op = std::move(operations_.front());
+    operations_.pop();
+    std::thread cq_worker([op = std::move(op)]() mutable { op->exec(); });
+
+    EXPECT_STATUS_OK(admission_and_completion.second.get());
+    batcher.reset();
+    cq_worker.join();
+  }
 }
 
 }  // namespace
