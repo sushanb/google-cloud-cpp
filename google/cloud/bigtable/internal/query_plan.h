@@ -18,8 +18,17 @@
 
 #include "google/cloud/bigtable/version.h"
 #include "google/cloud/completion_queue.h"
+#include "google/cloud/future.h"
 #include "google/cloud/internal/clock.h"
+#include "google/cloud/status.h"
+#include "google/cloud/status_or.h"
 #include "google/bigtable/v2/bigtable.pb.h"
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -63,36 +72,44 @@ class QueryPlan : public std::enable_shared_from_this<QueryPlan> {
             StatusOr<google::bigtable::v2::PrepareQueryResponse> response)
       : state_(response.ok() ? RefreshState::kDone : RefreshState::kBegin),
         cq_(std::move(cq)),
-        clock_(std::move(clock)),
+        clock_(clock ? std::move(clock) : std::make_shared<Clock>()),
         refresh_fn_(std::move(fn)),
         response_(std::move(response)) {}
-
-  bool IsRefreshing(std::unique_lock<std::mutex> const&) const;
 
   // Performs the first call to ScheduleRefresh and any other initialization not
   // possible in the constructor.
   void Initialize();
 
   // Calls MakeDeadlineTimer on the CompletionQueue with a continuation lambda
-  // capturing a std::weak_ptr to this that calls RefreshQueryPlan.
-  void ScheduleRefresh(std::unique_lock<std::mutex> const&);
+  // capturing a std::weak_ptr to this that calls ExpiredRefresh.
+  void ScheduleRefresh(std::unique_lock<std::mutex> const& lock);
+  void ScheduleRefreshAt(std::unique_lock<std::mutex> const& lock,
+                         std::chrono::system_clock::time_point deadline);
 
-  // Performs the synchronization around calling RefreshFn and updating
-  // response_.
-  void RefreshQueryPlan();
+  // Starts an asynchronous refresh attempt without blocking on its completion.
+  // Unlocks `lock` while invoking `refresh_fn_()` and re-acquires `lock` before
+  // returning the assigned refresh attempt ID.
+  std::uint64_t StartRefresh(std::unique_lock<std::mutex>& lock);
+
+  // Handles completion of an asynchronous refresh attempt.
+  void OnRefreshCompleted(
+      StatusOr<google::bigtable::v2::PrepareQueryResponse> response);
 
   void ExpiredRefresh();
 
-  // State machine where the only valid transitions are:
-  //   kDone -> kBegin
-  //   kBegin -> kPending
-  //   kPending -> kBegin
-  //   kPending -> kDone
-  // When refreshing the same previous query plan.
+  // State machine transitions:
+  //   kDone -> kBegin      (Invalidate while idle)
+  //   kDone -> kPending    (proactive ExpiredRefresh)
+  //   kBegin -> kPending   (StartRefresh from response())
+  //   kPending -> kBegin   (post-invalidation refresh failed)
+  //   kPending -> kDone    (refresh succeeded, or proactive refresh failed
+  //                         while the existing plan has not been invalidated)
+  //   kPending -> kPending (Invalidate arrived during an in-flight refresh,
+  //                         immediately starting a fresh refresh)
   enum class RefreshState {
-    kBegin,    // waiting for a future thread to refresh response_
-    kPending,  // waiting for an active thread to refresh response_
-    kDone,     // response_ has been refreshed
+    kBegin,    // waiting for a caller to start refreshing response_
+    kPending,  // asynchronous refresh RPC is in flight
+    kDone,     // response_ holds a usable query plan
   };
   RefreshState state_;
 
@@ -101,8 +118,13 @@ class QueryPlan : public std::enable_shared_from_this<QueryPlan> {
   RefreshFn refresh_fn_;
   future<void> refresh_timer_;
   mutable std::mutex mu_;
-  std::condition_variable cond_;
-  std::string old_query_plan_id_;
+  std::condition_variable turn_cv_;
+  std::condition_variable refresh_cv_;
+  bool invalidate_during_refresh_ = false;
+  bool active_refresh_has_leader_ = false;
+  std::uint64_t next_refresh_id_ = 0;
+  std::uint64_t active_refresh_id_ = 0;
+  std::uint64_t completed_refresh_id_ = 0;
   StatusOr<google::bigtable::v2::PrepareQueryResponse>
       response_;  // GUARDED_BY(mu_)
 };
