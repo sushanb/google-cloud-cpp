@@ -103,6 +103,67 @@ GetDirectAccessCompatibility(
              ? metrics_factory->direct_access_compatibility()
              : nullptr;
 }
+
+class DiagnosticsOperationContextFactory
+    : public bigtable_internal::OperationContextFactory {
+ public:
+  DiagnosticsOperationContextFactory(
+      std::unique_ptr<bigtable_internal::OperationContextFactory> inner,
+      std::unique_ptr<bigtable_internal::DirectPathDiagnostics::AsyncTask>
+          diagnostics_task)
+      : inner_(std::move(inner)),
+        diagnostics_task_(std::move(diagnostics_task)) {}
+
+  ~DiagnosticsOperationContextFactory() override {
+    // Interrupt and join any in-flight diagnostic task before `inner_`
+    // destroys DirectAccessCompatibility and the OpenTelemetry MeterProvider.
+    diagnostics_task_.reset();
+  }
+
+  std::shared_ptr<bigtable_internal::OperationContext> ReadRow(
+      std::string const& name, std::string const& app_profile) override {
+    return inner_->ReadRow(name, app_profile);
+  }
+  std::shared_ptr<bigtable_internal::OperationContext> ReadRows(
+      std::string const& name, std::string const& app_profile) override {
+    return inner_->ReadRows(name, app_profile);
+  }
+  std::shared_ptr<bigtable_internal::OperationContext> MutateRow(
+      std::string const& name, std::string const& app_profile) override {
+    return inner_->MutateRow(name, app_profile);
+  }
+  std::shared_ptr<bigtable_internal::OperationContext> MutateRows(
+      std::string const& name, std::string const& app_profile) override {
+    return inner_->MutateRows(name, app_profile);
+  }
+  std::shared_ptr<bigtable_internal::OperationContext> CheckAndMutateRow(
+      std::string const& name, std::string const& app_profile) override {
+    return inner_->CheckAndMutateRow(name, app_profile);
+  }
+  std::shared_ptr<bigtable_internal::OperationContext> SampleRowKeys(
+      std::string const& name, std::string const& app_profile) override {
+    return inner_->SampleRowKeys(name, app_profile);
+  }
+  std::shared_ptr<bigtable_internal::OperationContext> ReadModifyWriteRow(
+      std::string const& name, std::string const& app_profile) override {
+    return inner_->ReadModifyWriteRow(name, app_profile);
+  }
+  std::shared_ptr<bigtable_internal::OperationContext> PrepareQuery(
+      std::string const& instance_name,
+      std::string const& app_profile) override {
+    return inner_->PrepareQuery(instance_name, app_profile);
+  }
+  std::shared_ptr<bigtable_internal::OperationContext> ExecuteQuery(
+      std::string const& instance_name,
+      std::string const& app_profile) override {
+    return inner_->ExecuteQuery(instance_name, app_profile);
+  }
+
+ private:
+  std::unique_ptr<bigtable_internal::OperationContextFactory> inner_;
+  std::unique_ptr<bigtable_internal::DirectPathDiagnostics::AsyncTask>
+      diagnostics_task_;
+};
 #endif  // GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
 
 struct DataConnectionComponents {
@@ -117,6 +178,25 @@ struct DataConnectionComponents {
       direct_access_compatibility;
 #endif
 };
+
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+void AttachFallbackDiagnostics(DataConnectionComponents& components,
+                               Options const& directpath_options) {
+  if (components.direct_access_compatibility == nullptr ||
+      components.operation_context_factory == nullptr) {
+    return;
+  }
+  std::weak_ptr<bigtable_internal::DirectAccessCompatibility> weak_compat(
+      components.direct_access_compatibility);
+  components.direct_access_compatibility.reset();
+  auto diagnostics_task = bigtable_internal::DirectPathDiagnostics::StartAsync(
+      directpath_options, std::move(weak_compat));
+  components.operation_context_factory =
+      std::make_unique<DiagnosticsOperationContextFactory>(
+          std::move(components.operation_context_factory),
+          std::move(diagnostics_task));
+}
+#endif  // GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
 
 DataConnectionComponents MakeDataConnectionComponents(
     Options options, std::vector<bigtable::InstanceResource> const& instances,
@@ -316,9 +396,7 @@ MakeSpeculativeDirectPathDataConnection(
         (void)f.get();
       });
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
-  bigtable_internal::DirectPathDiagnostics::RunAsync(
-      components.background->cq(), directpath_options,
-      components.direct_access_compatibility);
+  AttachFallbackDiagnostics(components, directpath_options);
 #endif
   return std::make_shared<bigtable_internal::DataConnectionImpl>(
       std::move(components.background), std::move(stub_manager),
@@ -377,9 +455,7 @@ std::shared_ptr<bigtable::DataConnection> MakeBlockingDirectPathDataConnection(
   auto stub_manager = create_stub_manager(cloudpath_options);
 
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
-  bigtable_internal::DirectPathDiagnostics::RunAsync(
-      components.background->cq(), directpath_options,
-      components.direct_access_compatibility);
+  AttachFallbackDiagnostics(components, directpath_options);
 #endif
   return std::make_shared<bigtable_internal::DataConnectionImpl>(
       std::move(components.background), std::move(stub_manager),
