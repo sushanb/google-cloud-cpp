@@ -28,7 +28,9 @@
 #include "google/cloud/universe_domain_options.h"
 #include "absl/algorithm/container.h"
 #include "absl/strings/str_split.h"
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <string>
 #include <string_view>
 
@@ -75,11 +77,13 @@ Options DefaultConnectionRefreshOptions(Options opts) {
     opts.set<MinConnectionRefreshOption>(kDefaultMinRefreshPeriod);
     opts.set<MaxConnectionRefreshOption>(kDefaultMaxRefreshPeriod);
   } else if (has_min && !has_max) {
-    opts.set<MaxConnectionRefreshOption>((std::max)(
-        opts.get<MinConnectionRefreshOption>(), kDefaultMaxRefreshPeriod));
+    opts.set<MaxConnectionRefreshOption>(
+        (std::max)(opts.get<MinConnectionRefreshOption>(),
+                   kDefaultMaxRefreshPeriod));
   } else if (!has_min && has_max) {
-    opts.set<MinConnectionRefreshOption>((std::min)(
-        opts.get<MaxConnectionRefreshOption>(), kDefaultMinRefreshPeriod));
+    opts.set<MinConnectionRefreshOption>(
+        (std::min)(opts.get<MaxConnectionRefreshOption>(),
+                   kDefaultMinRefreshPeriod));
   } else {
     // If the range is invalid, use the greater value as both the min and max
     auto const p = opts.get<MinConnectionRefreshOption>();
@@ -314,6 +318,19 @@ Options DefaultDataOptions(Options opts) {
     opts.set<EnableServerRetriesOption>(true);
   }
   opts = DefaultOptions(std::move(opts));
+  auto& sizing_policy =
+      opts.lookup<experimental::DynamicChannelPoolSizingPolicyOption>();
+  if (sizing_policy.minimum_channel_pool_size == 0) {
+    sizing_policy.minimum_channel_pool_size = static_cast<std::size_t>(
+        (std::max)(1, opts.get<GrpcNumChannelsOption>()));
+  }
+  if (sizing_policy.maximum_channel_pool_size == 0) {
+    sizing_policy.maximum_channel_pool_size =
+        2 * sizing_policy.minimum_channel_pool_size;
+  }
+  sizing_policy.maximum_channel_pool_size =
+      (std::max)(sizing_policy.minimum_channel_pool_size,
+                 sizing_policy.maximum_channel_pool_size);
   if (!opts.has<AuthorityOption>()) {
     auto ep = google::cloud::internal::UniverseDomainEndpoint(
         "bigtable.googleapis.com", opts);

@@ -221,6 +221,113 @@ TEST(BigtableStubFactory, DynamicChannelPoolSizingPolicyOption) {
   EXPECT_EQ(policy.maximum_average_outstanding_rpcs_per_channel, 99);
   EXPECT_EQ(policy.pool_size_decrease_cooldown_interval,
             std::chrono::seconds(300));
+  EXPECT_EQ(policy.minimum_channel_pool_size, 1U);
+  EXPECT_EQ(policy.maximum_channel_pool_size, 2U);
+
+  fake_cq_impl->SimulateCompletion(false);
+}
+
+TEST(BigtableStubFactory, DynamicChannelPoolSizingPolicyDefaultsAndClamping) {
+  MockFactory factory;
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, PingAndWarm)
+      .WillRepeatedly(Return(google::bigtable::v2::PingAndWarmResponse{}));
+  EXPECT_CALL(factory, Call)
+      .WillRepeatedly(
+          [&](std::shared_ptr<grpc::Channel> const&) { return mock; });
+
+  auto fake_cq_impl = std::make_shared<testing_util::FakeCompletionQueueImpl>();
+
+  {
+    auto auth = MakeStubFactoryMockAuth();
+    EXPECT_CALL(*auth, CreateChannel("localhost:1", _)).Times(4);
+    EXPECT_CALL(*auth, RequiresConfigureContext).WillRepeatedly(Return(false));
+    auto refresh_state = std::make_shared<ConnectionRefreshState>(
+        fake_cq_impl, std::chrono::milliseconds(1),
+        std::chrono::milliseconds(10));
+
+    auto stub = CreateBigtableStubRandomTwoLeastUsed(
+        std::move(auth), fake_cq_impl,
+        "projects/my-projects/instances/my-instance",
+        StubManager::Priming::kSynchronousPriming,
+        Options{}
+            .set<GrpcNumChannelsOption>(4)
+            .set<EndpointOption>("localhost:1")
+            .set<UnifiedCredentialsOption>(MakeInsecureCredentials()),
+        factory.AsStdFunction(), std::move(refresh_state));
+
+    auto random_two_least_used =
+        std::dynamic_pointer_cast<BigtableRandomTwoLeastUsed>(stub);
+    ASSERT_NE(random_two_least_used, nullptr);
+    auto const& policy = random_two_least_used->pool()->sizing_policy();
+    EXPECT_EQ(policy.minimum_channel_pool_size, 4U);
+    EXPECT_EQ(policy.maximum_channel_pool_size, 8U);
+  }
+
+  {
+    auto auth = MakeStubFactoryMockAuth();
+    EXPECT_CALL(*auth, CreateChannel("localhost:1", _)).Times(2);
+    EXPECT_CALL(*auth, RequiresConfigureContext).WillRepeatedly(Return(false));
+    auto refresh_state = std::make_shared<ConnectionRefreshState>(
+        fake_cq_impl, std::chrono::milliseconds(1),
+        std::chrono::milliseconds(10));
+
+    google::cloud::bigtable::experimental::DynamicChannelPoolSizingPolicy
+        partial_policy;
+    partial_policy.minimum_channel_pool_size = 6;
+
+    auto stub = CreateBigtableStubRandomTwoLeastUsed(
+        std::move(auth), fake_cq_impl,
+        "projects/my-projects/instances/my-instance",
+        StubManager::Priming::kSynchronousPriming,
+        Options{}
+            .set<GrpcNumChannelsOption>(2)
+            .set<EndpointOption>("localhost:1")
+            .set<UnifiedCredentialsOption>(MakeInsecureCredentials())
+            .set<google::cloud::bigtable::experimental::
+                     DynamicChannelPoolSizingPolicyOption>(partial_policy),
+        factory.AsStdFunction(), std::move(refresh_state));
+
+    auto random_two_least_used =
+        std::dynamic_pointer_cast<BigtableRandomTwoLeastUsed>(stub);
+    ASSERT_NE(random_two_least_used, nullptr);
+    auto const& policy = random_two_least_used->pool()->sizing_policy();
+    EXPECT_EQ(policy.minimum_channel_pool_size, 6U);
+    EXPECT_EQ(policy.maximum_channel_pool_size, 12U);
+  }
+
+  {
+    auto auth = MakeStubFactoryMockAuth();
+    EXPECT_CALL(*auth, CreateChannel("localhost:1", _)).Times(2);
+    EXPECT_CALL(*auth, RequiresConfigureContext).WillRepeatedly(Return(false));
+    auto refresh_state = std::make_shared<ConnectionRefreshState>(
+        fake_cq_impl, std::chrono::milliseconds(1),
+        std::chrono::milliseconds(10));
+
+    google::cloud::bigtable::experimental::DynamicChannelPoolSizingPolicy
+        inverted_policy;
+    inverted_policy.minimum_channel_pool_size = 6;
+    inverted_policy.maximum_channel_pool_size = 3;
+
+    auto stub = CreateBigtableStubRandomTwoLeastUsed(
+        std::move(auth), fake_cq_impl,
+        "projects/my-projects/instances/my-instance",
+        StubManager::Priming::kSynchronousPriming,
+        Options{}
+            .set<GrpcNumChannelsOption>(2)
+            .set<EndpointOption>("localhost:1")
+            .set<UnifiedCredentialsOption>(MakeInsecureCredentials())
+            .set<google::cloud::bigtable::experimental::
+                     DynamicChannelPoolSizingPolicyOption>(inverted_policy),
+        factory.AsStdFunction(), std::move(refresh_state));
+
+    auto random_two_least_used =
+        std::dynamic_pointer_cast<BigtableRandomTwoLeastUsed>(stub);
+    ASSERT_NE(random_two_least_used, nullptr);
+    auto const& policy = random_two_least_used->pool()->sizing_policy();
+    EXPECT_EQ(policy.minimum_channel_pool_size, 6U);
+    EXPECT_EQ(policy.maximum_channel_pool_size, 6U);
+  }
 
   fake_cq_impl->SimulateCompletion(false);
 }

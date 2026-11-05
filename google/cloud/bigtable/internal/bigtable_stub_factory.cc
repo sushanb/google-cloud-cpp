@@ -34,6 +34,13 @@
 #include "google/cloud/log.h"
 #include "google/bigtable/v2/feature_flags.pb.h"
 #include <grpcpp/grpcpp.h>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 namespace google {
 namespace cloud {
@@ -162,23 +169,37 @@ std::shared_ptr<BigtableStub> CreateBigtableStubRandomTwoLeastUsed(
     return wrapper;
   };
 
+  auto const initial_pool_size = static_cast<std::size_t>(
+      (std::max)(1, options.get<GrpcNumChannelsOption>()));
   std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> children;
-  children.reserve(std::max(1, options.get<GrpcNumChannelsOption>()));
+  children.reserve(initial_pool_size);
   std::uint32_t id = 0;
-  for (std::uint32_t i = 0; i < children.capacity(); ++i) {
+  for (std::size_t i = 0; i < initial_pool_size; ++i) {
     auto stub = refreshing_channel_stub_factory(id++, instance_name, priming);
     if (stub.ok()) {
       children.push_back(*std::move(stub));
     }
   }
 
+  auto sizing_policy =
+      options
+          .get<bigtable::experimental::DynamicChannelPoolSizingPolicyOption>();
+  if (sizing_policy.minimum_channel_pool_size == 0) {
+    sizing_policy.minimum_channel_pool_size = initial_pool_size;
+  }
+  if (sizing_policy.maximum_channel_pool_size == 0) {
+    sizing_policy.maximum_channel_pool_size =
+        2 * sizing_policy.minimum_channel_pool_size;
+  }
+  sizing_policy.maximum_channel_pool_size =
+      (std::max)(sizing_policy.minimum_channel_pool_size,
+                 sizing_policy.maximum_channel_pool_size);
+
   return std::make_shared<BigtableRandomTwoLeastUsed>(
       DynamicChannelPool<BigtableStub>::Create(
           std::string{instance_name}, CompletionQueue(std::move(cq_impl)),
           std::move(children), std::move(refresh_state),
-          std::move(refreshing_channel_stub_factory),
-          options.get<
-              bigtable::experimental::DynamicChannelPoolSizingPolicyOption>(),
+          std::move(refreshing_channel_stub_factory), std::move(sizing_policy),
           bigtable::internal::IsDirectPath(options)
               ? TransportType::kDirectPath
               : TransportType::kCloudPath));

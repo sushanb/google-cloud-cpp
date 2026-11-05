@@ -202,10 +202,11 @@ struct DynamicChannelPoolSizingPolicy {
   std::chrono::milliseconds remove_channel_polling_interval =
       std::chrono::seconds(30);
 
-  // Limits how large the pool can grow. Default is twice the minimum_pool_size.
+  // Limits how large the pool can grow. Defaults to twice
+  // minimum_channel_pool_size.
   std::size_t maximum_channel_pool_size = 0;
 
-  // This is set to the value of GrpcNumChannelsOption.
+  // Defaults to the value of GrpcNumChannelsOption.
   std::size_t minimum_channel_pool_size = 0;
 };
 

@@ -26,6 +26,8 @@
 #include "google/cloud/testing_util/status_matchers.h"
 #include "google/cloud/universe_domain_options.h"
 #include <gmock/gmock.h>
+#include <algorithm>
+#include <cstddef>
 #include <optional>
 #include <thread>
 
@@ -238,6 +240,70 @@ TEST(OptionsTest, DefaultDataOptionsPolicies) {
   EXPECT_TRUE(options.has<bigtable::DataRetryPolicyOption>());
   EXPECT_TRUE(options.has<bigtable::DataBackoffPolicyOption>());
   EXPECT_TRUE(options.has<bigtable::IdempotentMutationPolicyOption>());
+  EXPECT_TRUE(
+      options
+          .has<bigtable::experimental::DynamicChannelPoolSizingPolicyOption>());
+}
+
+TEST(OptionsTest, DynamicChannelPoolSizingPolicyDefaultsAndNormalization) {
+  auto options = DefaultDataOptions(Options{});
+  auto const expected_min =
+      static_cast<std::size_t>((std::max)(1, DefaultConnectionPoolSize()));
+  auto const& default_policy =
+      options.get<experimental::DynamicChannelPoolSizingPolicyOption>();
+  EXPECT_EQ(default_policy.minimum_channel_pool_size, expected_min);
+  EXPECT_EQ(default_policy.maximum_channel_pool_size, 2 * expected_min);
+
+  auto options_with_channels =
+      DefaultDataOptions(Options{}.set<GrpcNumChannelsOption>(6));
+  auto const& policy_with_channels =
+      options_with_channels
+          .get<experimental::DynamicChannelPoolSizingPolicyOption>();
+  EXPECT_EQ(policy_with_channels.minimum_channel_pool_size, 6U);
+  EXPECT_EQ(policy_with_channels.maximum_channel_pool_size, 12U);
+
+  auto options_zero_channels =
+      DefaultDataOptions(Options{}.set<GrpcNumChannelsOption>(0));
+  auto const& policy_zero_channels =
+      options_zero_channels
+          .get<experimental::DynamicChannelPoolSizingPolicyOption>();
+  EXPECT_EQ(policy_zero_channels.minimum_channel_pool_size, 1U);
+  EXPECT_EQ(policy_zero_channels.maximum_channel_pool_size, 2U);
+
+  experimental::DynamicChannelPoolSizingPolicy min_only;
+  min_only.minimum_channel_pool_size = 8;
+  auto options_min_only = DefaultDataOptions(
+      Options{}.set<experimental::DynamicChannelPoolSizingPolicyOption>(
+          min_only));
+  auto const& policy_min_only =
+      options_min_only
+          .get<experimental::DynamicChannelPoolSizingPolicyOption>();
+  EXPECT_EQ(policy_min_only.minimum_channel_pool_size, 8U);
+  EXPECT_EQ(policy_min_only.maximum_channel_pool_size, 16U);
+
+  experimental::DynamicChannelPoolSizingPolicy max_only;
+  max_only.maximum_channel_pool_size = 20;
+  auto options_max_only = DefaultDataOptions(
+      Options{}
+          .set<GrpcNumChannelsOption>(6)
+          .set<experimental::DynamicChannelPoolSizingPolicyOption>(max_only));
+  auto const& policy_max_only =
+      options_max_only
+          .get<experimental::DynamicChannelPoolSizingPolicyOption>();
+  EXPECT_EQ(policy_max_only.minimum_channel_pool_size, 6U);
+  EXPECT_EQ(policy_max_only.maximum_channel_pool_size, 20U);
+
+  experimental::DynamicChannelPoolSizingPolicy inverted;
+  inverted.minimum_channel_pool_size = 10;
+  inverted.maximum_channel_pool_size = 4;
+  auto options_inverted = DefaultDataOptions(
+      Options{}.set<experimental::DynamicChannelPoolSizingPolicyOption>(
+          inverted));
+  auto const& policy_inverted =
+      options_inverted
+          .get<experimental::DynamicChannelPoolSizingPolicyOption>();
+  EXPECT_EQ(policy_inverted.minimum_channel_pool_size, 10U);
+  EXPECT_EQ(policy_inverted.maximum_channel_pool_size, 10U);
 }
 
 TEST(OptionsTest, DataUserProjectOption) {
