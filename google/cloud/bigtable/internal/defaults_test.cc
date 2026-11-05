@@ -26,6 +26,7 @@
 #include "google/cloud/testing_util/status_matchers.h"
 #include "google/cloud/universe_domain_options.h"
 #include <gmock/gmock.h>
+#include <chrono>
 #include <optional>
 #include <thread>
 
@@ -710,6 +711,30 @@ TEST(ConnectionRefreshRange, DisabledIfEmulator) {
 
   // Zero duration means connection refreshing is disabled.
   EXPECT_EQ(secs(0), opts.get<MaxConnectionRefreshOption>());
+}
+
+TEST(ConnectionRefreshRange, DisabledIfMaxZeroWithPositiveMin) {
+  ScopedEnvironment emulator("BIGTABLE_EMULATOR_HOST", std::nullopt);
+  auto opts = DefaultDataOptions(
+      Options{}
+          .set<MinConnectionRefreshOption>(std::chrono::milliseconds(1000))
+          .set<MaxConnectionRefreshOption>(std::chrono::milliseconds(0)));
+
+  EXPECT_EQ(std::chrono::milliseconds(0),
+            opts.get<MinConnectionRefreshOption>());
+  EXPECT_EQ(std::chrono::milliseconds(0),
+            opts.get<MaxConnectionRefreshOption>());
+}
+
+TEST(ConnectionRefreshRange, DisabledIfEmulatorWithPositiveMin) {
+  ScopedEnvironment emulator("BIGTABLE_EMULATOR_HOST", "emulator-host:8000");
+  auto opts = DefaultDataOptions(Options{}.set<MinConnectionRefreshOption>(
+      std::chrono::milliseconds(1000)));
+
+  EXPECT_EQ(std::chrono::milliseconds(0),
+            opts.get<MinConnectionRefreshOption>());
+  EXPECT_EQ(std::chrono::milliseconds(0),
+            opts.get<MaxConnectionRefreshOption>());
 }
 
 }  // namespace

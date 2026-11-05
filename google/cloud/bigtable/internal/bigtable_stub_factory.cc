@@ -34,12 +34,23 @@
 #include "google/cloud/log.h"
 #include "google/bigtable/v2/feature_flags.pb.h"
 #include <grpcpp/grpcpp.h>
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 namespace google {
 namespace cloud {
 namespace bigtable_internal {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace {
+
+auto constexpr kChannelRefreshTimeout = std::chrono::seconds(10);
 
 std::shared_ptr<grpc::Channel> CreateGrpcChannel(
     internal::GrpcAuthenticationStrategy& auth, Options const& options,
@@ -76,17 +87,26 @@ std::string const& FeaturesMetadata(Options const& options) {
   return *kFeatures;
 }
 
-std::shared_ptr<BigtableStub> ApplyCommonDecorators(
+std::shared_ptr<BigtableStub> ApplyAuthAndMetadataDecorators(
     std::shared_ptr<internal::GrpcAuthenticationStrategy> auth,
-    std::shared_ptr<BigtableStub> stub, Options const& options) {
-  if (auth->RequiresConfigureContext()) {
+    bool requires_configure_context, std::shared_ptr<BigtableStub> stub,
+    Options const& options) {
+  if (requires_configure_context) {
     stub = std::make_shared<BigtableAuth>(std::move(auth), std::move(stub));
   }
-  stub = std::make_shared<BigtableMetadata>(
+  return std::make_shared<BigtableMetadata>(
       std::move(stub),
       std::multimap<std::string, std::string>{
           {"bigtable-features", FeaturesMetadata(options)}},
       internal::HandCraftedLibClientHeader());
+}
+
+std::shared_ptr<BigtableStub> ApplyCommonDecorators(
+    std::shared_ptr<internal::GrpcAuthenticationStrategy> auth,
+    bool requires_configure_context, std::shared_ptr<BigtableStub> stub,
+    Options const& options) {
+  stub = ApplyAuthAndMetadataDecorators(
+      std::move(auth), requires_configure_context, std::move(stub), options);
   if (internal::Contains(options.get<LoggingComponentsOption>(), "rpc")) {
     GCP_LOG(INFO) << "Enabled logging for gRPC calls";
     stub = std::make_shared<BigtableLogging>(
@@ -97,6 +117,98 @@ std::shared_ptr<BigtableStub> ApplyCommonDecorators(
     stub = MakeBigtableTracingStub(std::move(stub));
   }
   return stub;
+}
+
+std::shared_ptr<BigtableStub> CreateBigtableStubRandomTwoLeastUsedImpl(
+    std::shared_ptr<internal::GrpcAuthenticationStrategy> auth,
+    bool requires_configure_context,
+    std::shared_ptr<internal::CompletionQueueImpl> cq_impl,
+    std::string_view instance_name, StubManager::Priming priming,
+    Options const& options, BaseBigtableStubFactory stub_factory,
+    std::shared_ptr<ConnectionRefreshState> refresh_state) {
+  auto immutable_options = internal::MakeImmutableOptions(options);
+  auto refreshing_channel_stub_factory =
+      [stub_factory = std::move(stub_factory), cq_impl, refresh_state,
+       auth = std::move(auth), requires_configure_context,
+       immutable_options = std::move(immutable_options)](
+          std::uint32_t id, std::string_view target_instance,
+          StubManager::Priming target_priming)
+      -> StatusOr<std::shared_ptr<ChannelUsage<BigtableStub>>> {
+    auto wrapper = std::make_shared<ChannelUsage<BigtableStub>>();
+    auto connection_status_fn = [weak = wrapper->MakeWeak()](Status const& s) {
+      if (auto self = weak.lock()) {
+        self->set_last_refresh_status(s);
+      }
+      if (!s.ok()) {
+        if (ChannelUsage<BigtableStub>::IsSuccessfulRefreshStatus(s)) {
+          GCP_LOG(WARNING)
+              << "Connection refreshed; treating received Status as non-error: "
+              << s;
+        } else {
+          GCP_LOG(WARNING) << "Failed to refresh connection. Error: " << s;
+        }
+      }
+    };
+
+    auto channel = CreateGrpcChannel(*auth, *immutable_options, id);
+    auto stub = stub_factory(std::move(channel));
+    auto refresh_stub = ApplyAuthAndMetadataDecorators(
+        auth, requires_configure_context, stub, *immutable_options);
+    if (target_priming == StubManager::Priming::kSynchronousPriming) {
+      grpc::ClientContext client_context;
+      client_context.set_deadline(std::chrono::system_clock::now() +
+                                  kChannelRefreshTimeout);
+      internal::ConfigureContext(client_context, *immutable_options);
+      if (immutable_options->has<bigtable::DeadlineOption>()) {
+        client_context.set_deadline(
+            std::chrono::system_clock::now() +
+            immutable_options->get<bigtable::DeadlineOption>());
+      }
+      google::bigtable::v2::PingAndWarmRequest request;
+      request.set_name(std::string{target_instance});
+      if (immutable_options->has<bigtable::AppProfileIdOption>()) {
+        request.set_app_profile_id(
+            immutable_options->get<bigtable::AppProfileIdOption>());
+      }
+      OperationContext op_ctx;
+      auto response = refresh_stub->PingAndWarm(
+          client_context, *immutable_options, request, op_ctx);
+      if (!ChannelUsage<BigtableStub>::IsSuccessfulRefreshStatus(
+              response.status())) {
+        return response.status();
+      }
+      wrapper->set_last_refresh_status(response.status());
+    }
+
+    wrapper->set_stub(std::move(stub)).set_refresh_stub(refresh_stub);
+    if (refresh_state && refresh_state->enabled()) {
+      ScheduleStubRefresh(cq_impl, refresh_state, refresh_stub,
+                          immutable_options, std::string{target_instance},
+                          std::move(connection_status_fn));
+    }
+    return wrapper;
+  };
+
+  std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> children;
+  children.reserve((std::max)(1, options.get<GrpcNumChannelsOption>()));
+  std::uint32_t id = 0;
+  for (std::uint32_t i = 0; i < children.capacity(); ++i) {
+    auto stub = refreshing_channel_stub_factory(id++, instance_name, priming);
+    if (stub.ok()) {
+      children.push_back(*std::move(stub));
+    }
+  }
+
+  return std::make_shared<BigtableRandomTwoLeastUsed>(
+      DynamicChannelPool<BigtableStub>::Create(
+          std::string{instance_name}, CompletionQueue(std::move(cq_impl)),
+          std::move(children), std::move(refresh_state),
+          std::move(refreshing_channel_stub_factory),
+          options.get<
+              bigtable::experimental::DynamicChannelPoolSizingPolicyOption>(),
+          bigtable::internal::IsDirectPath(options)
+              ? TransportType::kDirectPath
+              : TransportType::kCloudPath));
 }
 
 }  // namespace
@@ -120,68 +232,11 @@ std::shared_ptr<BigtableStub> CreateBigtableStubRandomTwoLeastUsed(
     std::string_view instance_name, StubManager::Priming priming,
     Options const& options, BaseBigtableStubFactory stub_factory,
     std::shared_ptr<ConnectionRefreshState> refresh_state) {
-  auto refreshing_channel_stub_factory =
-      [stub_factory = std::move(stub_factory), cq_impl, refresh_state,
-       auth = std::move(auth),
-       options](std::uint32_t id, std::string_view instance_name,
-                StubManager::Priming priming)
-      -> StatusOr<std::shared_ptr<ChannelUsage<BigtableStub>>> {
-    auto wrapper = std::make_shared<ChannelUsage<BigtableStub>>();
-    auto connection_status_fn = [weak = wrapper->MakeWeak()](Status const& s) {
-      if (auto self = weak.lock()) {
-        self->set_last_refresh_status(s);
-      }
-      if (!s.ok()) {
-        if (ChannelUsage<BigtableStub>::IsSuccessfulRefreshStatus(s)) {
-          GCP_LOG(WARNING)
-              << "Connection refreshed; treating received Status as non-error: "
-              << s;
-        } else {
-          GCP_LOG(WARNING) << "Failed to refresh connection. Error: " << s;
-        }
-      }
-    };
-
-    auto channel = CreateGrpcChannel(*auth, options, id);
-    auto stub = stub_factory(std::move(channel));
-    if (priming == StubManager::Priming::kSynchronousPriming) {
-      grpc::ClientContext client_context;
-      google::bigtable::v2::PingAndWarmRequest request;
-      request.set_name(std::string{instance_name});
-      OperationContext op_ctx;
-      auto response = stub->PingAndWarm(client_context, options,
-                                        std::move(request), op_ctx);
-      if (!response.ok()) return response.status();
-    }
-
-    ScheduleStubRefresh(cq_impl, refresh_state, stub,
-                        std::string{instance_name},
-                        std::move(connection_status_fn));
-
-    wrapper->set_stub(std::move(stub));
-    return wrapper;
-  };
-
-  std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> children;
-  children.reserve(std::max(1, options.get<GrpcNumChannelsOption>()));
-  std::uint32_t id = 0;
-  for (std::uint32_t i = 0; i < children.capacity(); ++i) {
-    auto stub = refreshing_channel_stub_factory(id++, instance_name, priming);
-    if (stub.ok()) {
-      children.push_back(*std::move(stub));
-    }
-  }
-
-  return std::make_shared<BigtableRandomTwoLeastUsed>(
-      DynamicChannelPool<BigtableStub>::Create(
-          std::string{instance_name}, CompletionQueue(std::move(cq_impl)),
-          std::move(children), std::move(refresh_state),
-          std::move(refreshing_channel_stub_factory),
-          options.get<
-              bigtable::experimental::DynamicChannelPoolSizingPolicyOption>(),
-          bigtable::internal::IsDirectPath(options)
-              ? TransportType::kDirectPath
-              : TransportType::kCloudPath));
+  auto const requires_configure_context = auth->RequiresConfigureContext();
+  return CreateBigtableStubRandomTwoLeastUsedImpl(
+      std::move(auth), requires_configure_context, std::move(cq_impl),
+      instance_name, priming, options, std::move(stub_factory),
+      std::move(refresh_state));
 }
 
 std::shared_ptr<BigtableStub> CreateDecoratedStubs(
@@ -193,10 +248,12 @@ std::shared_ptr<BigtableStub> CreateDecoratedStubs(
   auto refresh = std::make_shared<ConnectionRefreshState>(
       cq_impl, options.get<bigtable::MinConnectionRefreshOption>(),
       options.get<bigtable::MaxConnectionRefreshOption>());
-  auto stub = CreateBigtableStubRandomTwoLeastUsed(
-      auth, std::move(cq_impl), instance_name, priming, options, stub_factory,
-      std::move(refresh));
-  return ApplyCommonDecorators(std::move(auth), std::move(stub), options);
+  auto const requires_configure_context = auth->RequiresConfigureContext();
+  auto stub = CreateBigtableStubRandomTwoLeastUsedImpl(
+      auth, requires_configure_context, std::move(cq_impl), instance_name,
+      priming, options, stub_factory, std::move(refresh));
+  return ApplyCommonDecorators(std::move(auth), requires_configure_context,
+                               std::move(stub), options);
 }
 
 std::shared_ptr<BigtableStub> CreateDecoratedStubs(
@@ -220,7 +277,9 @@ std::shared_ptr<BigtableStub> CreateDecoratedStubs(
     stub = std::make_shared<BigtableChannelRefresh>(std::move(stub),
                                                     std::move(refresh));
   }
-  return ApplyCommonDecorators(std::move(auth), std::move(stub), options);
+  auto const requires_configure_context = auth->RequiresConfigureContext();
+  return ApplyCommonDecorators(std::move(auth), requires_configure_context,
+                               std::move(stub), options);
 }
 
 absl::flat_hash_map<std::string, std::shared_ptr<BigtableStub>>

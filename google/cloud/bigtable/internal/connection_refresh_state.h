@@ -20,10 +20,13 @@
 #include "google/cloud/completion_queue.h"
 #include "google/cloud/future.h"
 #include "google/cloud/internal/random.h"
+#include "google/cloud/options.h"
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 
 namespace google {
@@ -93,6 +96,13 @@ void ScheduleChannelRefresh(
 /**
  * Schedule a chain of timers to refresh the BigtableStub using PingAndWarm.
  */
+void ScheduleStubRefresh(
+    std::shared_ptr<internal::CompletionQueueImpl> const& cq,
+    std::shared_ptr<ConnectionRefreshState> const& state,
+    std::shared_ptr<BigtableStub> const& stub,
+    internal::ImmutableOptions options, std::string const& instance_name,
+    std::function<void(Status const&)> connection_status_fn = {});
+
 void ScheduleStubRefresh(
     std::shared_ptr<internal::CompletionQueueImpl> const& cq,
     std::shared_ptr<ConnectionRefreshState> const& state,

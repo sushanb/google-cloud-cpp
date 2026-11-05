@@ -28,9 +28,11 @@
 #include "google/cloud/universe_domain_options.h"
 #include "absl/algorithm/container.h"
 #include "absl/strings/str_split.h"
+#include <algorithm>
 #include <chrono>
 #include <string>
 #include <string_view>
+#include <thread>
 
 namespace google {
 namespace cloud {
@@ -75,16 +77,32 @@ Options DefaultConnectionRefreshOptions(Options opts) {
     opts.set<MinConnectionRefreshOption>(kDefaultMinRefreshPeriod);
     opts.set<MaxConnectionRefreshOption>(kDefaultMaxRefreshPeriod);
   } else if (has_min && !has_max) {
-    opts.set<MaxConnectionRefreshOption>((std::max)(
-        opts.get<MinConnectionRefreshOption>(), kDefaultMaxRefreshPeriod));
+    auto const min_refresh = (std::max)(std::chrono::milliseconds(0),
+                                        opts.get<MinConnectionRefreshOption>());
+    opts.set<MinConnectionRefreshOption>(min_refresh);
+    opts.set<MaxConnectionRefreshOption>(
+        (std::max)(min_refresh, kDefaultMaxRefreshPeriod));
   } else if (!has_min && has_max) {
-    opts.set<MinConnectionRefreshOption>((std::min)(
-        opts.get<MaxConnectionRefreshOption>(), kDefaultMinRefreshPeriod));
+    auto const max_refresh = (std::max)(std::chrono::milliseconds(0),
+                                        opts.get<MaxConnectionRefreshOption>());
+    opts.set<MaxConnectionRefreshOption>(max_refresh);
+    opts.set<MinConnectionRefreshOption>(
+        (std::min)(max_refresh, kDefaultMinRefreshPeriod));
   } else {
-    // If the range is invalid, use the greater value as both the min and max
-    auto const p = opts.get<MinConnectionRefreshOption>();
-    if (p > opts.get<MaxConnectionRefreshOption>()) {
-      opts.set<MaxConnectionRefreshOption>(std::move(p));
+    auto const max_refresh = (std::max)(std::chrono::milliseconds(0),
+                                        opts.get<MaxConnectionRefreshOption>());
+    if (max_refresh == std::chrono::milliseconds(0)) {
+      opts.set<MinConnectionRefreshOption>(std::chrono::milliseconds(0));
+      opts.set<MaxConnectionRefreshOption>(std::chrono::milliseconds(0));
+    } else {
+      // If the range is invalid, use the greater value as both the min and max
+      auto const min_refresh =
+          (std::max)(std::chrono::milliseconds(0),
+                     opts.get<MinConnectionRefreshOption>());
+      opts.set<MinConnectionRefreshOption>(min_refresh);
+      if (min_refresh > max_refresh) {
+        opts.set<MaxConnectionRefreshOption>(min_refresh);
+      }
     }
   }
   return opts;
@@ -234,7 +252,18 @@ Options DefaultOptions(Options opts) {
 
   opts = MergeOptions(std::move(opts), std::move(defaults));
 
-  if (!emulator) opts = DefaultConnectionRefreshOptions(std::move(opts));
+  if (!emulator) {
+    opts = DefaultConnectionRefreshOptions(std::move(opts));
+  } else {
+    auto const max_refresh = (std::max)(std::chrono::milliseconds(0),
+                                        opts.get<MaxConnectionRefreshOption>());
+    auto const min_refresh =
+        (std::min)((std::max)(std::chrono::milliseconds(0),
+                              opts.get<MinConnectionRefreshOption>()),
+                   max_refresh);
+    opts.set<MinConnectionRefreshOption>(min_refresh);
+    opts.set<MaxConnectionRefreshOption>(max_refresh);
+  }
   opts = DefaultChannelArgumentOptions(std::move(opts));
 
   // Inserts our user-agent string at the front.
