@@ -14,7 +14,11 @@
 
 #include "google/cloud/bigtable/internal/partial_result_set_resume.h"
 #include "google/cloud/internal/retry_loop_helpers.h"
-#include <thread>
+#include "google/cloud/internal/status_payload_keys.h"
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
 
 namespace google {
 namespace cloud {
@@ -27,7 +31,8 @@ bool PartialResultSetResume::Read(
     std::optional<std::string> const& resume_token,
     UnownedPartialResultSet& result) {
   bool resumption = false;
-  do {
+  std::unique_ptr<BackoffPolicy> backoff;
+  while (true) {
     if (reader_->Read(resume_token, result)) {
       // Let the caller know if we recreated the PartialResultSetReader using
       // the resume_token so that they might discard any previous results that
@@ -43,21 +48,24 @@ bool PartialResultSetResume::Read(
       // would otherwise be replayed.
       return false;
     }
-    if (idempotency_ == google::cloud::Idempotency::kNonIdempotent ||
-        !retry_policy_->OnFailure(status)) {
-      if (retry_policy_->IsExhausted()) break;
+    if (!backoff) backoff = backoff_policy_prototype_->clone();
+    auto delay =
+        internal::Backoff(status, "ExecuteQuery", *retry_policy_, *backoff,
+                          idempotency_, enable_server_retries_);
+    if (!delay) {
+      last_status_ = std::move(delay).status();
+      if (auto payload = internal::GetPayload(
+              status, internal::StatusPayloadGrpcProto())) {
+        internal::SetPayload(*last_status_, internal::StatusPayloadGrpcProto(),
+                             *std::move(payload));
+      }
       return false;
     }
-    std::this_thread::sleep_for(backoff_policy_->OnCompletion());
+    sleeper_(*delay);
     resumption = true;
     last_status_.reset();
     reader_ = factory_(*resume_token);
-  } while (!retry_policy_->IsExhausted());
-  if (last_status_) {
-    last_status_ = internal::RetryLoopError(*last_status_, __func__,
-                                            retry_policy_->IsExhausted());
   }
-  return false;
 }
 
 grpc::ClientContext const& PartialResultSetResume::context() const {

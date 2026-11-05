@@ -19,10 +19,16 @@
 #include "google/cloud/bigtable/retry_policy.h"
 #include "google/cloud/bigtable/version.h"
 #include "google/cloud/backoff_policy.h"
+#include "google/cloud/common_options.h"
+#include "google/cloud/idempotency.h"
+#include "google/cloud/options.h"
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
+#include <utility>
 
 namespace google {
 namespace cloud {
@@ -38,15 +44,25 @@ using PartialResultSetReaderFactory =
  */
 class PartialResultSetResume : public PartialResultSetReader {
  public:
+  using Sleeper = std::function<void(std::chrono::milliseconds)>;
+
   PartialResultSetResume(
       PartialResultSetReaderFactory factory,
       google::cloud::Idempotency idempotency,
       std::unique_ptr<bigtable::DataRetryPolicy> retry_policy,
-      std::unique_ptr<BackoffPolicy> backoff_policy)
+      std::unique_ptr<BackoffPolicy> backoff_policy,
+      bool enable_server_retries =
+          internal::CurrentOptions().has<EnableServerRetriesOption>()
+              ? internal::CurrentOptions().get<EnableServerRetriesOption>()
+              : true,
+      Sleeper sleeper =
+          [](std::chrono::milliseconds d) { std::this_thread::sleep_for(d); })
       : factory_(std::move(factory)),
         idempotency_(idempotency),
         retry_policy_(std::move(retry_policy)),
-        backoff_policy_(std::move(backoff_policy)),
+        backoff_policy_prototype_(std::move(backoff_policy)),
+        enable_server_retries_(enable_server_retries),
+        sleeper_(std::move(sleeper)),
         reader_(factory_(std::string{})) {}
 
   ~PartialResultSetResume() override = default;
@@ -61,7 +77,9 @@ class PartialResultSetResume : public PartialResultSetReader {
   PartialResultSetReaderFactory factory_;
   google::cloud::Idempotency idempotency_;
   std::unique_ptr<bigtable::DataRetryPolicy> retry_policy_;
-  std::unique_ptr<BackoffPolicy> backoff_policy_;
+  std::unique_ptr<BackoffPolicy> backoff_policy_prototype_;
+  bool enable_server_retries_;
+  Sleeper sleeper_;
   std::unique_ptr<PartialResultSetReader> reader_;
   std::optional<Status> last_status_;
 };

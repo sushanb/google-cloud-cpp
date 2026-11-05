@@ -1037,7 +1037,7 @@ class QueryPlanRefreshingPartialResultSource
       auto delay = internal::Backoff(
           last_status_, __func__, *query_plan_refresh_retry_policy_,
           *query_plan_backoff_policy_, Idempotency::kIdempotent,
-          false /* enable_server_retries */);
+          enable_server_retries(*options_));
       if (!delay) break;
       std::this_thread::sleep_for(*delay);
     }
@@ -1074,9 +1074,10 @@ bigtable::RowStream DataConnectionImpl::ExecuteQuery(
 
   auto const tracing_enabled = RpcStreamTracingEnabled();
   auto const& tracing_options = RpcTracingOptions();
+  auto const server_retries = enable_server_retries(*current);
   auto stub = stub_manager_->GetStub(params.bound_query.instance().FullName());
   auto source_fn =
-      [stub, tracing_enabled, tracing_options](
+      [stub, tracing_enabled, tracing_options, server_retries](
           google::bigtable::v2::ExecuteQueryRequest& request,
           google::bigtable::v2::ResultSetMetadata metadata,
           std::unique_ptr<bigtable::DataRetryPolicy> retry_policy_prototype,
@@ -1105,7 +1106,8 @@ bigtable::RowStream DataConnectionImpl::ExecuteQuery(
 
     auto resume = std::make_unique<PartialResultSetResume>(
         std::move(factory), Idempotency::kIdempotent,
-        retry_policy_prototype->clone(), backoff_policy_prototype->clone());
+        retry_policy_prototype->clone(), backoff_policy_prototype->clone(),
+        server_retries);
 
     return PartialResultSetSource::Create(std::move(metadata),
                                           operation_context, std::move(resume));
