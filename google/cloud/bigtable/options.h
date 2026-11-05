@@ -379,7 +379,7 @@ struct MetricsPeriodOption {
 using DataPolicyOptionList =
     OptionList<DataRetryPolicyOption, DataBackoffPolicyOption, DeadlineOption,
                IdempotentMutationPolicyOption, EnableMetricsOption,
-               MetricsPeriodOption,
+               MetricsPeriodOption, experimental::BulkApplyThrottlingOption,
                experimental::DynamicChannelPoolSizingPolicyOption,
                experimental::DirectPathInitializationModeOption>;
 

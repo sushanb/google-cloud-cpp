@@ -22,6 +22,7 @@
 #include "google/cloud/grpc_options.h"
 #include "google/cloud/testing_util/opentelemetry_matchers.h"
 #include "google/cloud/testing_util/scoped_environment.h"
+#include "google/cloud/testing_util/scoped_log.h"
 #include "rpc_retry_policy.h"
 #include <gmock/gmock.h>
 #include <chrono>
@@ -38,7 +39,9 @@ using ::google::cloud::testing_util::EnableTracing;
 using ::google::cloud::testing_util::SpanNamed;
 using ::testing::Contains;
 using ::testing::Eq;
+using ::testing::HasSubstr;
 using ::testing::IsEmpty;
+using ::testing::Not;
 
 Options TestOptions() {
   return Options{}
@@ -100,6 +103,31 @@ TEST(MakeDataConnection, WithInstances) {
   EXPECT_THAT(
       options.get<bigtable_internal::InstanceChannelAffinityOption>().size(),
       Eq(2));
+}
+
+TEST(MakeDataConnection, BulkApplyThrottlingOption) {
+  testing_util::ScopedLog log;
+  auto conn = MakeDataConnection(
+      TestOptions()
+          .set<EnableMetricsOption>(false)
+          .set<experimental::BulkApplyThrottlingOption>(true));
+  ASSERT_NE(conn, nullptr);
+  EXPECT_TRUE(conn->options().get<experimental::BulkApplyThrottlingOption>());
+  EXPECT_THAT(log.ExtractLines(),
+              Not(Contains(HasSubstr("Unexpected option"))));
+}
+
+TEST(MakeDataConnection, BulkApplyThrottlingOptionWithInstances) {
+  testing_util::ScopedLog log;
+  InstanceResource instance_a{Project("my-project"), "instance-a"};
+  auto conn = MakeDataConnection(
+      {instance_a}, TestOptions()
+                        .set<EnableMetricsOption>(false)
+                        .set<experimental::BulkApplyThrottlingOption>(true));
+  ASSERT_NE(conn, nullptr);
+  EXPECT_TRUE(conn->options().get<experimental::BulkApplyThrottlingOption>());
+  EXPECT_THAT(log.ExtractLines(),
+              Not(Contains(HasSubstr("Unexpected option"))));
 }
 
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
