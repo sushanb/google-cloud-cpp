@@ -13,9 +13,10 @@
 // limitations under the License.
 
 #include "google/cloud/bigtable/internal/grpc_metrics_exporter.h"
-#include "google/cloud/common_options.h"
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_GRPC_OTEL_METRICS
+#include "google/cloud/bigtable/instance_resource.h"
 #include "google/cloud/bigtable/internal/data_connection_impl.h"
+#include "google/cloud/bigtable/internal/defaults.h"
 #include "google/cloud/bigtable/options.h"
 #include "google/cloud/bigtable/version.h"
 #include "google/cloud/opentelemetry/internal/monitoring_exporter.h"
@@ -49,6 +50,7 @@
 #include <opentelemetry/sdk/metrics/view/meter_selector.h>
 #include <opentelemetry/sdk/metrics/view/view.h>
 #include <opentelemetry/sdk/resource/resource.h>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -63,21 +65,6 @@ namespace google {
 namespace cloud {
 namespace bigtable_internal {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
-
-GrpcMetricsExporterRegistry& GrpcMetricsExporterRegistry::Singleton() {
-  static auto* registry = new GrpcMetricsExporterRegistry;
-  return *registry;
-}
-
-bool GrpcMetricsExporterRegistry::Register(std::string authority) {
-  std::unique_lock<std::mutex> lk(mu_);
-  return known_authorities_.insert(std::move(authority)).second;
-}
-
-void GrpcMetricsExporterRegistry::Clear() {
-  std::unique_lock<std::mutex> lk(mu_);
-  known_authorities_.clear();
-}
 
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_GRPC_OTEL_METRICS
 
@@ -161,6 +148,48 @@ void AddHistogramView(opentelemetry::sdk::metrics::MeterProvider& provider,
 #endif  // OPENTELEMETRY_VERSION_MAJOR > 1 || (OPENTELEMETRY_VERSION_MAJOR == 1
         // && OPENTELEMETRY_VERSION_MINOR >= 23)
 }
+
+class GatedPushMetricExporter final
+    : public opentelemetry::sdk::metrics::PushMetricExporter {
+ public:
+  GatedPushMetricExporter(
+      std::unique_ptr<opentelemetry::sdk::metrics::PushMetricExporter> exporter,
+      std::shared_ptr<std::atomic<bool>> export_enabled)
+      : exporter_(std::move(exporter)),
+        export_enabled_(std::move(export_enabled)) {}
+
+  opentelemetry::sdk::metrics::AggregationTemporality GetAggregationTemporality(
+      opentelemetry::sdk::metrics::InstrumentType instrument_type)
+      const noexcept override {
+    return exporter_->GetAggregationTemporality(instrument_type);
+  }
+
+  opentelemetry::sdk::common::ExportResult Export(
+      opentelemetry::sdk::metrics::ResourceMetrics const& data) noexcept
+      override {
+    if (export_enabled_ != nullptr &&
+        !export_enabled_->load(std::memory_order_acquire)) {
+      return opentelemetry::sdk::common::ExportResult::kSuccess;
+    }
+    return exporter_->Export(data);
+  }
+
+  bool ForceFlush(std::chrono::microseconds timeout) noexcept override {
+    if (export_enabled_ != nullptr &&
+        !export_enabled_->load(std::memory_order_acquire)) {
+      return true;
+    }
+    return exporter_->ForceFlush(timeout);
+  }
+
+  bool Shutdown(std::chrono::microseconds timeout) noexcept override {
+    return exporter_->Shutdown(timeout);
+  }
+
+ private:
+  std::unique_ptr<opentelemetry::sdk::metrics::PushMetricExporter> exporter_;
+  std::shared_ptr<std::atomic<bool>> export_enabled_;
+};
 
 }  // namespace
 
@@ -290,12 +319,14 @@ MonitoredResourceResult MakeMonitoredResource(
 }
 
 GrpcMetricsPluginConfig MakeGrpcMetricsPluginConfig(
-    // NOLINTNEXTLINE(performance-unnecessary-value-param)
-    opentelemetry::sdk::resource::Resource detected_resource,
+    opentelemetry::sdk::resource::Resource const& detected_resource,
     std::shared_ptr<monitoring_v3::MetricServiceConnection> const& conn,
-    Options const& options, std::string const& client_uid) {
+    Options const& options, std::string const& client_uid,
+    std::shared_ptr<std::atomic<bool>> export_enabled) {
+  auto resource_options = options;
+  resource_options.unset<GrpcChannelArgumentsNativeOption>();
   auto dynamic_resource_fn =
-      [options, client_uid, detected_resource = std::move(detected_resource)](
+      [options = std::move(resource_options), client_uid, detected_resource](
           opentelemetry::sdk::metrics::PointDataAttributes const& pda) {
         auto res =
             MakeMonitoredResource(pda, detected_resource, options, client_uid);
@@ -332,6 +363,7 @@ GrpcMetricsPluginConfig MakeGrpcMetricsPluginConfig(
   auto constexpr kBigtableMetricNamePath =
       "bigtable.googleapis.com/internal/client/";
   auto exporter_options = options;
+  exporter_options.unset<GrpcChannelArgumentsNativeOption>();
   // Internal metrics must use ServiceTimeSeries to avoid permission issues.
   exporter_options.set<otel::ServiceTimeSeriesOption>(true);
   exporter_options.set<otel::MetricNameFormatterOption>([=](auto const& name) {
@@ -339,15 +371,30 @@ GrpcMetricsPluginConfig MakeGrpcMetricsPluginConfig(
                         absl::StrReplaceAll(name, {{".", "/"}}));
   });
 
+  auto metric_conn =
+      conn != nullptr
+          ? conn
+          : monitoring_v3::MakeMetricServiceConnection(
+                bigtable::internal::MetricsExporterConnectionOptions(
+                    exporter_options));
   auto exporter = otel_internal::MakeMonitoringExporter(
-      dynamic_resource_fn, resource_filter_fn, conn, exporter_options);
+      std::move(dynamic_resource_fn), std::move(resource_filter_fn),
+      std::move(metric_conn), std::move(exporter_options));
+  if (export_enabled != nullptr) {
+    exporter = std::make_unique<GatedPushMetricExporter>(
+        std::move(exporter), std::move(export_enabled));
+  }
 
   auto reader_options =
       opentelemetry::sdk::metrics::PeriodicExportingMetricReaderOptions{};
   // otel::PeriodicExportingMetricReader enforces that export_timeout_millis <
   // export_interval_millis.
-  reader_options.export_interval_millis =
-      options.get<bigtable::MetricsPeriodOption>();
+  auto const period = options.has<bigtable::MetricsPeriodOption>() &&
+                              options.get<bigtable::MetricsPeriodOption>() >
+                                  std::chrono::seconds::zero()
+                          ? options.get<bigtable::MetricsPeriodOption>()
+                          : std::chrono::seconds(60);
+  reader_options.export_interval_millis = period;
   reader_options.export_timeout_millis =
       (std::min)(std::chrono::milliseconds(std::chrono::seconds(30)),
                  reader_options.export_interval_millis / 2);
@@ -376,55 +423,85 @@ GrpcMetricsPluginConfig MakeGrpcMetricsPluginConfig(
           "grpc.client.attempt.rcvd_total_compressed_message_size"},
   };
 
-  auto authority = options.get<AuthorityOption>();
-  auto scope_filter =
-      [authority = std::move(authority)](
-          grpc::OpenTelemetryPluginBuilder::ChannelScope const& scope) {
-        GCP_LOG(DEBUG) << "GrpcMetricsExporter: scope filter checking target="
-                       << scope.target()
-                       << " default_authority=" << scope.default_authority()
-                       << " vs expected authority=" << authority;
-        return scope.default_authority() == authority;
-      };
-
   auto generic_method_filter = [](std::string_view target) {
     return absl::StartsWith(target, "google.bigtable.v2");
   };
 
   return GrpcMetricsPluginConfig{
-      std::move(provider),        std::move(metrics),
-      std::move(disable_metrics), std::move(generic_method_filter),
-      std::move(scope_filter),
+      std::move(provider),
+      std::move(metrics),
+      std::move(disable_metrics),
+      std::move(generic_method_filter),
   };
 }
 
 GrpcMetricsPluginConfig MakeGrpcMetricsPluginConfig(
     std::shared_ptr<monitoring_v3::MetricServiceConnection> const& conn,
-    Options const& options, std::string const& client_uid) {
+    Options const& options, std::string const& client_uid,
+    std::shared_ptr<std::atomic<bool>> export_enabled) {
   auto detector = otel::MakeResourceDetector();
   return MakeGrpcMetricsPluginConfig(detector->Detect(), conn, options,
-                                     client_uid);
+                                     client_uid, std::move(export_enabled));
 }
 
-void EnableGrpcMetrics(
-    std::shared_ptr<monitoring_v3::MetricServiceConnection> const& conn,
-    Options const& options, std::string const& client_uid) {
-  auto const& authority = options.get<AuthorityOption>();
-  if (!GrpcMetricsExporterRegistry::Singleton().Register(authority)) return;
-
-  auto config = MakeGrpcMetricsPluginConfig(conn, options, client_uid);
-  auto status =
-      grpc::OpenTelemetryPluginBuilder()
-          .SetMeterProvider(config.meter_provider)
-          .EnableMetrics(config.enabled_metrics)
-          .DisableMetrics(config.disabled_metrics)
-          .SetGenericMethodAttributeFilter(
-              std::move(config.generic_method_filter))
-          .SetChannelScopeFilter(std::move(config.channel_scope_filter))
-          .BuildAndRegisterGlobal();
-  if (!status.ok()) {
-    GCP_LOG(ERROR) << "Cannot register provider status=" << status.ToString();
+std::shared_ptr<grpc::experimental::OpenTelemetryPlugin> MakeGrpcMetricsPlugin(
+    GrpcMetricsPluginConfig config) {
+  auto plugin = grpc::OpenTelemetryPluginBuilder()
+                    .SetMeterProvider(std::move(config.meter_provider))
+                    .EnableMetrics(config.enabled_metrics)
+                    .DisableMetrics(config.disabled_metrics)
+                    .SetGenericMethodAttributeFilter(
+                        std::move(config.generic_method_filter))
+                    .Build();
+  if (!plugin.ok()) {
+    GCP_LOG(ERROR) << "Cannot build gRPC OpenTelemetry plugin: status="
+                   << plugin.status().ToString();
+    return nullptr;
   }
+  return *std::move(plugin);
+}
+
+std::shared_ptr<grpc::experimental::OpenTelemetryPlugin> MakeGrpcMetricsPlugin(
+    opentelemetry::sdk::resource::Resource const& detected_resource,
+    std::shared_ptr<monitoring_v3::MetricServiceConnection> const& conn,
+    Options const& options, std::string const& client_uid,
+    std::shared_ptr<std::atomic<bool>> export_enabled) {
+  return MakeGrpcMetricsPlugin(MakeGrpcMetricsPluginConfig(
+      detected_resource, conn, options, client_uid, std::move(export_enabled)));
+}
+
+std::shared_ptr<grpc::experimental::OpenTelemetryPlugin> MakeGrpcMetricsPlugin(
+    std::shared_ptr<monitoring_v3::MetricServiceConnection> const& conn,
+    Options const& options, std::string const& client_uid,
+    std::shared_ptr<std::atomic<bool>> export_enabled) {
+  return MakeGrpcMetricsPlugin(MakeGrpcMetricsPluginConfig(
+      conn, options, client_uid, std::move(export_enabled)));
+}
+
+Options WithGrpcMetricsPlugin(
+    Options options,
+    std::shared_ptr<grpc::experimental::OpenTelemetryPlugin> const& plugin) {
+  if (plugin != nullptr) {
+    plugin->AddToChannelArguments(
+        &options.lookup<GrpcChannelArgumentsNativeOption>());
+  }
+  return options;
+}
+
+Options EnableGrpcMetricsForInstance(
+    opentelemetry::sdk::resource::Resource const& detected_resource,
+    std::shared_ptr<monitoring_v3::MetricServiceConnection> const& conn,
+    Options options, std::string_view instance_name,
+    std::string const& client_uid,
+    std::shared_ptr<std::atomic<bool>> export_enabled) {
+  auto instance = bigtable::MakeInstanceResource(std::string{instance_name});
+  if (instance.ok()) {
+    options.set<bigtable_internal::InstanceChannelAffinityOption>(
+        {*std::move(instance)});
+  }
+  auto plugin = MakeGrpcMetricsPlugin(detected_resource, conn, options,
+                                      client_uid, std::move(export_enabled));
+  return WithGrpcMetricsPlugin(std::move(options), plugin);
 }
 
 #endif  // GOOGLE_CLOUD_CPP_BIGTABLE_WITH_GRPC_OTEL_METRICS
