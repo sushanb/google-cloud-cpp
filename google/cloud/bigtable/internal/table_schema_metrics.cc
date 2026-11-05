@@ -27,6 +27,7 @@
 #include <opentelemetry/context/runtime_context.h>
 #include <opentelemetry/metrics/meter.h>
 #include <algorithm>
+#include <cstdint>
 #include <map>
 #include <set>
 #include <string_view>
@@ -37,6 +38,17 @@ namespace bigtable_internal {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace {
 auto constexpr kMeterInstrumentationScopeVersion = "v1";
+
+bool IsConnectivityErrorImpl(
+    google::cloud::Status const& status,
+    grpc::ClientContext const& client_context,
+    std::optional<google::bigtable::v2::ResponseParams> const&
+        response_params) {
+  return !status.ok() &&
+         status.code() != google::cloud::StatusCode::kDeadlineExceeded &&
+         !response_params.has_value() && !HasServerTiming(client_context) &&
+         !GetPeerInfoFromServerMetadata(client_context).has_value();
+}
 }  // namespace
 
 // TODO(#15329): Refactor how we're handling different data labels for
@@ -102,8 +114,9 @@ bool HasServerTiming(grpc::ClientContext const& client_context) {
 
 bool IsConnectivityError(google::cloud::Status const& status,
                          grpc::ClientContext const& client_context) {
-  return status.code() != google::cloud::StatusCode::kDeadlineExceeded &&
-         !HasServerTiming(client_context);
+  return IsConnectivityErrorImpl(
+      status, client_context,
+      GetResponseParamsFromTrailingMetadata(client_context));
 }
 
 std::optional<google::bigtable::v2::ResponseParams>
@@ -253,6 +266,9 @@ void AttemptLatency::PostCall(opentelemetry::context::Context const& context,
   if (response_params) {
     resource_labels_.cluster = response_params->cluster_id();
     resource_labels_.zone = response_params->zone_id();
+  } else {
+    resource_labels_.cluster.clear();
+    resource_labels_.zone.clear();
   }
 
   auto attempt_elapsed = std::chrono::duration_cast<LatencyDuration>(
@@ -294,6 +310,9 @@ void AttemptLatency2::PostCall(opentelemetry::context::Context const& context,
   if (response_params) {
     resource_labels_.cluster = response_params->cluster_id();
     resource_labels_.zone = response_params->zone_id();
+  } else {
+    resource_labels_.cluster.clear();
+    resource_labels_.zone.clear();
   }
 
   std::optional<google::bigtable::v2::PeerInfo> peer_info =
@@ -449,6 +468,9 @@ void ServerLatency::PostCall(opentelemetry::context::Context const& context,
   if (response_params) {
     resource_labels_.cluster = response_params->cluster_id();
     resource_labels_.zone = response_params->zone_id();
+  } else {
+    resource_labels_.cluster.clear();
+    resource_labels_.zone.clear();
   }
   data_labels_.status = StatusCodeToString(p.attempt_status.code());
   auto server_latency = GetServerLatencyFromInitialMetadata(client_context);
@@ -528,27 +550,24 @@ ConnectivityErrorCount::ConnectivityErrorCount(
                          kMeterInstrumentationScopeVersion)
               ->CreateUInt64Counter("connectivity_error_count")) {}
 
-void ConnectivityErrorCount::PostCall(opentelemetry::context::Context const&,
-                                      grpc::ClientContext const& client_context,
-                                      PostCallParams const& p) {
+void ConnectivityErrorCount::PostCall(
+    opentelemetry::context::Context const& context,
+    grpc::ClientContext const& client_context, PostCallParams const& p) {
   auto response_params = GetResponseParamsFromTrailingMetadata(client_context);
   if (response_params) {
     resource_labels_.cluster = response_params->cluster_id();
     resource_labels_.zone = response_params->zone_id();
+  } else {
+    resource_labels_.cluster.clear();
+    resource_labels_.zone.clear();
   }
   auto const& status = p.attempt_status;
   data_labels_.status = StatusCodeToString(status.code());
-  if (resource_labels_.cluster.empty() || resource_labels_.zone.empty() ||
-      IsConnectivityError(status, client_context)) {
-    ++num_errors_;
-  }
-}
-
-void ConnectivityErrorCount::OnDone(
-    opentelemetry::context::Context const& context, OnDoneParams const&) {
+  std::uint64_t const count =
+      IsConnectivityErrorImpl(status, client_context, response_params) ? 1 : 0;
   auto m = IntoLabelMap(resource_labels_, data_labels_,
                         std::set<std::string>{"streaming"});
-  connectivity_error_count_->Add(num_errors_, std::move(m), context);
+  connectivity_error_count_->Add(count, std::move(m), context);
 }
 
 std::unique_ptr<TableSchemaMetric> ConnectivityErrorCount::clone(
