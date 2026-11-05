@@ -25,6 +25,15 @@
 #include <google/protobuf/util/time_util.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
 
 namespace google {
 namespace cloud {
@@ -125,8 +134,18 @@ TEST(QueryPlanTest, FailedRefreshExpiredPlan) {
   ASSERT_STATUS_OK(data);
   EXPECT_EQ(data->prepared_query(), "original-query-plan");
 
+  // A failed proactive timer refresh preserves the existing plan rather than
+  // clobbering it while the server may still accept it.
   fake_cq_impl->SimulateCompletion(true);
 
+  data = query_plan->response();
+  ASSERT_STATUS_OK(data);
+  EXPECT_EQ(data->prepared_query(), "original-query-plan");
+
+  // Once the server actually rejects the plan and Invalidate is called, a
+  // failed refresh surfaces the refresh error.
+  query_plan->Invalidate(internal::FailedPreconditionError("plan expired"),
+                         "original-query-plan");
   data = query_plan->response();
   EXPECT_THAT(data.status(), StatusIs(StatusCode::kInternal, "oops!"));
 
@@ -488,6 +507,298 @@ TEST(QueryPlanMultithreadedTest, RefreshInvalidatedPlanAfterFailedRefresh) {
   EXPECT_EQ(calls_to_refresh_fn, kNumFailingThreads + 1);
 
   // Cancel all pending operations, satisfying any remaining futures.
+  fake_cq_impl->SimulateCompletion(false);
+}
+
+TEST(QueryPlanTest, ProactiveRefreshTransientFailureRetriesBeforeExpiry) {
+  using google::bigtable::v2::PrepareQueryResponse;
+  auto fake_cq_impl = std::make_shared<FakeCompletionQueueImpl>();
+  auto fake_clock = std::make_shared<FakeSystemClock>();
+  auto now = std::chrono::system_clock::now();
+  fake_clock->SetTime(now);
+
+  int calls = 0;
+  auto refresh_fn = [&]() {
+    ++calls;
+    if (calls == 1 || calls == 3) {
+      return make_ready_future(StatusOr<PrepareQueryResponse>(
+          Status(StatusCode::kUnavailable, "transient failure")));
+    }
+    PrepareQueryResponse r;
+    r.set_prepared_query(calls == 2 ? "plan-v2" : "plan-v3");
+    *r.mutable_valid_until() =
+        internal::ToProtoTimestamp(now + std::chrono::seconds(20));
+    return make_ready_future(make_status_or(std::move(r)));
+  };
+
+  PrepareQueryResponse initial;
+  initial.set_prepared_query("plan-v1");
+  *initial.mutable_valid_until() =
+      internal::ToProtoTimestamp(now + std::chrono::seconds(10));
+
+  auto query_plan = QueryPlan::Create(CompletionQueue(fake_cq_impl), initial,
+                                      refresh_fn, fake_clock);
+  EXPECT_EQ(fake_cq_impl->size(), 1);
+
+  // Proactive refresh fires before valid_until and fails transiently.
+  fake_clock->AdvanceTime(std::chrono::seconds(9));
+  fake_cq_impl->SimulateCompletion(true);
+  EXPECT_EQ(calls, 1);
+
+  // The valid plan is preserved and a retry timer is scheduled before expiry.
+  auto data = query_plan->response();
+  ASSERT_STATUS_OK(data);
+  EXPECT_EQ(data->prepared_query(), "plan-v1");
+  EXPECT_EQ(calls, 1);
+  EXPECT_EQ(fake_cq_impl->size(), 1);
+
+  // Retry timer fires and succeeds.
+  fake_cq_impl->SimulateCompletion(true);
+  EXPECT_EQ(calls, 2);
+  data = query_plan->response();
+  ASSERT_STATUS_OK(data);
+  EXPECT_EQ(data->prepared_query(), "plan-v2");
+  EXPECT_EQ(fake_cq_impl->size(), 1);
+
+  // If a proactive refresh fails after valid_until has passed, the existing
+  // plan is still preserved for the server grace window without scheduling
+  // tight-loop timers past valid_until.
+  fake_clock->AdvanceTime(std::chrono::seconds(20));
+  fake_cq_impl->SimulateCompletion(true);
+  EXPECT_EQ(calls, 3);
+  data = query_plan->response();
+  ASSERT_STATUS_OK(data);
+  EXPECT_EQ(data->prepared_query(), "plan-v2");
+  EXPECT_THAT(*fake_cq_impl, IsEmpty());
+
+  // Reactive Invalidate refreshes to plan-v3.
+  query_plan->Invalidate(internal::FailedPreconditionError("expired"),
+                         "plan-v2");
+  data = query_plan->response();
+  ASSERT_STATUS_OK(data);
+  EXPECT_EQ(data->prepared_query(), "plan-v3");
+  EXPECT_EQ(calls, 4);
+
+  fake_cq_impl->SimulateCompletion(false);
+}
+
+TEST(QueryPlanTest, AsyncProactiveRefreshDoesNotBlockTimerCompletion) {
+  using google::bigtable::v2::PrepareQueryResponse;
+  auto fake_cq_impl = std::make_shared<FakeCompletionQueueImpl>();
+  auto fake_clock = std::make_shared<FakeSystemClock>();
+  fake_clock->SetTime(std::chrono::system_clock::now());
+
+  promise<StatusOr<PrepareQueryResponse>> refresh_promise;
+  auto refresh_fn = [&]() { return refresh_promise.get_future(); };
+
+  PrepareQueryResponse initial;
+  initial.set_prepared_query("plan-v1");
+  auto query_plan = QueryPlan::Create(CompletionQueue(fake_cq_impl), initial,
+                                      refresh_fn, fake_clock);
+
+  // Completing the timer on this thread must not block waiting on the
+  // unsatisfied refresh future.
+  fake_cq_impl->SimulateCompletion(true);
+
+  // Foreground callers continue receiving the existing plan non-blockingly
+  // while the proactive refresh is in flight.
+  auto data = query_plan->response();
+  ASSERT_STATUS_OK(data);
+  EXPECT_EQ(data->prepared_query(), "plan-v1");
+
+  PrepareQueryResponse refreshed;
+  refreshed.set_prepared_query("plan-v2");
+  refresh_promise.set_value(refreshed);
+
+  data = query_plan->response();
+  ASSERT_STATUS_OK(data);
+  EXPECT_EQ(data->prepared_query(), "plan-v2");
+
+  fake_cq_impl->SimulateCompletion(false);
+}
+
+TEST(QueryPlanTest, StaleMultiHopInvalidateDoesNotClobberCurrentPlan) {
+  using google::bigtable::v2::PrepareQueryResponse;
+  auto fake_cq_impl = std::make_shared<FakeCompletionQueueImpl>();
+  auto fake_clock = std::make_shared<FakeSystemClock>();
+  fake_clock->SetTime(std::chrono::system_clock::now());
+
+  int calls = 0;
+  auto refresh_fn = [&]() {
+    ++calls;
+    PrepareQueryResponse r;
+    r.set_prepared_query("plan-v" + std::to_string(calls + 1));
+    return make_ready_future(make_status_or(std::move(r)));
+  };
+
+  PrepareQueryResponse initial;
+  initial.set_prepared_query("plan-v1");
+  auto query_plan = QueryPlan::Create(CompletionQueue(fake_cq_impl), initial,
+                                      refresh_fn, fake_clock);
+
+  // Refresh twice: plan-v1 -> plan-v2 -> plan-v3.
+  fake_cq_impl->SimulateCompletion(true);
+  ASSERT_STATUS_OK(query_plan->response());
+  EXPECT_EQ(query_plan->response()->prepared_query(), "plan-v2");
+
+  fake_cq_impl->SimulateCompletion(true);
+  ASSERT_STATUS_OK(query_plan->response());
+  EXPECT_EQ(query_plan->response()->prepared_query(), "plan-v3");
+  EXPECT_EQ(calls, 2);
+
+  // Delayed callers reporting expiry for plan-v1 (multi-hop stale) or plan-v2
+  // (single-hop stale) must not clobber plan-v3 or trigger extra refreshes.
+  query_plan->Invalidate(internal::FailedPreconditionError("expired v1"),
+                         "plan-v1");
+  auto data = query_plan->response();
+  ASSERT_STATUS_OK(data);
+  EXPECT_EQ(data->prepared_query(), "plan-v3");
+  EXPECT_EQ(calls, 2);
+
+  query_plan->Invalidate(internal::FailedPreconditionError("expired v2"),
+                         "plan-v2");
+  data = query_plan->response();
+  ASSERT_STATUS_OK(data);
+  EXPECT_EQ(data->prepared_query(), "plan-v3");
+  EXPECT_EQ(calls, 2);
+
+  // Invalidating the active plan-v3 triggers a refresh to plan-v4.
+  query_plan->Invalidate(internal::FailedPreconditionError("expired v3"),
+                         "plan-v3");
+  data = query_plan->response();
+  ASSERT_STATUS_OK(data);
+  EXPECT_EQ(data->prepared_query(), "plan-v4");
+  EXPECT_EQ(calls, 3);
+
+  fake_cq_impl->SimulateCompletion(false);
+}
+
+TEST(QueryPlanTest,
+     InvalidateDuringPendingProactiveRefreshTriggersFreshRefresh) {
+  using google::bigtable::v2::PrepareQueryResponse;
+  auto fake_cq_impl = std::make_shared<FakeCompletionQueueImpl>();
+  auto fake_clock = std::make_shared<FakeSystemClock>();
+  fake_clock->SetTime(std::chrono::system_clock::now());
+
+  promise<StatusOr<PrepareQueryResponse>> promise_1;
+  promise<StatusOr<PrepareQueryResponse>> promise_2;
+  promise<void> call_2_started;
+  std::atomic<int> calls{0};
+
+  auto refresh_fn = [&]() {
+    int const c = ++calls;
+    if (c == 1) return promise_1.get_future();
+    call_2_started.set_value();
+    return promise_2.get_future();
+  };
+
+  PrepareQueryResponse initial;
+  initial.set_prepared_query("plan-v1");
+  auto query_plan = QueryPlan::Create(CompletionQueue(fake_cq_impl), initial,
+                                      refresh_fn, fake_clock);
+
+  // Start slow proactive refresh #1.
+  fake_cq_impl->SimulateCompletion(true);
+  EXPECT_EQ(calls.load(), 1);
+
+  // Server rejects plan-v1 while proactive refresh #1 is still in flight.
+  query_plan->Invalidate(internal::FailedPreconditionError("expired v1"),
+                         "plan-v1");
+  // Duplicate Invalidate for the same expired plan is coalesced.
+  query_plan->Invalidate(internal::FailedPreconditionError("expired v1 again"),
+                         "plan-v1");
+  EXPECT_EQ(calls.load(), 1);
+
+  // A foreground caller requesting response() must wait rather than receiving
+  // the known-expired plan-v1.
+  promise<void> caller_entered;
+  promise<StatusOr<PrepareQueryResponse>> caller_result;
+  auto caller_future = caller_result.get_future();
+  std::thread caller([&] {
+    caller_entered.set_value();
+    caller_result.set_value(query_plan->response());
+  });
+  caller_entered.get_future().get();
+  EXPECT_FALSE(caller_future.is_ready());
+
+  // When the pre-invalidation refresh #1 finishes, OnRefreshCompleted discards
+  // it and immediately starts fresh refresh #2.
+  PrepareQueryResponse stale_refresh;
+  stale_refresh.set_prepared_query("stale-plan-v2");
+  promise_1.set_value(stale_refresh);
+
+  call_2_started.get_future().get();
+  EXPECT_EQ(calls.load(), 2);
+  EXPECT_FALSE(caller_future.is_ready());
+
+  PrepareQueryResponse fresh_refresh;
+  fresh_refresh.set_prepared_query("fresh-plan-v3");
+  promise_2.set_value(fresh_refresh);
+
+  auto result = caller_future.get();
+  caller.join();
+  ASSERT_STATUS_OK(result);
+  EXPECT_EQ(result->prepared_query(), "fresh-plan-v3");
+  EXPECT_EQ(calls.load(), 2);
+
+  fake_cq_impl->SimulateCompletion(false);
+}
+
+TEST(QueryPlanTest,
+     InvalidateDuringPendingProactiveRefreshHandlesFollowUpFailureAndRecovery) {
+  using google::bigtable::v2::PrepareQueryResponse;
+  auto fake_cq_impl = std::make_shared<FakeCompletionQueueImpl>();
+  auto fake_clock = std::make_shared<FakeSystemClock>();
+  fake_clock->SetTime(std::chrono::system_clock::now());
+
+  promise<StatusOr<PrepareQueryResponse>> promise_1;
+  promise<StatusOr<PrepareQueryResponse>> promise_2;
+  int calls = 0;
+
+  auto refresh_fn = [&]() {
+    ++calls;
+    if (calls == 1) return promise_1.get_future();
+    if (calls == 2) return promise_2.get_future();
+    if (calls == 3) {
+      return make_ready_future(StatusOr<PrepareQueryResponse>(
+          Status(StatusCode::kUnavailable, "retry failed")));
+    }
+    PrepareQueryResponse recovered;
+    recovered.set_prepared_query("plan-v4");
+    return make_ready_future(make_status_or(std::move(recovered)));
+  };
+
+  PrepareQueryResponse initial;
+  initial.set_prepared_query("plan-v1");
+  auto query_plan = QueryPlan::Create(CompletionQueue(fake_cq_impl), initial,
+                                      refresh_fn, fake_clock);
+
+  fake_cq_impl->SimulateCompletion(true);
+  EXPECT_EQ(calls, 1);
+
+  query_plan->Invalidate(internal::FailedPreconditionError("expired v1"),
+                         "plan-v1");
+
+  // Even when the pre-invalidation refresh fails, OnRefreshCompleted still
+  // triggers a fresh post-invalidation refresh immediately.
+  promise_1.set_value(
+      StatusOr<PrepareQueryResponse>(Status(StatusCode::kUnavailable, "old")));
+  EXPECT_EQ(calls, 2);
+
+  // If the post-invalidation refresh also fails, state transitions to kBegin so
+  // subsequent response() calls retry on demand.
+  promise_2.set_value(StatusOr<PrepareQueryResponse>(
+      Status(StatusCode::kUnavailable, "follow-up failed")));
+
+  auto failed = query_plan->response();
+  EXPECT_THAT(failed, StatusIs(StatusCode::kUnavailable, "retry failed"));
+  EXPECT_EQ(calls, 3);
+
+  auto recovered = query_plan->response();
+  ASSERT_STATUS_OK(recovered);
+  EXPECT_EQ(recovered->prepared_query(), "plan-v4");
+  EXPECT_EQ(calls, 4);
+
   fake_cq_impl->SimulateCompletion(false);
 }
 
