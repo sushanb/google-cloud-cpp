@@ -621,11 +621,14 @@ TEST_F(DefaultRowReaderTest, FailedParseIsRetried) {
                    auto const&) {
         EXPECT_THAT(request, HasCorrectResourceNames());
         auto stream = std::make_unique<MockReadRowsStream>();
+        ::testing::InSequence s;
         EXPECT_CALL(*stream, Read)
             .WillOnce([](google::bigtable::v2::ReadRowsResponse* r) {
               *r = MalformedResponse();
               return std::nullopt;
             });
+        EXPECT_CALL(*stream, Cancel);
+        EXPECT_CALL(*stream, Read).WillOnce(Return(Status()));
         return stream;
       })
       .WillOnce([](auto, auto const&,
@@ -687,6 +690,7 @@ TEST_F(DefaultRowReaderTest, FailedParseSkipsAlreadyReadRows) {
         // We should have two rows in the initial request: "r1" and "r2".
         EXPECT_THAT(request.rows().row_keys(), ElementsAre("r1", "r2"));
         auto stream = std::make_unique<MockReadRowsStream>();
+        ::testing::InSequence s;
         EXPECT_CALL(*stream, Read)
             .WillOnce([](google::bigtable::v2::ReadRowsResponse* r) {
               *r = MakeRow("r1");
@@ -696,6 +700,8 @@ TEST_F(DefaultRowReaderTest, FailedParseSkipsAlreadyReadRows) {
               *r = MalformedResponse();
               return std::nullopt;
             });
+        EXPECT_CALL(*stream, Cancel);
+        EXPECT_CALL(*stream, Read).WillOnce(Return(Status()));
         return stream;
       })
       .WillOnce([](auto, auto const&,
@@ -754,6 +760,7 @@ TEST_F(DefaultRowReaderTest, FailedParseSkipsAlreadyScannedRows) {
         // We start our call with 3 rows in the set: "r1", "r2", "r3".
         EXPECT_THAT(request.rows().row_keys(), ElementsAre("r1", "r2", "r3"));
         auto stream = std::make_unique<MockReadRowsStream>();
+        ::testing::InSequence s;
         EXPECT_CALL(*stream, Read)
             .WillOnce([](google::bigtable::v2::ReadRowsResponse* r) {
               *r = MakeRow("r1");
@@ -770,6 +777,8 @@ TEST_F(DefaultRowReaderTest, FailedParseSkipsAlreadyScannedRows) {
               *r = MalformedResponse();
               return std::nullopt;
             });
+        EXPECT_CALL(*stream, Cancel);
+        EXPECT_CALL(*stream, Read).WillOnce(Return(Status()));
         return stream;
       })
       .WillOnce([](auto, auto const&,
@@ -1574,6 +1583,492 @@ TEST_F(DefaultRowReaderTest, RetryInfoIgnored) {
   auto reader = bigtable_internal::MakeRowReader(std::move(impl));
   EXPECT_THAT(StatusOrRowKeys(reader),
               ElementsAre(StatusIs(StatusCode::kResourceExhausted)));
+}
+
+TEST_F(DefaultRowReaderTest,
+       CancelPopulatesTrailingMetadataBeforePostCallAndReportsCancelled) {
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_shared<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(1);
+  EXPECT_CALL(*mock_metric, ElementRequest).Times(0);
+  EXPECT_CALL(*mock_metric, ElementDelivery).Times(1);
+  EXPECT_CALL(*mock_metric, PostCall)
+      .WillOnce([](opentelemetry::context::Context const&,
+                   grpc::ClientContext const& client_context,
+                   PostCallParams const& p) {
+        EXPECT_THAT(p.attempt_status, StatusIs(StatusCode::kCancelled));
+        EXPECT_THAT(p.attempt_status.error_info().metadata(),
+                    Contains(Pair("gl-cpp.error.origin", "client")));
+        auto response_params =
+            GetResponseParamsFromTrailingMetadata(client_context);
+        ASSERT_TRUE(response_params.has_value());
+        EXPECT_EQ(response_params->cluster_id(), "the-cluster");
+        EXPECT_EQ(response_params->zone_id(), "the-zone");
+        EXPECT_FALSE(IsConnectivityError(p.attempt_status, client_context));
+      });
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce(
+          [](opentelemetry::context::Context const&, OnDoneParams const& p) {
+            EXPECT_THAT(p.operation_status, StatusIs(StatusCode::kCancelled));
+            EXPECT_THAT(p.operation_status.error_info().metadata(),
+                        Contains(Pair("gl-cpp.error.origin", "client")));
+          });
+
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({mock_metric}, clock));
+#else
+  auto operation_context = std::make_shared<OperationContext>();
+#endif
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, ReadRows)
+      .WillOnce([this](auto context, auto const&,
+                       google::bigtable::v2::ReadRowsRequest const& request,
+                       auto const&) {
+        EXPECT_THAT(request, HasCorrectResourceNames());
+        auto stream = std::make_unique<MockReadRowsStream>();
+        ::testing::InSequence s;
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([](google::bigtable::v2::ReadRowsResponse* r) {
+              *r = MakeRow("r1");
+              return std::nullopt;
+            });
+        EXPECT_CALL(*stream, Cancel);
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([](google::bigtable::v2::ReadRowsResponse* r) {
+              *r = MakeRow("discarded-row");
+              return std::nullopt;
+            })
+            .WillOnce([this, context](google::bigtable::v2::ReadRowsResponse*) {
+              RpcMetadata server_metadata;
+              server_metadata.headers.emplace("server-timing",
+                                              "gfet4t7; dur=10.0");
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+              google::bigtable::v2::ResponseParams response_params;
+              response_params.set_cluster_id("the-cluster");
+              response_params.set_zone_id("the-zone");
+              server_metadata.trailers.emplace(
+                  "x-goog-ext-425905942-bin",
+                  response_params.SerializeAsString());
+#endif
+              metadata_fixture_.SetServerMetadata(*context, server_metadata);
+              return Status{};
+            });
+        return stream;
+      });
+
+  auto impl = std::make_shared<DefaultRowReader>(
+      mock, kAppProfile, kTableName, bigtable::RowSet(),
+      bigtable::RowReader::NO_ROWS_LIMIT, bigtable::Filter::PassAllFilter(),
+      false, retry_.clone(), backoff_.clone(), false,
+      std::move(operation_context));
+  auto reader = bigtable_internal::MakeRowReader(std::move(impl));
+
+  auto it = reader.begin();
+  EXPECT_NE(it, reader.end());
+  ASSERT_STATUS_OK(*it);
+  EXPECT_EQ((*it)->row_key(), "r1");
+  reader.Cancel();
+}
+
+TEST_F(DefaultRowReaderTest, CancelAfterRetryReportsCancelledNotStaleError) {
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_shared<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(2);
+  EXPECT_CALL(*mock_metric, ElementRequest).Times(0);
+  EXPECT_CALL(*mock_metric, ElementDelivery).Times(1);
+  {
+    ::testing::InSequence s;
+    EXPECT_CALL(*mock_metric, PostCall)
+        .WillOnce([](opentelemetry::context::Context const&,
+                     grpc::ClientContext const&, PostCallParams const& p) {
+          EXPECT_THAT(p.attempt_status, StatusIs(StatusCode::kUnavailable));
+        });
+    EXPECT_CALL(*mock_metric, PostCall)
+        .WillOnce([](opentelemetry::context::Context const&,
+                     grpc::ClientContext const& client_context,
+                     PostCallParams const& p) {
+          EXPECT_THAT(p.attempt_status, StatusIs(StatusCode::kCancelled));
+          auto response_params =
+              GetResponseParamsFromTrailingMetadata(client_context);
+          ASSERT_TRUE(response_params.has_value());
+          EXPECT_EQ(response_params->cluster_id(), "cluster-2");
+          EXPECT_EQ(response_params->zone_id(), "zone-2");
+        });
+    EXPECT_CALL(*mock_metric, OnDone)
+        .WillOnce(
+            [](opentelemetry::context::Context const&, OnDoneParams const& p) {
+              EXPECT_THAT(p.operation_status, StatusIs(StatusCode::kCancelled));
+            });
+  }
+
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({mock_metric}, clock));
+#else
+  auto operation_context = std::make_shared<OperationContext>();
+#endif
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, ReadRows)
+      .WillOnce([this](auto context, auto const&,
+                       google::bigtable::v2::ReadRowsRequest const& request,
+                       auto const&) {
+        EXPECT_THAT(request, HasCorrectResourceNames());
+        metadata_fixture_.SetServerMetadata(*context);
+        auto stream = std::make_unique<MockReadRowsStream>();
+        EXPECT_CALL(*stream, Read)
+            .WillOnce(Return(Status(StatusCode::kUnavailable, "try again")));
+        return stream;
+      })
+      .WillOnce([this](auto context, auto const&,
+                       google::bigtable::v2::ReadRowsRequest const& request,
+                       auto const&) {
+        EXPECT_THAT(request, HasCorrectResourceNames());
+        auto stream = std::make_unique<MockReadRowsStream>();
+        ::testing::InSequence s;
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([](google::bigtable::v2::ReadRowsResponse* r) {
+              *r = MakeRow("r1");
+              return std::nullopt;
+            });
+        EXPECT_CALL(*stream, Cancel);
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([this, context](google::bigtable::v2::ReadRowsResponse*) {
+              RpcMetadata server_metadata;
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+              google::bigtable::v2::ResponseParams response_params;
+              response_params.set_cluster_id("cluster-2");
+              response_params.set_zone_id("zone-2");
+              server_metadata.trailers.emplace(
+                  "x-goog-ext-425905942-bin",
+                  response_params.SerializeAsString());
+#endif
+              metadata_fixture_.SetServerMetadata(*context, server_metadata);
+              return Status{};
+            });
+        return stream;
+      });
+
+  auto impl = std::make_shared<DefaultRowReader>(
+      mock, kAppProfile, kTableName, bigtable::RowSet(),
+      bigtable::RowReader::NO_ROWS_LIMIT, bigtable::Filter::PassAllFilter(),
+      false, retry_.clone(), backoff_.clone(), false,
+      std::move(operation_context));
+  auto reader = bigtable_internal::MakeRowReader(std::move(impl));
+
+  auto it = reader.begin();
+  EXPECT_NE(it, reader.end());
+  ASSERT_STATUS_OK(*it);
+  EXPECT_EQ((*it)->row_key(), "r1");
+  // Break out of iteration early; ~RowReader() cancels and drains the second
+  // stream before invoking PostCall and OnDone.
+}
+
+TEST_F(DefaultRowReaderTest, CancelPreservesNonOkDrainStatus) {
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_shared<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(1);
+  EXPECT_CALL(*mock_metric, ElementRequest).Times(0);
+  EXPECT_CALL(*mock_metric, ElementDelivery).Times(1);
+  EXPECT_CALL(*mock_metric, PostCall)
+      .WillOnce([](opentelemetry::context::Context const&,
+                   grpc::ClientContext const&, PostCallParams const& p) {
+        EXPECT_THAT(p.attempt_status,
+                    StatusIs(StatusCode::kCancelled, HasSubstr("peer reset")));
+      });
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce([](opentelemetry::context::Context const&,
+                   OnDoneParams const& p) {
+        EXPECT_THAT(p.operation_status,
+                    StatusIs(StatusCode::kCancelled, HasSubstr("peer reset")));
+      });
+
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({mock_metric}, clock));
+#else
+  auto operation_context = std::make_shared<OperationContext>();
+#endif
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, ReadRows)
+      .WillOnce([](auto, auto const&,
+                   google::bigtable::v2::ReadRowsRequest const& request,
+                   auto const&) {
+        EXPECT_THAT(request, HasCorrectResourceNames());
+        auto stream = std::make_unique<MockReadRowsStream>();
+        ::testing::InSequence s;
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([](google::bigtable::v2::ReadRowsResponse* r) {
+              *r = MakeRow("r1");
+              return std::nullopt;
+            });
+        EXPECT_CALL(*stream, Cancel);
+        EXPECT_CALL(*stream, Read)
+            .WillOnce(Return(Status(StatusCode::kCancelled, "peer reset")));
+        return stream;
+      });
+
+  internal::OptionsSpan span(TestOptions(/*expected_streams=*/1));
+
+  auto impl = std::make_shared<DefaultRowReader>(
+      mock, kAppProfile, kTableName, bigtable::RowSet(),
+      bigtable::RowReader::NO_ROWS_LIMIT, bigtable::Filter::PassAllFilter(),
+      false, retry_.clone(), backoff_.clone(), false,
+      std::move(operation_context));
+  auto reader = bigtable_internal::MakeRowReader(std::move(impl));
+
+  auto it = reader.begin();
+  EXPECT_NE(it, reader.end());
+  ASSERT_STATUS_OK(*it);
+  EXPECT_EQ((*it)->row_key(), "r1");
+  reader.Cancel();
+}
+
+TEST_F(DefaultRowReaderTest,
+       FailedParseWithPermanentErrorReportsInternalAndTrailingMetadata) {
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_shared<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(1);
+  EXPECT_CALL(*mock_metric, ElementRequest).Times(0);
+  EXPECT_CALL(*mock_metric, ElementDelivery).Times(0);
+  EXPECT_CALL(*mock_metric, PostCall)
+      .WillOnce([](opentelemetry::context::Context const&,
+                   grpc::ClientContext const& client_context,
+                   PostCallParams const& p) {
+        EXPECT_THAT(p.attempt_status, StatusIs(StatusCode::kInternal));
+        auto response_params =
+            GetResponseParamsFromTrailingMetadata(client_context);
+        ASSERT_TRUE(response_params.has_value());
+        EXPECT_EQ(response_params->cluster_id(), "the-cluster");
+        EXPECT_EQ(response_params->zone_id(), "the-zone");
+      });
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce(
+          [](opentelemetry::context::Context const&, OnDoneParams const& p) {
+            EXPECT_THAT(p.operation_status, StatusIs(StatusCode::kInternal));
+          });
+
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({mock_metric}, clock));
+#else
+  auto operation_context = std::make_shared<OperationContext>();
+#endif
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, ReadRows)
+      .WillOnce([this](auto context, auto const&,
+                       google::bigtable::v2::ReadRowsRequest const& request,
+                       auto const&) {
+        EXPECT_THAT(request, HasCorrectResourceNames());
+        auto stream = std::make_unique<MockReadRowsStream>();
+        ::testing::InSequence s;
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([](google::bigtable::v2::ReadRowsResponse* r) {
+              *r = MalformedResponse();
+              return std::nullopt;
+            });
+        EXPECT_CALL(*stream, Cancel);
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([this, context](google::bigtable::v2::ReadRowsResponse*) {
+              RpcMetadata server_metadata;
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+              google::bigtable::v2::ResponseParams response_params;
+              response_params.set_cluster_id("the-cluster");
+              response_params.set_zone_id("the-zone");
+              server_metadata.trailers.emplace(
+                  "x-goog-ext-425905942-bin",
+                  response_params.SerializeAsString());
+#endif
+              metadata_fixture_.SetServerMetadata(*context, server_metadata);
+              return Status{};
+            });
+        return stream;
+      });
+
+  auto impl = std::make_shared<DefaultRowReader>(
+      mock, kAppProfile, kTableName, bigtable::RowSet(),
+      bigtable::RowReader::NO_ROWS_LIMIT, bigtable::Filter::PassAllFilter(),
+      false, retry_.clone(), backoff_.clone(), false,
+      std::move(operation_context));
+  auto reader = bigtable_internal::MakeRowReader(std::move(impl));
+  EXPECT_THAT(StatusOrRowKeys(reader),
+              ElementsAre(StatusIs(StatusCode::kInternal)));
+}
+
+TEST_F(DefaultRowReaderTest,
+       FailedParseRetryForwardsTrailingCookiesFromDrainedStream) {
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, ReadRows)
+      .WillOnce([this](auto context, auto const&,
+                       google::bigtable::v2::ReadRowsRequest const& request,
+                       auto const&) {
+        EXPECT_THAT(request, HasCorrectResourceNames());
+        auto stream = std::make_unique<MockReadRowsStream>();
+        ::testing::InSequence s;
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([](google::bigtable::v2::ReadRowsResponse* r) {
+              *r = MalformedResponse();
+              return std::nullopt;
+            });
+        EXPECT_CALL(*stream, Cancel);
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([this, context](google::bigtable::v2::ReadRowsResponse*) {
+              metadata_fixture_.SetServerMetadata(
+                  *context,
+                  {{}, {{"x-goog-cbt-cookie-routing", "parse-retry-cookie"}}});
+              return Status{};
+            });
+        return stream;
+      })
+      .WillOnce([this](auto context, auto const&,
+                       google::bigtable::v2::ReadRowsRequest const& request,
+                       auto const&) {
+        EXPECT_THAT(request, HasCorrectResourceNames());
+        auto headers = metadata_fixture_.GetMetadata(*context);
+        EXPECT_THAT(headers, Contains(Pair("x-goog-cbt-cookie-routing",
+                                           "parse-retry-cookie")));
+        auto stream = std::make_unique<MockReadRowsStream>();
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([](google::bigtable::v2::ReadRowsResponse* r) {
+              *r = MakeRow("r1");
+              return std::nullopt;
+            })
+            .WillOnce(Return(Status{}));
+        return stream;
+      });
+
+  auto retry = std::make_unique<MockDataRetryPolicy>();
+  EXPECT_CALL(*retry, OnFailure).WillOnce(Return(true));
+
+  auto impl = std::make_shared<DefaultRowReader>(
+      mock, kAppProfile, kTableName, bigtable::RowSet(),
+      bigtable::RowReader::NO_ROWS_LIMIT, bigtable::Filter::PassAllFilter(),
+      false, std::move(retry), backoff_.clone(), false,
+      std::make_shared<OperationContext>());
+  auto reader = bigtable_internal::MakeRowReader(std::move(impl));
+  EXPECT_THAT(StatusOrRowKeys(reader), ElementsAre(IsOkAndHolds("r1")));
+}
+
+TEST_F(DefaultRowReaderTest, FailedParseAtEndOfStreamReportsInternalToOnDone) {
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_shared<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(1);
+  EXPECT_CALL(*mock_metric, ElementRequest).Times(0);
+  EXPECT_CALL(*mock_metric, ElementDelivery).Times(0);
+  EXPECT_CALL(*mock_metric, PostCall)
+      .WillOnce(
+          [](opentelemetry::context::Context const&, grpc::ClientContext const&,
+             PostCallParams const& p) { EXPECT_STATUS_OK(p.attempt_status); });
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce([](opentelemetry::context::Context const&,
+                   OnDoneParams const& p) {
+        EXPECT_THAT(p.operation_status,
+                    StatusIs(StatusCode::kInternal,
+                             HasSubstr("end of stream with unfinished row")));
+      });
+
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({mock_metric}, clock));
+#else
+  auto operation_context = std::make_shared<OperationContext>();
+#endif
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, ReadRows)
+      .WillOnce([](auto, auto const&,
+                   google::bigtable::v2::ReadRowsRequest const& request,
+                   auto const&) {
+        EXPECT_THAT(request, HasCorrectResourceNames());
+        auto stream = std::make_unique<MockReadRowsStream>();
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([](google::bigtable::v2::ReadRowsResponse* r) {
+              google::bigtable::v2::ReadRowsResponse resp;
+              auto& chunk = *resp.add_chunks();
+              *chunk.mutable_row_key() = "r1";
+              chunk.mutable_family_name()->set_value("cf");
+              chunk.mutable_qualifier()->set_value("cq");
+              chunk.set_commit_row(false);
+              *r = std::move(resp);
+              return std::nullopt;
+            })
+            .WillOnce(Return(Status{}));
+        return stream;
+      });
+
+  internal::OptionsSpan span(TestOptions(/*expected_streams=*/1));
+
+  auto impl = std::make_shared<DefaultRowReader>(
+      mock, kAppProfile, kTableName, bigtable::RowSet(),
+      bigtable::RowReader::NO_ROWS_LIMIT, bigtable::Filter::PassAllFilter(),
+      false, retry_.clone(), backoff_.clone(), false,
+      std::move(operation_context));
+  auto reader = bigtable_internal::MakeRowReader(std::move(impl));
+  EXPECT_THAT(
+      StatusOrRowKeys(reader),
+      ElementsAre(StatusIs(StatusCode::kInternal,
+                           HasSubstr("end of stream with unfinished row"))));
+}
+
+TEST_F(DefaultRowReaderTest, PostLimitErrorReportsOkToOnDone) {
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_shared<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(1);
+  EXPECT_CALL(*mock_metric, ElementRequest).Times(1);
+  EXPECT_CALL(*mock_metric, ElementDelivery).Times(1);
+  EXPECT_CALL(*mock_metric, PostCall)
+      .WillOnce([](opentelemetry::context::Context const&,
+                   grpc::ClientContext const&, PostCallParams const& p) {
+        EXPECT_THAT(p.attempt_status, StatusIs(StatusCode::kUnavailable));
+      });
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce(
+          [](opentelemetry::context::Context const&, OnDoneParams const& p) {
+            EXPECT_STATUS_OK(p.operation_status);
+          });
+
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({mock_metric}, clock));
+#else
+  auto operation_context = std::make_shared<OperationContext>();
+#endif
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, ReadRows)
+      .WillOnce([](auto, auto const&,
+                   google::bigtable::v2::ReadRowsRequest const& request,
+                   auto const&) {
+        EXPECT_THAT(request, HasCorrectResourceNames());
+        EXPECT_THAT(request, RequestWithRowsLimit(1));
+        auto stream = std::make_unique<MockReadRowsStream>();
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([](google::bigtable::v2::ReadRowsResponse* r) {
+              *r = MakeRow("r1");
+              return std::nullopt;
+            })
+            .WillOnce(Return(Status(StatusCode::kUnavailable, "try again")));
+        return stream;
+      });
+
+  internal::OptionsSpan span(TestOptions(/*expected_streams=*/1));
+
+  auto impl = std::make_shared<DefaultRowReader>(
+      mock, kAppProfile, kTableName, bigtable::RowSet(), 1,
+      bigtable::Filter::PassAllFilter(), false, retry_.clone(),
+      backoff_.clone(), false, std::move(operation_context));
+  auto reader = bigtable_internal::MakeRowReader(std::move(impl));
+  EXPECT_THAT(StatusOrRowKeys(reader), ElementsAre(IsOkAndHolds("r1")));
 }
 
 }  // namespace
