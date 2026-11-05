@@ -1325,6 +1325,123 @@ TEST_F(DataConnectionTest, BulkApplyThrottling) {
   CheckFailedMutations(actual, expected);
 }
 
+TEST_F(DataConnectionTest,
+       BulkApplyRetriesConfirmedTransientEntriesOnNonRetryableStreamStatus) {
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_unique<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(2);
+  EXPECT_CALL(*mock_metric, PostCall).Times(2);
+  EXPECT_CALL(*mock_metric, OnDone).Times(1);
+  EXPECT_CALL(*mock_metric, ElementRequest).Times(0);
+  EXPECT_CALL(*mock_metric, ElementDelivery).Times(0);
+  auto fake_metric = std::make_shared<CloningMetric>(std::move(mock_metric));
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+  auto factory = std::make_unique<FakeOperationContextFactory>(
+      TableResourceLabels{}, TableDataLabels{}, fake_metric, clock);
+#else
+  auto factory = std::make_unique<SimpleOperationContextFactory>();
+#endif
+
+  std::vector<bigtable::FailedMutation> expected = {
+      {Status(StatusCode::kDeadlineExceeded, "stream deadline"), 2}};
+  bigtable::BulkMutation mut(IdempotentMutation("r0-ok"),
+                             IdempotentMutation("r1-transient"),
+                             IdempotentMutation("r2-unconfirmed"));
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, MutateRows)
+      .WillOnce(
+          [](auto, auto const&,
+             google::bigtable::v2::MutateRowsRequest const& request,
+             std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ(kAppProfile, request.app_profile_id());
+            EXPECT_EQ(kTableName, request.table_name());
+            EXPECT_THAT(request.entries(),
+                        ElementsAre(Entry("r0-ok"), Entry("r1-transient"),
+                                    Entry("r2-unconfirmed")));
+            auto stream = std::make_unique<MockMutateRowsStream>();
+            EXPECT_CALL(*stream, Read)
+                .WillOnce([](google::bigtable::v2::MutateRowsResponse* r) {
+                  *r = MakeBulkApplyResponse(
+                      {{0, grpc::StatusCode::OK},
+                       {1, grpc::StatusCode::UNAVAILABLE}});
+                  return std::nullopt;
+                })
+                .WillOnce(Return(
+                    Status(StatusCode::kDeadlineExceeded, "stream deadline")));
+            return stream;
+          })
+      .WillOnce(
+          [](auto, auto const&,
+             google::bigtable::v2::MutateRowsRequest const& request,
+             std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ(kAppProfile, request.app_profile_id());
+            EXPECT_EQ(kTableName, request.table_name());
+            EXPECT_THAT(request.entries(), ElementsAre(Entry("r1-transient")));
+            auto stream = std::make_unique<MockMutateRowsStream>();
+            EXPECT_CALL(*stream, Read)
+                .WillOnce([](google::bigtable::v2::MutateRowsResponse* r) {
+                  *r = MakeBulkApplyResponse({{0, grpc::StatusCode::OK}});
+                  return std::nullopt;
+                })
+                .WillOnce(Return(Status()));
+            return stream;
+          });
+
+  auto mock_b = std::make_unique<MockBackoffPolicy>();
+  EXPECT_CALL(*mock_b, clone).WillOnce([]() {
+    auto clone = std::make_unique<MockBackoffPolicy>();
+    EXPECT_CALL(*clone, OnCompletion).Times(1);
+    return clone;
+  });
+
+  auto conn = TestConnection(std::move(mock), std::move(factory));
+  internal::OptionsSpan span(
+      CallOptions().set<DataBackoffPolicyOption>(std::move(mock_b)));
+  auto actual = conn->BulkApply(kTableName, std::move(mut));
+  CheckFailedMutations(actual, expected);
+}
+
+TEST_F(DataConnectionTest,
+       BulkApplyRespectsRetryBudgetOnRepeatedNonRetryableStreamStatus) {
+  std::vector<bigtable::FailedMutation> expected = {
+      {Status(StatusCode::kAborted, "aborted"), 0}};
+  bigtable::BulkMutation mut(IdempotentMutation("r0"));
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, MutateRows)
+      .Times(kNumRetries + 1)
+      .WillRepeatedly(
+          [](auto, auto const&,
+             google::bigtable::v2::MutateRowsRequest const& request,
+             std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ(kAppProfile, request.app_profile_id());
+            EXPECT_EQ(kTableName, request.table_name());
+            EXPECT_THAT(request.entries(), ElementsAre(Entry("r0")));
+            auto stream = std::make_unique<MockMutateRowsStream>();
+            EXPECT_CALL(*stream, Read)
+                .WillOnce([](google::bigtable::v2::MutateRowsResponse* r) {
+                  *r = MakeBulkApplyResponse({{0, grpc::StatusCode::ABORTED}});
+                  return std::nullopt;
+                })
+                .WillOnce(Return(Status(StatusCode::kUnknown, "rst stream")));
+            return stream;
+          });
+
+  auto mock_b = std::make_unique<MockBackoffPolicy>();
+  EXPECT_CALL(*mock_b, clone).WillOnce([]() {
+    auto clone = std::make_unique<MockBackoffPolicy>();
+    EXPECT_CALL(*clone, OnCompletion).Times(kNumRetries);
+    return clone;
+  });
+
+  auto conn = TestConnection(std::move(mock));
+  internal::OptionsSpan span(
+      CallOptions().set<DataBackoffPolicyOption>(std::move(mock_b)));
+  auto actual = conn->BulkApply(kTableName, std::move(mut));
+  CheckFailedMutations(actual, expected);
+}
+
 // The `AsyncBulkApplier` is tested extensively in `async_bulk_apply_test.cc`.
 // In this test, we just verify that the configuration is passed along.
 TEST_F(DataConnectionTest, AsyncBulkApply) {

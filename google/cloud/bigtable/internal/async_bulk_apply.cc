@@ -14,9 +14,11 @@
 
 #include "google/cloud/bigtable/internal/async_bulk_apply.h"
 #include "google/cloud/bigtable/internal/async_streaming_read.h"
+#include "google/cloud/bigtable/internal/retry_traits.h"
 #include "google/cloud/grpc_options.h"
 #include "google/cloud/internal/grpc_opentelemetry.h"
 #include "google/cloud/internal/retry_loop_helpers.h"
+#include "google/cloud/status.h"
 
 namespace google {
 namespace cloud {
@@ -99,16 +101,23 @@ void AsyncBulkApplier::OnRead(
 
 void AsyncBulkApplier::OnFinish(Status const& status) {
   operation_context_->PostCall(*client_context_, status);
-  state_.OnFinish(status);
+  state_.OnFinish(status, enable_server_retries_);
 
-  if (!state_.HasPendingMutations()) {
+  if (!state_.HasPendingMutations() || !keep_reading_.load()) {
     SetPromise();
     operation_context_->OnDone(status);
     return;
   }
-  auto delay = internal::Backoff(status, "AsyncBulkApply", *retry_policy_,
-                                 *backoff_policy_, Idempotency::kIdempotent,
-                                 enable_server_retries_);
+  bool const server_retryable =
+      enable_server_retries_ &&
+      google::cloud::internal::GetRetryInfo(status).has_value();
+  auto const backoff_status =
+      (!server_retryable && SafeGrpcRetry::IsPermanentFailure(status))
+          ? Status(StatusCode::kUnavailable, status.message())
+          : status;
+  auto delay = internal::Backoff(
+      backoff_status, "AsyncBulkApply", *retry_policy_, *backoff_policy_,
+      Idempotency::kIdempotent, enable_server_retries_);
   if (!delay) {
     SetPromise();
     operation_context_->OnDone(status);
