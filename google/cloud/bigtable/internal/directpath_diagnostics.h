@@ -28,7 +28,11 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
+#ifndef _WIN32
+#include <ifaddrs.h>
+#endif
 
 namespace google {
 namespace cloud {
@@ -70,11 +74,45 @@ constexpr char const* DefaultDirectPathMetadataHost() {
   return "169.254.169.254";
 }
 constexpr std::uint16_t DefaultDirectPathMetadataPort() { return 80; }
+constexpr std::chrono::milliseconds DefaultDirectPathMetadataTimeout() {
+  return std::chrono::seconds(2);
+}
+
+#ifndef _WIN32
+/// For testing only.
+DiagnosticFailureReason EvaluateLoopbackIfaddrs(struct ifaddrs const* ifaddr);
+#endif
 
 std::shared_ptr<DirectPathNetworkSystem> MakeDefaultDirectPathNetworkSystem();
 
 class DirectPathDiagnostics {
  public:
+  class CancelState;
+
+  /**
+   * Owns a background diagnostic run started off the `CompletionQueue` thread
+   * and interrupts/joins it on destruction so connection teardown never blocks
+   * waiting for TCP timeouts.
+   */
+  class AsyncTask {
+   public:
+    AsyncTask() = default;
+    AsyncTask(std::shared_ptr<CancelState> cancel_state, std::thread worker);
+    ~AsyncTask();
+
+    AsyncTask(AsyncTask const&) = delete;
+    AsyncTask& operator=(AsyncTask const&) = delete;
+    AsyncTask(AsyncTask&&) noexcept = default;
+    AsyncTask& operator=(AsyncTask&& other) noexcept;
+
+    void CancelAndJoin();
+    void Wait();
+
+   private:
+    std::shared_ptr<CancelState> cancel_state_;
+    std::thread worker_;
+  };
+
   static DiagnosticFailureReason RunDiagnostics(Options const& options);
 
   /// For testing only.
@@ -85,14 +123,26 @@ class DirectPathDiagnostics {
       std::string const& metadata_host, std::uint16_t metadata_port);
 
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
-  static void RunAsync(CompletionQueue cq, Options const& options);
+  static std::unique_ptr<AsyncTask> StartAsync(
+      Options const& options,
+      std::weak_ptr<DirectAccessCompatibility> direct_access_compatibility);
 
-  static void RunAsync(
+  /// For testing only.
+  static std::unique_ptr<AsyncTask> StartAsync(
+      Options const& options,
+      std::weak_ptr<DirectAccessCompatibility> direct_access_compatibility,
+      std::shared_ptr<internal::GcpDetector> detector,
+      std::shared_ptr<DirectPathNetworkSystem> network_system,
+      std::string const& metadata_host, std::uint16_t metadata_port);
+
+  static future<void> RunAsync(CompletionQueue cq, Options const& options);
+
+  static future<void> RunAsync(
       CompletionQueue cq, Options const& options,
       std::shared_ptr<DirectAccessCompatibility> direct_access_compatibility);
 
   /// For testing only.
-  static void RunAsync(
+  static future<void> RunAsync(
       CompletionQueue cq, Options const& options,
       std::shared_ptr<DirectAccessCompatibility> direct_access_compatibility,
       std::shared_ptr<internal::GcpDetector> detector,

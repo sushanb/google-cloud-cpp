@@ -20,11 +20,15 @@
 #include "google/cloud/common_options.h"
 #include "google/cloud/credentials.h"
 #include "google/cloud/grpc_options.h"
+#include "google/cloud/internal/background_threads_impl.h"
 #include "google/cloud/testing_util/opentelemetry_matchers.h"
 #include "google/cloud/testing_util/scoped_environment.h"
 #include "rpc_retry_policy.h"
 #include <gmock/gmock.h>
 #include <chrono>
+#include <future>
+#include <memory>
+#include <optional>
 
 namespace google {
 namespace cloud {
@@ -172,6 +176,76 @@ TEST(MakeDataConnection, DirectPathInitializationModeSpeculative) {
                             experimental::DirectPathInitializationMode::
                                 kAsynchronousSpeculative));
   EXPECT_NE(conn, nullptr);
+}
+
+void VerifyDirectPathFallbackDoesNotBlockCqOrTeardown(
+    experimental::DirectPathInitializationMode mode) {
+  testing_util::ScopedEnvironment collector_env(
+      "GOOGLE_CLOUD_CPP_TESTING_OTEL_COLLECTOR", "1");
+  // Point GCE_METADATA_HOST at a non-routable RFC 5737 TEST-NET-1 endpoint so
+  // that on GCE hosts where IsGoogleCloudBios() is true, fallback diagnostics
+  // exercises an unreachable metadata TCP connect attempt.
+  testing_util::ScopedEnvironment metadata_env("GCE_METADATA_HOST",
+                                               "192.0.2.1:80");
+
+  auto captured_cq = std::make_shared<std::optional<CompletionQueue>>();
+  BackgroundThreadsFactory single_thread_factory =
+      [captured_cq]() -> std::unique_ptr<BackgroundThreads> {
+    auto bg = std::make_unique<
+        google::cloud::internal::AutomaticallyCreatedBackgroundThreads>(1);
+    if (!captured_cq->has_value()) {
+      *captured_cq = bg->cq();
+    }
+    return bg;
+  };
+
+  InstanceResource instance_a{Project("my-project"), "instance-a"};
+  auto conn = MakeDataConnection(
+      {instance_a},
+      TestOptions()
+          .set<EnableMetricsOption>(true)
+          .set<GrpcBackgroundThreadsFactoryOption>(
+              std::move(single_thread_factory))
+          .set<experimental::DirectPathModeOption>(
+              experimental::DirectPathMode::kEnabled)
+          .set<experimental::DirectPathInitializationModeOption>(mode)
+          .set<experimental::DirectPathProbeTimeoutOption>(ms(50))
+          .set<experimental::DirectPathDiagnosticsTimeoutOption>(
+              std::chrono::seconds(30)));
+  ASSERT_NE(conn, nullptr);
+  ASSERT_TRUE(captured_cq->has_value());
+
+  // Verify the single-thread background CompletionQueue remains responsive to
+  // async callbacks and timers immediately after fallback.
+  std::promise<void> cq_work_promise;
+  auto cq_work_future = cq_work_promise.get_future();
+  captured_cq->value().RunAsync(
+      [&cq_work_promise] { cq_work_promise.set_value(); });
+  auto timer_future = captured_cq->value().MakeRelativeTimer(ms(5));
+
+  EXPECT_EQ(cq_work_future.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  EXPECT_EQ(timer_future.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+
+  captured_cq->reset();
+  auto const teardown_start = std::chrono::steady_clock::now();
+  conn.reset();
+  auto const teardown_elapsed =
+      std::chrono::steady_clock::now() - teardown_start;
+  EXPECT_LT(teardown_elapsed, std::chrono::seconds(5));
+}
+
+TEST(MakeDataConnection,
+     DirectPathFallbackDoesNotBlockSingleThreadCqOrTeardownBlocking) {
+  VerifyDirectPathFallbackDoesNotBlockCqOrTeardown(
+      experimental::DirectPathInitializationMode::kBlocking);
+}
+
+TEST(MakeDataConnection,
+     DirectPathFallbackDoesNotBlockSingleThreadCqOrTeardownSpeculative) {
+  VerifyDirectPathFallbackDoesNotBlockCqOrTeardown(
+      experimental::DirectPathInitializationMode::kAsynchronousSpeculative);
 }
 #endif
 
