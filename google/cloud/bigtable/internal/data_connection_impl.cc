@@ -338,25 +338,32 @@ std::vector<bigtable::FailedMutation> DataConnectionImpl::BulkApply(
   BulkMutator mutator(app_profile_id(*current), table_name,
                       *idempotency_policy(*current), std::move(mut),
                       operation_context);
-  // We wait to allocate the policies until they are needed as a
-  // micro-optimization.
-  std::unique_ptr<bigtable::DataRetryPolicy> retry;
-  std::unique_ptr<BackoffPolicy> backoff;
+  auto retry = retry_policy(*current);
+  auto backoff = backoff_policy(*current);
   Status status;
   auto stub = stub_manager_->GetStub(InstanceNameFromTableName(table_name));
   while (true) {
     status = mutator.MakeOneRequest(*stub, *limiter_, *current);
     if (!mutator.HasPendingMutations()) break;
-    if (!retry) retry = retry_policy(*current);
-    if (!backoff) backoff = backoff_policy(*current);
     auto delay = internal::Backoff(status, "BulkApply", *retry, *backoff,
                                    Idempotency::kIdempotent,
                                    enable_server_retries(*current));
     if (!delay) break;
     std::this_thread::sleep_for(*delay);
   }
-  operation_context->OnDone(status);
-  return std::move(mutator).OnRetryDone();
+  bool const has_pending = mutator.HasPendingMutations();
+  auto failures = std::move(mutator).OnRetryDone();
+  if (has_pending) {
+    operation_context->OnDone(
+        !status.ok() ? status
+                     : (!failures.empty()
+                            ? failures.front().status()
+                            : Status(StatusCode::kDeadlineExceeded,
+                                     "Retry policy exhausted in BulkApply")));
+  } else {
+    operation_context->OnDone(status);
+  }
+  return failures;
 }
 
 future<std::vector<bigtable::FailedMutation>>
@@ -528,8 +535,8 @@ StatusOr<std::vector<bigtable::RowKeySample>> DataConnectionImpl::SampleRows(
   request.set_table_name(table_name);
 
   std::vector<bigtable::RowKeySample> samples;
-  std::unique_ptr<bigtable::DataRetryPolicy> retry;
-  std::unique_ptr<BackoffPolicy> backoff;
+  auto retry = retry_policy(*current);
+  auto backoff = backoff_policy(*current);
   auto operation_context = operation_context_factory_->SampleRowKeys(
       table_name, app_profile_id(*current));
   auto stub = stub_manager_->GetStub(InstanceNameFromTableName(table_name));
@@ -554,10 +561,6 @@ StatusOr<std::vector<bigtable::RowKeySample>> DataConnectionImpl::SampleRows(
     }
     operation_context->PostCall(*context, *status);
     if (status->ok()) break;
-    // We wait to allocate the policies until they are needed as a
-    // micro-optimization.
-    if (!retry) retry = retry_policy(*current);
-    if (!backoff) backoff = backoff_policy(*current);
     auto delay = internal::Backoff(*status, "SampleRows", *retry, *backoff,
                                    Idempotency::kIdempotent,
                                    enable_server_retries(*current));

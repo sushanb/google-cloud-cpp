@@ -48,8 +48,10 @@ using ::google::cloud::bigtable::testing::MockBigtableStub;
 using ::google::cloud::bigtable::testing::MockMutateRowsLimiter;
 using ::google::cloud::testing_util::MockBackoffPolicy;
 using ::google::cloud::testing_util::MockCompletionQueueImpl;
+using ::google::cloud::testing_util::StatusIs;
 using ::testing::ByMove;
 using ::testing::Contains;
+using ::testing::ElementsAre;
 using ::testing::ElementsAreArray;
 using ::testing::Matcher;
 using ::testing::MockFunction;
@@ -622,6 +624,26 @@ TEST_F(AsyncBulkApplyTest, TimerError) {
   std::vector<bigtable::FailedMutation> expected = {{TransientError(), 0}};
   bigtable::BulkMutation mut(IdempotentMutation("r0"));
 
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_shared<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(1);
+  EXPECT_CALL(*mock_metric, PostCall).Times(1);
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce(
+          [](opentelemetry::context::Context const&, OnDoneParams const& p) {
+            EXPECT_THAT(p.operation_status,
+                        StatusIs(StatusCode::kDeadlineExceeded));
+          });
+
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({mock_metric}, clock));
+#else
+  auto operation_context = std::make_shared<OperationContext>();
+#endif
+
   auto mock = std::make_shared<MockBigtableStub>();
   EXPECT_CALL(*mock, AsyncMutateRows)
       .WillOnce([this](CompletionQueue const&, auto context, auto,
@@ -660,8 +682,79 @@ TEST_F(AsyncBulkApplyTest, TimerError) {
   auto actual = AsyncBulkApplier::Create(
       cq, mock, std::make_shared<NoopMutateRowsLimiter>(), std::move(retry),
       std::move(mock_b), false, *idempotency, kAppProfile, kTableName,
-      std::move(mut), std::make_shared<OperationContext>());
+      std::move(mut), std::move(operation_context));
 
+  CheckFailedMutations(actual.get(), expected);
+}
+
+TEST_F(AsyncBulkApplyTest, BackoffCancelledCallsOnDone) {
+  std::vector<bigtable::FailedMutation> expected = {{TransientError(), 1}};
+  bigtable::BulkMutation mut(IdempotentMutation("r0"),
+                             IdempotentMutation("r1"));
+
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_shared<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(1);
+  EXPECT_CALL(*mock_metric, PostCall).Times(1);
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce(
+          [](opentelemetry::context::Context const&, OnDoneParams const& p) {
+            EXPECT_THAT(p.operation_status, StatusIs(StatusCode::kCancelled));
+          });
+
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({mock_metric}, clock));
+#else
+  auto operation_context = std::make_shared<OperationContext>();
+#endif
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, AsyncMutateRows)
+      .WillOnce([this](CompletionQueue const&, auto context, auto,
+                       v2::MutateRowsRequest const& request, auto const&) {
+        metadata_fixture_.SetServerMetadata(*context, {});
+        EXPECT_THAT(request.entries(),
+                    ElementsAre(MatchEntry("r0"), MatchEntry("r1")));
+        auto stream = std::make_unique<MockAsyncMutateRowsStream>();
+        EXPECT_CALL(*stream, Start).WillOnce([] {
+          return make_ready_future(true);
+        });
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([] {
+              return make_ready_future(
+                  MakeResponse({{0, grpc::StatusCode::OK},
+                                {1, grpc::StatusCode::UNAVAILABLE}}));
+            })
+            .WillOnce([] {
+              return make_ready_future(std::optional<v2::MutateRowsResponse>{});
+            });
+        EXPECT_CALL(*stream, Finish).WillOnce([] {
+          return make_ready_future(Status{});
+        });
+        return stream;
+      });
+
+  promise<StatusOr<std::chrono::system_clock::time_point>> timer_promise;
+  auto mock_cq = std::make_shared<MockCompletionQueueImpl>();
+  EXPECT_CALL(*mock_cq, MakeRelativeTimer).WillOnce([&timer_promise] {
+    return timer_promise.get_future();
+  });
+  CompletionQueue cq(mock_cq);
+
+  auto retry = DataLimitedErrorCountRetryPolicy(kNumRetries).clone();
+  auto mock_b = std::make_unique<MockBackoffPolicy>();
+  EXPECT_CALL(*mock_b, OnCompletion).Times(1);
+  auto idempotency = bigtable::DefaultIdempotentMutationPolicy();
+
+  auto actual = AsyncBulkApplier::Create(
+      cq, mock, std::make_shared<NoopMutateRowsLimiter>(), std::move(retry),
+      std::move(mock_b), false, *idempotency, kAppProfile, kTableName,
+      std::move(mut), std::move(operation_context));
+
+  timer_promise.set_value(Status(StatusCode::kCancelled, "timer cancelled"));
   CheckFailedMutations(actual.get(), expected);
 }
 
@@ -934,6 +1027,258 @@ TEST_F(AsyncBulkApplyTest, RetriesOkStreamWithFailedMutations) {
       cq, mock, std::make_shared<NoopMutateRowsLimiter>(), std::move(retry),
       std::move(mock_b), false, *idempotency, kAppProfile, kTableName,
       std::move(mut), std::make_shared<OperationContext>());
+
+  CheckFailedMutations(actual.get(), expected);
+}
+
+TEST_F(AsyncBulkApplyTest, RetriesOkStreamWithFailedMutationsOnDoneFailure) {
+  std::vector<bigtable::FailedMutation> expected = {{TransientError(), 1}};
+  bigtable::BulkMutation mut(IdempotentMutation("r0"),
+                             IdempotentMutation("r1"));
+
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_shared<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(kNumRetries + 1);
+  EXPECT_CALL(*mock_metric, PostCall).Times(kNumRetries + 1);
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce(
+          [](opentelemetry::context::Context const&, OnDoneParams const& p) {
+            EXPECT_THAT(p.operation_status, StatusIs(StatusCode::kUnavailable));
+          });
+
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({mock_metric}, clock));
+#else
+  auto operation_context = std::make_shared<OperationContext>();
+#endif
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, AsyncMutateRows)
+      .Times(kNumRetries + 1)
+      .WillOnce([this](CompletionQueue const&, auto context, auto,
+                       v2::MutateRowsRequest const& request, auto const&) {
+        metadata_fixture_.SetServerMetadata(*context, {});
+        EXPECT_THAT(request.entries(),
+                    ElementsAre(MatchEntry("r0"), MatchEntry("r1")));
+        auto stream = std::make_unique<MockAsyncMutateRowsStream>();
+        EXPECT_CALL(*stream, Start).WillOnce([] {
+          return make_ready_future(true);
+        });
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([] {
+              return make_ready_future(
+                  MakeResponse({{0, grpc::StatusCode::OK},
+                                {1, grpc::StatusCode::UNAVAILABLE}}));
+            })
+            .WillOnce([] {
+              return make_ready_future(std::optional<v2::MutateRowsResponse>{});
+            });
+        EXPECT_CALL(*stream, Finish).WillOnce([] {
+          return make_ready_future(Status());
+        });
+        return stream;
+      })
+      .WillRepeatedly([this](CompletionQueue const&, auto context, auto,
+                             v2::MutateRowsRequest const& request,
+                             auto const&) {
+        metadata_fixture_.SetServerMetadata(*context, {});
+        EXPECT_THAT(request.entries(), ElementsAre(MatchEntry("r1")));
+        auto stream = std::make_unique<MockAsyncMutateRowsStream>();
+        EXPECT_CALL(*stream, Start).WillOnce([] {
+          return make_ready_future(true);
+        });
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([] {
+              return make_ready_future(
+                  MakeResponse({{0, grpc::StatusCode::UNAVAILABLE}}));
+            })
+            .WillOnce([] {
+              return make_ready_future(std::optional<v2::MutateRowsResponse>{});
+            });
+        EXPECT_CALL(*stream, Finish).WillOnce([] {
+          return make_ready_future(Status());
+        });
+        return stream;
+      });
+
+  auto mock_cq = std::make_shared<MockCompletionQueueImpl>();
+  EXPECT_CALL(*mock_cq, MakeRelativeTimer)
+      .Times(kNumRetries)
+      .WillRepeatedly([] {
+        return make_ready_future(
+            make_status_or(std::chrono::system_clock::now()));
+      });
+  CompletionQueue cq(mock_cq);
+
+  auto retry = DataLimitedErrorCountRetryPolicy(kNumRetries).clone();
+  auto mock_b = std::make_unique<MockBackoffPolicy>();
+  EXPECT_CALL(*mock_b, OnCompletion).Times(kNumRetries);
+  auto idempotency = bigtable::DefaultIdempotentMutationPolicy();
+
+  auto actual = AsyncBulkApplier::Create(
+      cq, mock, std::make_shared<NoopMutateRowsLimiter>(), std::move(retry),
+      std::move(mock_b), false, *idempotency, kAppProfile, kTableName,
+      std::move(mut), std::move(operation_context));
+
+  CheckFailedMutations(actual.get(), expected);
+}
+
+TEST_F(AsyncBulkApplyTest, IncompleteOkStreamRetryExhaustedOnDoneFailure) {
+  std::vector<bigtable::FailedMutation> expected = {
+      {Status(StatusCode::kInternal, "unconfirmed"), 1}};
+  bigtable::BulkMutation mut(IdempotentMutation("r0"),
+                             IdempotentMutation("r1"));
+
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_shared<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(kNumRetries + 1);
+  EXPECT_CALL(*mock_metric, PostCall).Times(kNumRetries + 1);
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce(
+          [](opentelemetry::context::Context const&, OnDoneParams const& p) {
+            EXPECT_THAT(p.operation_status, StatusIs(StatusCode::kInternal));
+          });
+
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({mock_metric}, clock));
+#else
+  auto operation_context = std::make_shared<OperationContext>();
+#endif
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, AsyncMutateRows)
+      .Times(kNumRetries + 1)
+      .WillOnce([this](CompletionQueue const&, auto context, auto,
+                       v2::MutateRowsRequest const& request, auto const&) {
+        metadata_fixture_.SetServerMetadata(*context, {});
+        EXPECT_THAT(request.entries(),
+                    ElementsAre(MatchEntry("r0"), MatchEntry("r1")));
+        auto stream = std::make_unique<MockAsyncMutateRowsStream>();
+        EXPECT_CALL(*stream, Start).WillOnce([] {
+          return make_ready_future(true);
+        });
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([] {
+              return make_ready_future(
+                  MakeResponse({{0, grpc::StatusCode::OK}}));
+            })
+            .WillOnce([] {
+              return make_ready_future(std::optional<v2::MutateRowsResponse>{});
+            });
+        EXPECT_CALL(*stream, Finish).WillOnce([] {
+          return make_ready_future(Status());
+        });
+        return stream;
+      })
+      .WillRepeatedly([this](CompletionQueue const&, auto context, auto,
+                             v2::MutateRowsRequest const& request,
+                             auto const&) {
+        metadata_fixture_.SetServerMetadata(*context, {});
+        EXPECT_THAT(request.entries(), ElementsAre(MatchEntry("r1")));
+        auto stream = std::make_unique<MockAsyncMutateRowsStream>();
+        EXPECT_CALL(*stream, Start).WillOnce([] {
+          return make_ready_future(true);
+        });
+        EXPECT_CALL(*stream, Read).WillOnce([] {
+          return make_ready_future(std::optional<v2::MutateRowsResponse>{});
+        });
+        EXPECT_CALL(*stream, Finish).WillOnce([] {
+          return make_ready_future(Status());
+        });
+        return stream;
+      });
+
+  auto mock_cq = std::make_shared<MockCompletionQueueImpl>();
+  EXPECT_CALL(*mock_cq, MakeRelativeTimer)
+      .Times(kNumRetries)
+      .WillRepeatedly([] {
+        return make_ready_future(
+            make_status_or(std::chrono::system_clock::now()));
+      });
+  CompletionQueue cq(mock_cq);
+
+  auto retry = DataLimitedErrorCountRetryPolicy(kNumRetries).clone();
+  auto mock_b = std::make_unique<MockBackoffPolicy>();
+  EXPECT_CALL(*mock_b, OnCompletion).Times(kNumRetries);
+  auto idempotency = bigtable::DefaultIdempotentMutationPolicy();
+
+  auto actual = AsyncBulkApplier::Create(
+      cq, mock, std::make_shared<NoopMutateRowsLimiter>(), std::move(retry),
+      std::move(mock_b), false, *idempotency, kAppProfile, kTableName,
+      std::move(mut), std::move(operation_context));
+
+  CheckFailedMutations(actual.get(), expected);
+}
+
+TEST_F(AsyncBulkApplyTest, PermanentEntryFailureOnOkStreamOnDoneOk) {
+  std::vector<bigtable::FailedMutation> expected = {
+      {Status(StatusCode::kInvalidArgument, "bad mutation"), 1}};
+  bigtable::BulkMutation mut(IdempotentMutation("r0"),
+                             IdempotentMutation("r1"));
+
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_shared<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(1);
+  EXPECT_CALL(*mock_metric, PostCall).Times(1);
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce(
+          [](opentelemetry::context::Context const&, OnDoneParams const& p) {
+            EXPECT_STATUS_OK(p.operation_status);
+          });
+
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({mock_metric}, clock));
+#else
+  auto operation_context = std::make_shared<OperationContext>();
+#endif
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, AsyncMutateRows)
+      .WillOnce([this](CompletionQueue const&, auto context, auto,
+                       v2::MutateRowsRequest const& request, auto const&) {
+        metadata_fixture_.SetServerMetadata(*context, {});
+        EXPECT_THAT(request.entries(),
+                    ElementsAre(MatchEntry("r0"), MatchEntry("r1")));
+        auto stream = std::make_unique<MockAsyncMutateRowsStream>();
+        EXPECT_CALL(*stream, Start).WillOnce([] {
+          return make_ready_future(true);
+        });
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([] {
+              return make_ready_future(
+                  MakeResponse({{0, grpc::StatusCode::OK},
+                                {1, grpc::StatusCode::INVALID_ARGUMENT}}));
+            })
+            .WillOnce([] {
+              return make_ready_future(std::optional<v2::MutateRowsResponse>{});
+            });
+        EXPECT_CALL(*stream, Finish).WillOnce([] {
+          return make_ready_future(Status());
+        });
+        return stream;
+      });
+
+  auto mock_cq = std::make_shared<MockCompletionQueueImpl>();
+  CompletionQueue cq(mock_cq);
+
+  auto retry = DataLimitedErrorCountRetryPolicy(kNumRetries).clone();
+  auto mock_b = std::make_unique<MockBackoffPolicy>();
+  EXPECT_CALL(*mock_b, OnCompletion).Times(0);
+  auto idempotency = bigtable::DefaultIdempotentMutationPolicy();
+
+  auto actual = AsyncBulkApplier::Create(
+      cq, mock, std::make_shared<NoopMutateRowsLimiter>(), std::move(retry),
+      std::move(mock_b), false, *idempotency, kAppProfile, kTableName,
+      std::move(mut), std::move(operation_context));
 
   CheckFailedMutations(actual.get(), expected);
 }

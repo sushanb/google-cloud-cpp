@@ -17,6 +17,8 @@
 #include "google/cloud/grpc_options.h"
 #include "google/cloud/internal/grpc_opentelemetry.h"
 #include "google/cloud/internal/retry_loop_helpers.h"
+#include "google/cloud/status.h"
+#include <utility>
 
 namespace google {
 namespace cloud {
@@ -102,16 +104,23 @@ void AsyncBulkApplier::OnFinish(Status const& status) {
   state_.OnFinish(status);
 
   if (!state_.HasPendingMutations()) {
-    SetPromise();
     operation_context_->OnDone(status);
+    SetPromise();
     return;
   }
   auto delay = internal::Backoff(status, "AsyncBulkApply", *retry_policy_,
                                  *backoff_policy_, Idempotency::kIdempotent,
                                  enable_server_retries_);
   if (!delay) {
-    SetPromise();
-    operation_context_->OnDone(status);
+    auto failures = std::move(state_).OnRetryDone();
+    operation_context_->OnDone(
+        !status.ok()
+            ? status
+            : (!failures.empty()
+                   ? failures.front().status()
+                   : Status(StatusCode::kDeadlineExceeded,
+                            "Retry policy exhausted in AsyncBulkApply")));
+    promise_.set_value(std::move(failures));
     return;
   }
 
@@ -119,10 +128,12 @@ void AsyncBulkApplier::OnFinish(Status const& status) {
   auto self = this->shared_from_this();
   internal::TracedAsyncBackoff(cq_, *call_context_.options, *delay,
                                "Async Backoff")
-      .then([self](auto result) {
-        if (result.get()) {
+      .then([self](auto f) {
+        auto result = f.get();
+        if (result) {
           self->StartIteration();
         } else {
+          self->operation_context_->OnDone(result.status());
           self->SetPromise();
         }
       });
