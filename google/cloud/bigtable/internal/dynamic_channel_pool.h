@@ -25,10 +25,12 @@
 #include "google/cloud/completion_queue.h"
 #include "google/cloud/internal/random.h"
 #include "google/cloud/version.h"
+#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <vector>
 
 namespace google {
@@ -341,30 +343,19 @@ class DynamicChannelPool
                 });
   }
 
-  // Locks the mutex, reverse sorts draining_channels_, calling pop_back until
-  // either draining_channels_ is empty or a channel with outstanding_rpcs is
-  // encountered. Calls ScheduleRemoveChannels if draining_channels_ is
-  // non-empty.
+  // Locks the mutex and removes any channels in draining_channels_ that have
+  // no outstanding RPCs. Calls ScheduleRemoveChannels if draining_channels_
+  // remains non-empty.
   void RemoveChannels() {
     std::scoped_lock lk(mu_);
-    std::sort(draining_channels_.begin(), draining_channels_.end(),
-              [](std::shared_ptr<ChannelUsage<T>> const& a,
-                 std::shared_ptr<ChannelUsage<T>> const& b) {
-                auto rpcs_a = a->instant_outstanding_rpcs();
-                auto rpcs_b = b->instant_outstanding_rpcs();
-                if (!rpcs_a.ok()) return false;
-                if (!rpcs_b.ok()) return true;
-                return *rpcs_a > *rpcs_b;
-              });
-    while (!draining_channels_.empty()) {
-      auto outstanding_rpcs =
-          draining_channels_.back()->instant_outstanding_rpcs();
-      if (outstanding_rpcs.ok() && *outstanding_rpcs > 0) {
-        ScheduleRemoveChannels(lk);
-        return;
-      }
-
-      draining_channels_.pop_back();
+    draining_channels_.erase(
+        std::remove_if(draining_channels_.begin(), draining_channels_.end(),
+                       [](std::shared_ptr<ChannelUsage<T>> const& ch) {
+                         return ch->outstanding_rpcs() == 0;
+                       }),
+        draining_channels_.end());
+    if (!draining_channels_.empty()) {
+      ScheduleRemoveChannels(lk);
     }
   }
 
