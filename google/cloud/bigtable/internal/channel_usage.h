@@ -56,6 +56,11 @@ class ChannelUsage : public std::enable_shared_from_this<ChannelUsage<T>> {
     return outstanding_rpcs_;
   }
 
+  int outstanding_rpcs() const {
+    std::scoped_lock lk(mu_);
+    return outstanding_rpcs_;
+  }
+
   ChannelUsage& set_last_refresh_status(Status s) {
     std::scoped_lock lk(mu_);
     last_refresh_status_ = std::move(s);

@@ -20,6 +20,7 @@
 #include "google/cloud/testing_util/mock_completion_queue_impl.h"
 #include "google/cloud/testing_util/status_matchers.h"
 #include <gmock/gmock.h>
+#include <atomic>
 #include <thread>
 
 namespace google {
@@ -720,8 +721,179 @@ TEST_F(DynamicChannelPoolTest, RemoveChannelsSomeChannelsDrained) {
 
   wrapper.RemoveChannels();
   ASSERT_THAT(d.size(), Eq(2));
-  EXPECT_THAT(d[0]->instant_outstanding_rpcs(), testing_util::IsOkAndHolds(2));
-  EXPECT_THAT(d[1]->instant_outstanding_rpcs(), testing_util::IsOkAndHolds(1));
+  EXPECT_THAT(d[0]->instant_outstanding_rpcs(), testing_util::IsOkAndHolds(1));
+  EXPECT_THAT(d[1]->instant_outstanding_rpcs(), testing_util::IsOkAndHolds(2));
+
+  fake_cq_impl_->SimulateCompletion(false);
+}
+
+TEST_F(DynamicChannelPoolTest,
+       RemoveChannelsRetainsUnhealthyChannelsWithActiveRpcs) {
+  auto instance_name =
+      bigtable::InstanceResource(Project("my-project"), "my-instance")
+          .FullName();
+  auto refresh_state = std::make_shared<ConnectionRefreshState>(
+      fake_cq_impl_, std::chrono::milliseconds(1),
+      std::chrono::milliseconds(10));
+
+  std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> channels;
+  DynamicChannelPoolSizingPolicy sizing_policy;
+
+  MockFunction<StatusOr<std::shared_ptr<ChannelUsage<BigtableStub>>>(
+      std::uint32_t, std::string const&, StubManager::Priming)>
+      stub_factory_fn;
+
+  EXPECT_CALL(*mock_cq_impl_, MakeRelativeTimer)
+      .WillOnce([&](std::chrono::nanoseconds ns) {
+        EXPECT_THAT(ns.count(),
+                    Eq(std::chrono::nanoseconds(
+                           sizing_policy.pool_size_decrease_cooldown_interval)
+                           .count()));
+        return make_ready_future(StatusOr(std::chrono::system_clock::now()));
+      })
+      .WillOnce([&](std::chrono::nanoseconds ns) {
+        EXPECT_THAT(ns.count(),
+                    Eq(std::chrono::nanoseconds(
+                           sizing_policy.remove_channel_polling_interval)
+                           .count()));
+        return cq_.MakeRelativeTimer(std::chrono::seconds(600));
+      });
+
+  auto pool = DynamicChannelPool<BigtableStub>::Create(
+      instance_name, CompletionQueue(mock_cq_impl_), channels, refresh_state,
+      stub_factory_fn.AsStdFunction(), sizing_policy,
+      TransportType::kCloudPath);
+  DynamicChannelPoolTestWrapper wrapper(pool);
+
+  auto bad_active = std::make_shared<ChannelUsage<BigtableStub>>(
+      std::make_shared<MockBigtableStub>(), 1,
+      internal::InternalError("bad channel with active rpc"));
+  auto bad_idle = std::make_shared<ChannelUsage<BigtableStub>>(
+      std::make_shared<MockBigtableStub>(), 0,
+      internal::InternalError("bad idle channel"));
+  auto weak_active = bad_active->MakeWeak();
+  auto weak_idle = bad_idle->MakeWeak();
+
+  std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> draining_channels;
+  draining_channels.push_back(std::move(bad_active));
+  draining_channels.push_back(std::move(bad_idle));
+  auto const& d = wrapper.SetDrainingChannels(std::move(draining_channels));
+
+  wrapper.RemoveChannels();
+  EXPECT_THAT(weak_idle.lock(), Eq(nullptr));
+  ASSERT_THAT(d.size(), Eq(1));
+  auto active = weak_active.lock();
+  ASSERT_NE(active, nullptr);
+  EXPECT_THAT(active->outstanding_rpcs(), Eq(1));
+
+  active->ReleaseStub();
+  active.reset();
+
+  wrapper.RemoveChannels();
+  EXPECT_THAT(d, IsEmpty());
+  EXPECT_THAT(weak_active.lock(), Eq(nullptr));
+
+  fake_cq_impl_->SimulateCompletion(false);
+}
+
+TEST_F(DynamicChannelPoolTest, RemoveChannelsConcurrentRpcAndRefreshMutations) {
+  auto instance_name =
+      bigtable::InstanceResource(Project("my-project"), "my-instance")
+          .FullName();
+  auto refresh_state = std::make_shared<ConnectionRefreshState>(
+      fake_cq_impl_, std::chrono::milliseconds(1),
+      std::chrono::milliseconds(10));
+
+  std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> channels;
+  DynamicChannelPoolSizingPolicy sizing_policy;
+
+  MockFunction<StatusOr<std::shared_ptr<ChannelUsage<BigtableStub>>>(
+      std::uint32_t, std::string const&, StubManager::Priming)>
+      stub_factory_fn;
+
+  EXPECT_CALL(*mock_cq_impl_, MakeRelativeTimer)
+      .WillOnce([&](std::chrono::nanoseconds ns) {
+        EXPECT_THAT(ns.count(),
+                    Eq(std::chrono::nanoseconds(
+                           sizing_policy.pool_size_decrease_cooldown_interval)
+                           .count()));
+        return make_ready_future(StatusOr(std::chrono::system_clock::now()));
+      })
+      .WillOnce([&](std::chrono::nanoseconds ns) {
+        EXPECT_THAT(ns.count(),
+                    Eq(std::chrono::nanoseconds(
+                           sizing_policy.remove_channel_polling_interval)
+                           .count()));
+        return cq_.MakeRelativeTimer(std::chrono::seconds(600));
+      });
+
+  auto pool = DynamicChannelPool<BigtableStub>::Create(
+      instance_name, CompletionQueue(mock_cq_impl_), channels, refresh_state,
+      stub_factory_fn.AsStdFunction(), sizing_policy,
+      TransportType::kCloudPath);
+  DynamicChannelPoolTestWrapper wrapper(pool);
+
+  constexpr std::size_t kNumDrainingChannels = 12;
+  std::vector<std::shared_ptr<ChannelUsage<BigtableStub>>> worker_refs;
+  worker_refs.reserve(kNumDrainingChannels);
+  for (std::size_t i = 0; i < kNumDrainingChannels; ++i) {
+    // Pin 1 baseline RPC per channel during concurrent mutations.
+    worker_refs.push_back(std::make_shared<ChannelUsage<BigtableStub>>(
+        std::make_shared<MockBigtableStub>(), 1));
+  }
+  auto const& d = wrapper.SetDrainingChannels(worker_refs);
+
+  std::atomic<bool> stop{false};
+  std::thread rpc_mutator([&] {
+    while (!stop.load(std::memory_order_relaxed)) {
+      for (auto const& ch : worker_refs) {
+        (void)ch->AcquireStub();
+      }
+      for (auto const& ch : worker_refs) {
+        ch->ReleaseStub();
+      }
+    }
+  });
+  std::thread refresh_mutator([&] {
+    Status const bad = internal::InternalError("refresh failed");
+    bool toggle = false;
+    while (!stop.load(std::memory_order_relaxed)) {
+      toggle = !toggle;
+      for (std::size_t i = 0; i < worker_refs.size(); ++i) {
+        worker_refs[i]->set_last_refresh_status(
+            ((i + (toggle ? 1U : 0U)) % 2 == 0) ? bad : Status{});
+      }
+    }
+  });
+
+  for (int iter = 0; iter < 500; ++iter) {
+    wrapper.RemoveChannels();
+  }
+
+  stop.store(true, std::memory_order_relaxed);
+  rpc_mutator.join();
+  refresh_mutator.join();
+
+  // Every channel still holds its 1 baseline RPC, even those whose last
+  // refresh status is an error.
+  ASSERT_THAT(d.size(), Eq(kNumDrainingChannels));
+
+  // Release baseline RPC on half the channels; RemoveChannels should erase
+  // exactly those 6 and retain the remaining 6.
+  for (std::size_t i = 0; i < kNumDrainingChannels / 2; ++i) {
+    worker_refs[i]->ReleaseStub();
+  }
+  wrapper.RemoveChannels();
+  ASSERT_THAT(d.size(), Eq(kNumDrainingChannels / 2));
+
+  // Release baseline RPC on the remaining channels; RemoveChannels should now
+  // drain the vector completely.
+  for (std::size_t i = kNumDrainingChannels / 2; i < kNumDrainingChannels;
+       ++i) {
+    worker_refs[i]->ReleaseStub();
+  }
+  wrapper.RemoveChannels();
+  EXPECT_THAT(d, IsEmpty());
 
   fake_cq_impl_->SimulateCompletion(false);
 }

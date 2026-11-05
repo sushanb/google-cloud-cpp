@@ -77,6 +77,27 @@ TEST(ChannelUsageTest, SetLastRefreshStatus) {
               StatusIs(error_status.code()));
 }
 
+TEST(ChannelUsageTest, OutstandingRpcsUnmaskedByRefreshError) {
+  auto mock = std::make_shared<MockBigtableStub>();
+  auto channel = std::make_shared<ChannelUsage<BigtableStub>>(mock);
+  EXPECT_THAT(channel->outstanding_rpcs(), Eq(0));
+
+  (void)channel->AcquireStub();
+  (void)channel->AcquireStub();
+  EXPECT_THAT(channel->outstanding_rpcs(), Eq(2));
+
+  Status error_status = internal::InternalError("refresh failed");
+  channel->set_last_refresh_status(error_status);
+  EXPECT_THAT(channel->instant_outstanding_rpcs(),
+              StatusIs(error_status.code()));
+  EXPECT_THAT(channel->outstanding_rpcs(), Eq(2));
+
+  channel->ReleaseStub();
+  EXPECT_THAT(channel->outstanding_rpcs(), Eq(1));
+  channel->ReleaseStub();
+  EXPECT_THAT(channel->outstanding_rpcs(), Eq(0));
+}
+
 TEST(ChannelUsageTest, MakeWeak) {
   auto channel = std::make_shared<ChannelUsage<BigtableStub>>();
   auto weak = channel->MakeWeak();
