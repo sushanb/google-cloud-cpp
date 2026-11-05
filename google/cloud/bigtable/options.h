@@ -379,8 +379,15 @@ struct MetricsPeriodOption {
 using DataPolicyOptionList =
     OptionList<DataRetryPolicyOption, DataBackoffPolicyOption, DeadlineOption,
                IdempotentMutationPolicyOption, EnableMetricsOption,
-               MetricsPeriodOption,
+               MetricsPeriodOption, ReverseScanOption,
+               experimental::BulkApplyThrottlingOption,
+               experimental::ExecuteQueryPlanRefreshRetryPolicyOption,
+               experimental::QueryPlanRefreshFunctionRetryPolicyOption,
                experimental::DynamicChannelPoolSizingPolicyOption,
+               experimental::DirectPathModeOption,
+               experimental::DirectPathMetricsModeOption,
+               experimental::DirectPathProbeTimeoutOption,
+               experimental::DirectPathDiagnosticsTimeoutOption,
                experimental::DirectPathInitializationModeOption>;
 
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END

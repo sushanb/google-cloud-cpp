@@ -14,6 +14,8 @@
 
 #include "google/cloud/bigtable/internal/stub_manager.h"
 #include "google/cloud/log.h"
+#include <mutex>
+#include <shared_mutex>
 #include <utility>
 
 namespace google {
@@ -35,16 +37,32 @@ std::shared_ptr<BigtableStub> StubManager::GetStub(
     std::string_view instance_name) {
   if (stub_) return stub_;
 
-  std::scoped_lock lk(mu_);
+  {
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    if (auto iter = affinity_stubs_.find(instance_name);
+        iter != affinity_stubs_.end()) {
+      return iter->second;
+    }
+    if (instance_name.empty() && !affinity_stubs_.empty()) {
+      return affinity_stubs_.begin()->second;
+    }
+  }
+
+  if (!stub_creation_fn_) return nullptr;
+  auto new_stub = stub_creation_fn_(instance_name, Priming::kNoPriming);
+  if (instance_name.empty()) {
+    return new_stub;
+  }
+
+  std::unique_lock<std::shared_mutex> lk(mu_);
   if (auto iter = affinity_stubs_.find(instance_name);
       iter != affinity_stubs_.end()) {
     return iter->second;
   }
   GCP_LOG(INFO) << "Dynamic connection resolution adding new channel pool "
                 << "for instance: " << instance_name;
-  auto inserted = affinity_stubs_.emplace(
-      std::string{instance_name},
-      stub_creation_fn_(instance_name, Priming::kNoPriming));
+  auto inserted =
+      affinity_stubs_.emplace(std::string{instance_name}, std::move(new_stub));
   return inserted.first->second;
 }
 

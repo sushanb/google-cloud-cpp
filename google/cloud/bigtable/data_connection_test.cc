@@ -22,9 +22,11 @@
 #include "google/cloud/grpc_options.h"
 #include "google/cloud/testing_util/opentelemetry_matchers.h"
 #include "google/cloud/testing_util/scoped_environment.h"
+#include "google/cloud/testing_util/scoped_log.h"
 #include "rpc_retry_policy.h"
 #include <gmock/gmock.h>
 #include <chrono>
+#include <optional>
 
 namespace google {
 namespace cloud {
@@ -38,7 +40,9 @@ using ::google::cloud::testing_util::EnableTracing;
 using ::google::cloud::testing_util::SpanNamed;
 using ::testing::Contains;
 using ::testing::Eq;
+using ::testing::HasSubstr;
 using ::testing::IsEmpty;
+using ::testing::Not;
 
 Options TestOptions() {
   return Options{}
@@ -100,6 +104,52 @@ TEST(MakeDataConnection, WithInstances) {
   EXPECT_THAT(
       options.get<bigtable_internal::InstanceChannelAffinityOption>().size(),
       Eq(2));
+}
+
+TEST(MakeDataConnection, ExpectedOptionsNoUnexpectedWarnings) {
+  testing_util::ScopedEnvironment direct_path("GOOGLE_CLOUD_ENABLE_DIRECT_PATH",
+                                              std::nullopt);
+  testing_util::ScopedEnvironment cbt_direct_path("CBT_ENABLE_DIRECTPATH",
+                                                  std::nullopt);
+  testing_util::ScopedLog log;
+
+  auto opts =
+      TestOptions()
+          .set<EnableMetricsOption>(false)
+          .set<MetricsPeriodOption>(std::chrono::seconds(60))
+          .set<DeadlineOption>(ms(500))
+          .set<IdempotentMutationPolicyOption>(
+              DefaultIdempotentMutationPolicy())
+          .set<ReverseScanOption>(true)
+          .set<experimental::BulkApplyThrottlingOption>(true)
+          .set<experimental::ExecuteQueryPlanRefreshRetryPolicyOption>(
+              std::make_shared<
+                  experimental::
+                      ExecuteQueryPlanRefreshLimitedErrorCountRetryPolicy>(0))
+          .set<experimental::QueryPlanRefreshFunctionRetryPolicyOption>(
+              std::make_shared<
+                  experimental::
+                      QueryPlanRefreshFunctionLimitedErrorCountRetryPolicy>(0))
+          .set<experimental::DynamicChannelPoolSizingPolicyOption>(
+              experimental::DynamicChannelPoolSizingPolicy{})
+          .set<experimental::DirectPathModeOption>(
+              experimental::DirectPathMode::kDisabled)
+          .set<experimental::DirectPathMetricsModeOption>(
+              experimental::DirectPathMetricsMode::kDisabled)
+          .set<experimental::DirectPathProbeTimeoutOption>(ms(1000))
+          .set<experimental::DirectPathDiagnosticsTimeoutOption>(ms(2000))
+          .set<experimental::DirectPathInitializationModeOption>(
+              experimental::DirectPathInitializationMode::kBlocking);
+
+  auto conn1 = MakeDataConnection(opts);
+  EXPECT_NE(conn1, nullptr);
+
+  InstanceResource instance_a{Project("my-project"), "instance-a"};
+  auto conn2 = MakeDataConnection({instance_a}, opts);
+  EXPECT_NE(conn2, nullptr);
+
+  EXPECT_THAT(log.ExtractLines(),
+              Not(Contains(HasSubstr("Unexpected option"))));
 }
 
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS

@@ -20,7 +20,7 @@
 #include "absl/container/flat_hash_map.h"
 #include <functional>
 #include <memory>
-#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 
@@ -36,9 +36,8 @@ class StubManager {
  public:
   enum class Priming { kNoPriming, kSynchronousPriming };
 
-  // This function must not send any RPCs as it is called while a lock is held.
-  // This means channels cannot be primed as part of construction, but instead
-  // must be scheduled to be primed asynchronously.
+  // Dynamically resolved instances pass Priming::kNoPriming so RPC callers do
+  // not block on synchronous priming RPCs; refresh timers prime asynchronously.
   using StubCreationFn = std::function<std::shared_ptr<BigtableStub>(
       std::string_view instance_name, Priming priming)>;
 
@@ -51,7 +50,7 @@ class StubManager {
   std::shared_ptr<BigtableStub> GetStub(std::string_view instance_name);
 
  private:
-  std::mutex mu_;
+  std::shared_mutex mu_;
   StubCreationFn stub_creation_fn_;
   std::shared_ptr<BigtableStub> stub_;
   absl::flat_hash_map<std::string, std::shared_ptr<BigtableStub>>
