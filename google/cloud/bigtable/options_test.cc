@@ -16,6 +16,7 @@
 #include "google/cloud/grpc_options.h"
 #include "google/cloud/options.h"
 #include "google/cloud/testing_util/fake_clock.h"
+#include "google/cloud/testing_util/scoped_log.h"
 #include <gmock/gmock.h>
 #include <chrono>
 #include <memory>
@@ -26,10 +27,14 @@ namespace bigtable_internal {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace {
 
+using ::google::cloud::bigtable::DataPolicyOptionList;
 using ::google::cloud::bigtable::DeadlineOption;
+using ::google::cloud::bigtable::experimental::BulkApplyThrottlingOption;
 using ::google::cloud::internal::GrpcSetupOption;
 using ::google::cloud::testing_util::FakeSystemClock;
+using ::google::cloud::testing_util::ScopedLog;
 using ::testing::Eq;
+using ::testing::IsEmpty;
 
 TEST(MergeOptions, ConnectionDeadlineOption) {
   FakeSystemClock clock;
@@ -168,6 +173,14 @@ TEST(MergeOptions, ClientDeadlineOptionCallGrpcSetupOption) {
   merged_call_opts.get<GrpcSetupOption>()(context);
   EXPECT_THAT(context.compression_algorithm(), Eq(GRPC_COMPRESS_DEFLATE));
   EXPECT_THAT(context.deadline() - clock.Now(), Eq(std::chrono::seconds(5)));
+}
+
+TEST(DataPolicyOptionList, IncludesBulkApplyThrottlingOption) {
+  ScopedLog log;
+  auto opts = Options{}.set<BulkApplyThrottlingOption>(true);
+  google::cloud::internal::CheckExpectedOptions<DataPolicyOptionList>(opts,
+                                                                      "caller");
+  EXPECT_THAT(log.ExtractLines(), IsEmpty());
 }
 
 }  // namespace
