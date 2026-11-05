@@ -15,15 +15,25 @@
 #include "google/cloud/bigtable/internal/partial_result_set_resume.h"
 #include "google/cloud/bigtable/internal/crc32c.h"
 #include "google/cloud/bigtable/internal/partial_result_set_source.h"
+#include "google/cloud/bigtable/internal/retry_traits.h"
 #include "google/cloud/bigtable/mocks/mock_query_row.h"
 #include "google/cloud/bigtable/retry_policy.h"
 #include "google/cloud/bigtable/testing/mock_partial_result_set_reader.h"
+#include "google/cloud/common_options.h"
+#include "google/cloud/internal/make_status.h"
+#include "google/cloud/internal/status_payload_keys.h"
+#include "google/cloud/options.h"
+#include "google/cloud/status.h"
 #include "google/cloud/testing_util/is_proto_equal.h"
+#include "google/cloud/testing_util/mock_backoff_policy.h"
 #include "google/cloud/testing_util/status_matchers.h"
 #include "absl/strings/substitute.h"
+#include "google/rpc/error_details.pb.h"
+#include "google/rpc/status.pb.h"
 #include <google/protobuf/text_format.h>
 #include <gmock/gmock.h>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -36,12 +46,16 @@ namespace {
 using ::google::cloud::Idempotency;
 using ::google::cloud::bigtable_testing::MockPartialResultSetReader;
 using ::google::cloud::testing_util::IsProtoEqual;
+using ::google::cloud::testing_util::MockBackoffPolicy;
 using ::google::cloud::testing_util::StatusIs;
 using ::google::protobuf::TextFormat;
 using ::testing::_;
 using ::testing::AtLeast;
 using ::testing::HasSubstr;
+using ::testing::InSequence;
+using ::testing::MockFunction;
 using ::testing::Return;
+using ms = std::chrono::milliseconds;
 
 struct MockFactory {
   MOCK_METHOD(std::unique_ptr<PartialResultSetReader>, MakeReader,
@@ -451,6 +465,254 @@ TEST(PartialResultSetResume, ResumptionMidway) {
 
   auto row = (*reader)->NextRow();
   EXPECT_THAT(row, IsValidAndEquals(bigtable::QueryRow{}));
+}
+
+TEST(PartialResultSetResume, RetryInfoHeeded) {
+  google::bigtable::v2::PartialResultSet r12;
+  google::bigtable::v2::PartialResultSet r34;
+  MakeResponse(r12, {"value-1", "value-2"}, "resume-after-2", true);
+  MakeResponse(r34, {"value-3", "value-4"}, "resume-after-4", true);
+
+  MockFactory mock_factory;
+  EXPECT_CALL(mock_factory, MakeReader)
+      .WillOnce([&r12](std::string const& token) {
+        EXPECT_TRUE(token.empty());
+        auto mock = std::make_unique<MockPartialResultSetReader>();
+        EXPECT_CALL(*mock, Read(_, _))
+            .WillOnce(ReadAction(r12, false))
+            .WillOnce(Return(false));
+        Status throttled(StatusCode::kResourceExhausted, "throttled");
+        internal::SetRetryInfo(throttled, internal::RetryInfo{ms(42)});
+        EXPECT_CALL(*mock, Finish()).WillOnce(Return(throttled));
+        return mock;
+      })
+      .WillOnce([&r34](std::string const& token) {
+        EXPECT_EQ("resume-after-2", token);
+        auto mock = std::make_unique<MockPartialResultSetReader>();
+        EXPECT_CALL(*mock, Read(_, _))
+            .WillOnce(ReadAction(r34, false))
+            .WillOnce(Return(false));
+        Status unavailable(StatusCode::kUnavailable, "try again");
+        internal::SetRetryInfo(unavailable, internal::RetryInfo{ms(75)});
+        EXPECT_CALL(*mock, Finish()).WillOnce(Return(unavailable));
+        return mock;
+      })
+      .WillOnce([](std::string const& token) {
+        EXPECT_EQ("resume-after-4", token);
+        auto mock = std::make_unique<MockPartialResultSetReader>();
+        EXPECT_CALL(*mock, Read(_, _)).WillOnce(Return(false));
+        EXPECT_CALL(*mock, Finish()).WillOnce(Return(Status()));
+        return mock;
+      });
+
+  MockFunction<void(ms)> mock_sleeper;
+  {
+    InSequence seq;
+    EXPECT_CALL(mock_sleeper, Call(ms(42)));
+    EXPECT_CALL(mock_sleeper, Call(ms(75)));
+  }
+
+  auto factory = [&mock_factory](std::string const& token) {
+    return mock_factory.MakeReader(token);
+  };
+  auto reader = std::make_unique<PartialResultSetResume>(
+      factory, Idempotency::kIdempotent,
+      bigtable::DataLimitedErrorCountRetryPolicy(/*maximum_failures=*/2)
+          .clone(),
+      google::cloud::ExponentialBackoffPolicy(ms(1), ms(1), 2.0).clone(),
+      /*enable_server_retries=*/true, mock_sleeper.AsStdFunction());
+
+  google::bigtable::v2::PartialResultSet raw_result;
+  auto result = UnownedPartialResultSet::FromPartialResultSet(raw_result);
+  ASSERT_TRUE(reader->Read("", result));
+  EXPECT_THAT(raw_result, IsProtoEqual(r12));
+  EXPECT_FALSE(result.resumption);
+  ASSERT_TRUE(reader->Read("resume-after-2", result));
+  EXPECT_THAT(raw_result, IsProtoEqual(r34));
+  EXPECT_TRUE(result.resumption);
+  ASSERT_FALSE(reader->Read("resume-after-4", result));
+  EXPECT_STATUS_OK(reader->Finish());
+}
+
+TEST(PartialResultSetResume, RetryInfoIgnoredWhenDisabled) {
+  MockFactory mock_factory;
+  EXPECT_CALL(mock_factory, MakeReader).WillOnce([](std::string const& token) {
+    EXPECT_TRUE(token.empty());
+    auto mock = std::make_unique<MockPartialResultSetReader>();
+    EXPECT_CALL(*mock, Read(_, _)).WillOnce(Return(false));
+    Status throttled(StatusCode::kResourceExhausted, "throttled");
+    internal::SetRetryInfo(throttled, internal::RetryInfo{ms(42)});
+    EXPECT_CALL(*mock, Finish()).WillOnce(Return(throttled));
+    return mock;
+  });
+
+  MockFunction<void(ms)> mock_sleeper;
+  EXPECT_CALL(mock_sleeper, Call).Times(0);
+
+  auto factory = [&mock_factory](std::string const& token) {
+    return mock_factory.MakeReader(token);
+  };
+  auto reader = std::make_unique<PartialResultSetResume>(
+      factory, Idempotency::kIdempotent,
+      bigtable::DataLimitedErrorCountRetryPolicy(/*maximum_failures=*/2)
+          .clone(),
+      google::cloud::ExponentialBackoffPolicy(ms(1), ms(1), 2.0).clone(),
+      /*enable_server_retries=*/false, mock_sleeper.AsStdFunction());
+
+  google::bigtable::v2::PartialResultSet raw_result;
+  auto result = UnownedPartialResultSet::FromPartialResultSet(raw_result);
+  ASSERT_FALSE(reader->Read("", result));
+  EXPECT_THAT(reader->Finish(),
+              StatusIs(StatusCode::kResourceExhausted, HasSubstr("throttled")));
+}
+
+TEST(PartialResultSetResume, RetryInfoIgnoredViaCurrentOptions) {
+  MockFactory mock_factory;
+  EXPECT_CALL(mock_factory, MakeReader).WillOnce([](std::string const& token) {
+    EXPECT_TRUE(token.empty());
+    auto mock = std::make_unique<MockPartialResultSetReader>();
+    EXPECT_CALL(*mock, Read(_, _)).WillOnce(Return(false));
+    Status throttled(StatusCode::kResourceExhausted, "throttled");
+    internal::SetRetryInfo(throttled, internal::RetryInfo{ms(0)});
+    EXPECT_CALL(*mock, Finish()).WillOnce(Return(throttled));
+    return mock;
+  });
+
+  auto factory = [&mock_factory](std::string const& token) {
+    return mock_factory.MakeReader(token);
+  };
+  internal::OptionsSpan span(Options{}.set<EnableServerRetriesOption>(false));
+  auto reader = MakeTestResume(factory, Idempotency::kIdempotent);
+
+  google::bigtable::v2::PartialResultSet raw_result;
+  auto result = UnownedPartialResultSet::FromPartialResultSet(raw_result);
+  ASSERT_FALSE(reader->Read("", result));
+  EXPECT_THAT(reader->Finish(),
+              StatusIs(StatusCode::kResourceExhausted, HasSubstr("throttled")));
+}
+
+TEST(PartialResultSetResume, BackoffResetAcrossHealthyReads) {
+  google::bigtable::v2::PartialResultSet r12;
+  google::bigtable::v2::PartialResultSet r34;
+  MakeResponse(r12, {"value-1", "value-2"}, "resume-after-2", true);
+  MakeResponse(r34, {"value-3", "value-4"}, "resume-after-4", true);
+
+  MockFactory mock_factory;
+  EXPECT_CALL(mock_factory, MakeReader)
+      .WillOnce([&r12](std::string const& token) {
+        EXPECT_TRUE(token.empty());
+        auto mock = std::make_unique<MockPartialResultSetReader>();
+        EXPECT_CALL(*mock, Read(_, _))
+            .WillOnce(ReadAction(r12, false))
+            .WillOnce(Return(false));
+        EXPECT_CALL(*mock, Finish())
+            .WillOnce(Return(Status(StatusCode::kUnavailable, "disconnect 1")));
+        return mock;
+      })
+      .WillOnce([](std::string const& token) {
+        EXPECT_EQ("resume-after-2", token);
+        auto mock = std::make_unique<MockPartialResultSetReader>();
+        EXPECT_CALL(*mock, Read(_, _)).WillOnce(Return(false));
+        EXPECT_CALL(*mock, Finish())
+            .WillOnce(Return(Status(StatusCode::kUnavailable, "disconnect 2")));
+        return mock;
+      })
+      .WillOnce([&r34](std::string const& token) {
+        EXPECT_EQ("resume-after-2", token);
+        auto mock = std::make_unique<MockPartialResultSetReader>();
+        EXPECT_CALL(*mock, Read(_, _))
+            .WillOnce(ReadAction(r34, false))
+            .WillOnce(Return(false));
+        EXPECT_CALL(*mock, Finish())
+            .WillOnce(Return(Status(StatusCode::kUnavailable, "disconnect 3")));
+        return mock;
+      })
+      .WillOnce([](std::string const& token) {
+        EXPECT_EQ("resume-after-4", token);
+        auto mock = std::make_unique<MockPartialResultSetReader>();
+        EXPECT_CALL(*mock, Read(_, _)).WillOnce(Return(false));
+        EXPECT_CALL(*mock, Finish()).WillOnce(Return(Status()));
+        return mock;
+      });
+
+  auto mock_backoff = std::make_unique<MockBackoffPolicy>();
+  EXPECT_CALL(*mock_backoff, clone)
+      .WillOnce([] {
+        auto clone = std::make_unique<MockBackoffPolicy>();
+        EXPECT_CALL(*clone, OnCompletion)
+            .WillOnce(Return(ms(10)))
+            .WillOnce(Return(ms(20)));
+        return clone;
+      })
+      .WillOnce([] {
+        auto clone = std::make_unique<MockBackoffPolicy>();
+        EXPECT_CALL(*clone, OnCompletion).WillOnce(Return(ms(10)));
+        return clone;
+      });
+
+  MockFunction<void(ms)> mock_sleeper;
+  {
+    InSequence seq;
+    EXPECT_CALL(mock_sleeper, Call(ms(10)));
+    EXPECT_CALL(mock_sleeper, Call(ms(20)));
+    EXPECT_CALL(mock_sleeper, Call(ms(10)));
+  }
+
+  auto factory = [&mock_factory](std::string const& token) {
+    return mock_factory.MakeReader(token);
+  };
+  auto reader = std::make_unique<PartialResultSetResume>(
+      factory, Idempotency::kIdempotent,
+      bigtable::DataLimitedErrorCountRetryPolicy(/*maximum_failures=*/5)
+          .clone(),
+      std::move(mock_backoff), /*enable_server_retries=*/true,
+      mock_sleeper.AsStdFunction());
+
+  google::bigtable::v2::PartialResultSet raw_result;
+  auto result = UnownedPartialResultSet::FromPartialResultSet(raw_result);
+  ASSERT_TRUE(reader->Read("", result));
+  EXPECT_THAT(raw_result, IsProtoEqual(r12));
+  ASSERT_TRUE(reader->Read("resume-after-2", result));
+  EXPECT_THAT(raw_result, IsProtoEqual(r34));
+  EXPECT_TRUE(result.resumption);
+  ASSERT_FALSE(reader->Read("resume-after-4", result));
+  EXPECT_STATUS_OK(reader->Finish());
+}
+
+TEST(PartialResultSetResume, PreservesGrpcStatusPayloadOnPermanentError) {
+  auto expired_status =
+      internal::FailedPreconditionError("failed precondition");
+  google::rpc::PreconditionFailure precondition;
+  auto& violation = *precondition.add_violations();
+  violation.set_type("PREPARED_QUERY_EXPIRED");
+  violation.set_description("The prepared query has expired.");
+  google::rpc::Status rpc_status;
+  rpc_status.set_code(static_cast<int>(StatusCode::kFailedPrecondition));
+  rpc_status.set_message("failed precondition");
+  ASSERT_TRUE(rpc_status.add_details()->PackFrom(precondition));
+  internal::SetPayload(expired_status, internal::StatusPayloadGrpcProto(),
+                       rpc_status.SerializeAsString());
+
+  MockFactory mock_factory;
+  EXPECT_CALL(mock_factory, MakeReader)
+      .WillOnce([&expired_status](std::string const& token) {
+        EXPECT_TRUE(token.empty());
+        auto mock = std::make_unique<MockPartialResultSetReader>();
+        EXPECT_CALL(*mock, Read(_, _)).WillOnce(Return(false));
+        EXPECT_CALL(*mock, Finish()).WillOnce(Return(expired_status));
+        return mock;
+      });
+
+  auto factory = [&mock_factory](std::string const& token) {
+    return mock_factory.MakeReader(token);
+  };
+  auto reader = MakeTestResume(factory, Idempotency::kIdempotent);
+  google::bigtable::v2::PartialResultSet raw_result;
+  auto result = UnownedPartialResultSet::FromPartialResultSet(raw_result);
+  ASSERT_FALSE(reader->Read("", result));
+  auto status = reader->Finish();
+  EXPECT_THAT(status, StatusIs(StatusCode::kFailedPrecondition));
+  EXPECT_TRUE(ExecuteQueryPlanRefreshRetry::IsQueryPlanExpired(status));
 }
 
 }  // namespace
