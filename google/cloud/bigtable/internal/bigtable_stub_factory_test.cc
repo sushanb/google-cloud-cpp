@@ -57,6 +57,7 @@ using ::testing::IsEmpty;
 using ::testing::MockFunction;
 using ::testing::Not;
 using ::testing::Optional;
+using ::testing::Pair;
 using ::testing::ResultOf;
 using ::testing::Return;
 
@@ -602,6 +603,281 @@ TEST(BigtableStubFactory, CreateBigtableAffinityStubs) {
       CreateBigtableAffinityStubs(instances, stub_creation_fn.AsStdFunction());
 
   EXPECT_THAT(stubs, testing::SizeIs(2));
+}
+
+TEST(BigtableStubFactory, RandomTwoLeastUsedRefreshDisabledSchedulesNoRefresh) {
+  auto constexpr kTestChannels = 3;
+
+  MockFactory factory;
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, PingAndWarm)
+      .Times(kTestChannels)
+      .WillRepeatedly(Return(google::bigtable::v2::PingAndWarmResponse{}));
+  EXPECT_CALL(*mock, AsyncPingAndWarm).Times(0);
+
+  EXPECT_CALL(factory, Call)
+      .Times(kTestChannels)
+      .WillRepeatedly(
+          [&](std::shared_ptr<grpc::Channel> const&) { return mock; });
+
+  auto auth = MakeStubFactoryMockAuth();
+  EXPECT_CALL(*auth, CreateChannel("localhost:1", _)).Times(kTestChannels);
+  EXPECT_CALL(*auth, RequiresConfigureContext).WillOnce(Return(false));
+
+  auto fake_cq_impl = std::make_shared<testing_util::FakeCompletionQueueImpl>();
+  CompletionQueue cq(fake_cq_impl);
+  auto stub = CreateDecoratedStubs(
+      std::move(auth), cq, "projects/my-project/instances/my-instance",
+      StubManager::Priming::kSynchronousPriming,
+      Options{}
+          .set<GrpcNumChannelsOption>(kTestChannels)
+          .set<EndpointOption>("localhost:1")
+          .set<UnifiedCredentialsOption>(MakeInsecureCredentials())
+          .set<bigtable::MinConnectionRefreshOption>(
+              std::chrono::milliseconds(1000))
+          .set<bigtable::MaxConnectionRefreshOption>(
+              std::chrono::milliseconds(0)),
+      factory.AsStdFunction());
+
+  // Only the single DynamicChannelPool cooldown timer should be registered.
+  EXPECT_EQ(fake_cq_impl->size(), 1U);
+  // Firing timers with ok=true must not trigger any AsyncPingAndWarm calls.
+  fake_cq_impl->SimulateCompletion(true);
+  EXPECT_TRUE(fake_cq_impl->empty());
+}
+
+TEST(BigtableStubFactory,
+     RandomTwoLeastUsedPrimingPermissionDeniedAndNotFoundSucceed) {
+  MockFactory factory;
+  auto mock_denied = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock_denied, PingAndWarm)
+      .WillOnce(
+          Return(internal::PermissionDeniedError("missing instances.ping")));
+  EXPECT_CALL(*mock_denied, MutateRow)
+      .WillRepeatedly(Return(google::bigtable::v2::MutateRowResponse{}));
+
+  auto mock_not_found = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock_not_found, PingAndWarm)
+      .WillOnce(Return(internal::NotFoundError("instance not found")));
+  EXPECT_CALL(*mock_not_found, MutateRow)
+      .WillRepeatedly(Return(google::bigtable::v2::MutateRowResponse{}));
+
+  auto mock_unavailable = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock_unavailable, PingAndWarm)
+      .WillOnce(Return(internal::UnavailableError("transient error")));
+  EXPECT_CALL(*mock_unavailable, MutateRow).Times(0);
+
+  EXPECT_CALL(factory, Call)
+      .WillOnce(Return(mock_denied))
+      .WillOnce(Return(mock_not_found))
+      .WillOnce(Return(mock_unavailable));
+
+  auto auth = MakeStubFactoryMockAuth();
+  EXPECT_CALL(*auth, CreateChannel("localhost:1", _)).Times(3);
+  EXPECT_CALL(*auth, RequiresConfigureContext).WillOnce(Return(false));
+
+  auto fake_cq_impl = std::make_shared<testing_util::FakeCompletionQueueImpl>();
+  auto refresh_state = std::make_shared<ConnectionRefreshState>(
+      fake_cq_impl, std::chrono::milliseconds(0), std::chrono::milliseconds(0));
+
+  auto stub = CreateBigtableStubRandomTwoLeastUsed(
+      std::move(auth), fake_cq_impl,
+      "projects/my-project/instances/my-instance",
+      StubManager::Priming::kSynchronousPriming,
+      Options{}
+          .set<GrpcNumChannelsOption>(3)
+          .set<EndpointOption>("localhost:1")
+          .set<UnifiedCredentialsOption>(MakeInsecureCredentials()),
+      factory.AsStdFunction(), std::move(refresh_state));
+
+  auto random_two_least_used =
+      std::dynamic_pointer_cast<BigtableRandomTwoLeastUsed>(stub);
+  ASSERT_NE(random_two_least_used, nullptr);
+  ASSERT_NE(random_two_least_used->pool(), nullptr);
+  EXPECT_EQ(random_two_least_used->pool()->size(), 2U);
+
+  grpc::ClientContext context;
+  OperationContext op_ctx;
+  EXPECT_STATUS_OK(stub->MutateRow(context, Options{}, {}, op_ctx));
+
+  fake_cq_impl->SimulateCompletion(false);
+}
+
+TEST(BigtableStubFactory,
+     RandomTwoLeastUsedPrimingAppliesAuthAndMetadataWithoutDoubleDecorating) {
+  MockFactory factory;
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, PingAndWarm)
+      .WillOnce([](grpc::ClientContext& context, Options const&,
+                   google::bigtable::v2::PingAndWarmRequest const& request,
+                   OperationContext&) {
+        EXPECT_LT(context.deadline(),
+                  (std::chrono::system_clock::time_point::max)());
+        EXPECT_EQ(request.name(), "projects/my-project/instances/my-instance");
+        EXPECT_EQ(request.app_profile_id(), "my-app-profile");
+
+        ValidateMetadataFixture fixture;
+        auto headers = fixture.GetMetadata(context);
+        EXPECT_THAT(
+            headers,
+            Contains(Pair("x-goog-request-params",
+                          "name=projects%2Fmy-project%2Finstances%2Fmy-instance"
+                          "&app_profile_id=my-app-profile")));
+        EXPECT_THAT(headers,
+                    Contains(Pair("x-goog-user-project", "my-quota-project")));
+        EXPECT_THAT(headers,
+                    Contains(Pair("x-goog-api-client",
+                                  internal::HandCraftedLibClientHeader())));
+        EXPECT_THAT(headers, Contains(Pair("x-test-auth", "configured")));
+        EXPECT_EQ(headers.count("bigtable-features"), 1U);
+        EXPECT_EQ(headers.count("x-goog-request-params"), 1U);
+        EXPECT_EQ(headers.count("x-goog-user-project"), 1U);
+        EXPECT_EQ(headers.count("x-goog-api-client"), 1U);
+        EXPECT_EQ(headers.count("x-test-auth"), 1U);
+        return google::bigtable::v2::PingAndWarmResponse{};
+      });
+  EXPECT_CALL(*mock, MutateRow)
+      .WillOnce([](grpc::ClientContext& context, Options const&,
+                   google::bigtable::v2::MutateRowRequest const&,
+                   OperationContext&) {
+        ValidateMetadataFixture fixture;
+        auto headers = fixture.GetMetadata(context);
+        EXPECT_THAT(headers,
+                    Contains(Pair("x-goog-user-project", "my-quota-project")));
+        EXPECT_THAT(headers, Contains(Pair("x-test-auth", "configured")));
+        EXPECT_EQ(headers.count("bigtable-features"), 1U);
+        EXPECT_EQ(headers.count("x-goog-request-params"), 1U);
+        EXPECT_EQ(headers.count("x-goog-user-project"), 1U);
+        EXPECT_EQ(headers.count("x-goog-api-client"), 1U);
+        EXPECT_EQ(headers.count("x-test-auth"), 1U);
+        return google::bigtable::v2::MutateRowResponse{};
+      });
+
+  EXPECT_CALL(factory, Call).WillOnce(Return(mock));
+
+  auto auth = MakeStubFactoryMockAuth();
+  EXPECT_CALL(*auth, CreateChannel("localhost:1", _)).Times(1);
+  EXPECT_CALL(*auth, RequiresConfigureContext).WillOnce(Return(true));
+  EXPECT_CALL(*auth, ConfigureContext)
+      .Times(2)
+      .WillRepeatedly([](grpc::ClientContext& context) {
+        context.AddMetadata("x-test-auth", "configured");
+        return Status{};
+      });
+
+  auto fake_cq_impl = std::make_shared<testing_util::FakeCompletionQueueImpl>();
+  CompletionQueue cq(fake_cq_impl);
+  bigtable::experimental::DynamicChannelPoolSizingPolicy single_channel_policy;
+  single_channel_policy.minimum_channel_pool_size = 1;
+  single_channel_policy.maximum_channel_pool_size = 1;
+  auto options =
+      Options{}
+          .set<GrpcNumChannelsOption>(1)
+          .set<bigtable::experimental::DynamicChannelPoolSizingPolicyOption>(
+              single_channel_policy)
+          .set<EndpointOption>("localhost:1")
+          .set<UserProjectOption>("my-quota-project")
+          .set<bigtable::AppProfileIdOption>("my-app-profile")
+          .set<bigtable::MaxConnectionRefreshOption>(
+              std::chrono::milliseconds(0));
+  auto stub = CreateDecoratedStubs(std::move(auth), cq,
+                                   "projects/my-project/instances/my-instance",
+                                   StubManager::Priming::kSynchronousPriming,
+                                   options, factory.AsStdFunction());
+
+  google::bigtable::v2::MutateRowRequest mutate_request;
+  mutate_request.set_table_name(
+      "projects/my-project/instances/my-instance/tables/my-table");
+  grpc::ClientContext context;
+  OperationContext op_ctx;
+  EXPECT_STATUS_OK(stub->MutateRow(context, options, mutate_request, op_ctx));
+
+  fake_cq_impl->SimulateCompletion(false);
+}
+
+TEST(BigtableStubFactory,
+     RandomTwoLeastUsedPeriodicRefreshAppliesAuthAndMetadata) {
+  MockFactory factory;
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, AsyncPingAndWarm)
+      .WillOnce([](CompletionQueue&,
+                   std::shared_ptr<grpc::ClientContext> context,
+                   internal::ImmutableOptions options,
+                   google::bigtable::v2::PingAndWarmRequest const& request,
+                   std::shared_ptr<OperationContext>) {
+        EXPECT_NE(context, nullptr);
+        EXPECT_NE(options, nullptr);
+        EXPECT_LT(context->deadline(),
+                  (std::chrono::system_clock::time_point::max)());
+        EXPECT_EQ(request.name(), "projects/my-project/instances/my-instance");
+        EXPECT_EQ(request.app_profile_id(), "my-app-profile");
+
+        ValidateMetadataFixture fixture;
+        auto headers = fixture.GetMetadata(*context);
+        EXPECT_THAT(
+            headers,
+            Contains(Pair("x-goog-request-params",
+                          "name=projects%2Fmy-project%2Finstances%2Fmy-instance"
+                          "&app_profile_id=my-app-profile")));
+        EXPECT_THAT(headers,
+                    Contains(Pair("x-goog-user-project", "my-quota-project")));
+        EXPECT_THAT(headers,
+                    Contains(Pair("x-goog-api-client",
+                                  internal::HandCraftedLibClientHeader())));
+        EXPECT_THAT(headers, Contains(Pair("x-test-async-auth", "configured")));
+        EXPECT_EQ(headers.count("bigtable-features"), 1U);
+        return make_ready_future(
+            make_status_or(google::bigtable::v2::PingAndWarmResponse{}));
+      });
+  EXPECT_CALL(*mock, MutateRow)
+      .WillOnce(Return(google::bigtable::v2::MutateRowResponse{}));
+
+  EXPECT_CALL(factory, Call).WillOnce(Return(mock));
+
+  auto auth = MakeStubFactoryMockAuth();
+  EXPECT_CALL(*auth, CreateChannel("localhost:1", _)).Times(1);
+  EXPECT_CALL(*auth, RequiresConfigureContext).WillOnce(Return(true));
+  EXPECT_CALL(*auth, AsyncConfigureContext)
+      .WillOnce([](std::shared_ptr<grpc::ClientContext> context) {
+        context->AddMetadata("x-test-async-auth", "configured");
+        return make_ready_future(make_status_or(std::move(context)));
+      });
+  EXPECT_CALL(*auth, ConfigureContext).WillOnce([](grpc::ClientContext&) {
+    return Status{};
+  });
+
+  auto fake_cq_impl = std::make_shared<testing_util::FakeCompletionQueueImpl>();
+  CompletionQueue cq(fake_cq_impl);
+  bigtable::experimental::DynamicChannelPoolSizingPolicy single_channel_policy;
+  single_channel_policy.minimum_channel_pool_size = 1;
+  single_channel_policy.maximum_channel_pool_size = 1;
+  auto options =
+      Options{}
+          .set<GrpcNumChannelsOption>(1)
+          .set<bigtable::experimental::DynamicChannelPoolSizingPolicyOption>(
+              single_channel_policy)
+          .set<EndpointOption>("localhost:1")
+          .set<UserProjectOption>("my-quota-project")
+          .set<bigtable::AppProfileIdOption>("my-app-profile")
+          .set<bigtable::MinConnectionRefreshOption>(
+              std::chrono::milliseconds(100))
+          .set<bigtable::MaxConnectionRefreshOption>(
+              std::chrono::milliseconds(200));
+  auto stub = CreateDecoratedStubs(
+      std::move(auth), cq, "projects/my-project/instances/my-instance",
+      StubManager::Priming::kNoPriming, options, factory.AsStdFunction());
+
+  // Fire the initial refresh timer.
+  fake_cq_impl->SimulateCompletion(true);
+
+  // Verify the channel remained healthy after authenticated refresh.
+  grpc::ClientContext context;
+  OperationContext op_ctx;
+  EXPECT_STATUS_OK(stub->MutateRow(context, options, {}, op_ctx));
+
+  while (!fake_cq_impl->empty()) {
+    fake_cq_impl->SimulateCompletion(false);
+  }
 }
 
 }  // namespace

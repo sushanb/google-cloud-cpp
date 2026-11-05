@@ -71,6 +71,20 @@ class ChannelUsage : public std::enable_shared_from_this<ChannelUsage<T>> {
     return *this;
   }
 
+  // Stores the decorated stub used for channel priming and background refresh
+  // so its lifetime matches this ChannelUsage instance without
+  // double-decorating data RPCs that acquire `stub_`.
+  ChannelUsage& set_refresh_stub(std::shared_ptr<T> refresh_stub) {
+    std::scoped_lock lk(mu_);
+    if (!refresh_stub_) refresh_stub_ = std::move(refresh_stub);
+    return *this;
+  }
+
+  std::shared_ptr<T> refresh_stub() const {
+    std::scoped_lock lk(mu_);
+    return refresh_stub_;
+  }
+
   std::weak_ptr<ChannelUsage<T>> MakeWeak() { return this->shared_from_this(); }
 
   std::shared_ptr<T> AcquireStub() {
@@ -91,6 +105,7 @@ class ChannelUsage : public std::enable_shared_from_this<ChannelUsage<T>> {
 
   mutable std::mutex mu_;
   std::shared_ptr<T> stub_;
+  std::shared_ptr<T> refresh_stub_;
   int outstanding_rpcs_ = 0;
   Status last_refresh_status_;
 };

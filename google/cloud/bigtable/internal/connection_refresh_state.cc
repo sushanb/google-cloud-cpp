@@ -13,8 +13,12 @@
 
 #include "google/cloud/bigtable/internal/connection_refresh_state.h"
 #include "google/cloud/bigtable/internal/operation_context.h"
+#include "google/cloud/bigtable/options.h"
+#include "google/cloud/grpc_options.h"
 #include "google/cloud/log.h"
+#include <algorithm>
 #include <chrono>
+#include <utility>
 
 namespace google {
 namespace cloud {
@@ -31,6 +35,19 @@ namespace {
  */
 auto constexpr kConnectionReadyTimeout = std::chrono::seconds(10);
 
+std::chrono::milliseconds ClampMaxRefreshPeriod(
+    std::chrono::milliseconds max_period) {
+  return (std::max)(std::chrono::milliseconds(0), max_period);
+}
+
+std::chrono::milliseconds ClampMinRefreshPeriod(
+    std::chrono::milliseconds min_period,
+    std::chrono::milliseconds max_period) {
+  auto const clamped_max = ClampMaxRefreshPeriod(max_period);
+  return (std::min)((std::max)(std::chrono::milliseconds(0), min_period),
+                    clamped_max);
+}
+
 void LogFailedConnectionRefresh(Status const& conn_status) {
   if (!conn_status.ok()) {
     GCP_LOG(WARNING) << "Failed to refresh connection. Error: " << conn_status;
@@ -43,8 +60,9 @@ ConnectionRefreshState::ConnectionRefreshState(
     std::shared_ptr<internal::CompletionQueueImpl> const& cq_impl,
     std::chrono::milliseconds min_conn_refresh_period,
     std::chrono::milliseconds max_conn_refresh_period)
-    : min_conn_refresh_period_(min_conn_refresh_period),
-      max_conn_refresh_period_(max_conn_refresh_period),
+    : min_conn_refresh_period_(ClampMinRefreshPeriod(min_conn_refresh_period,
+                                                     max_conn_refresh_period)),
+      max_conn_refresh_period_(ClampMaxRefreshPeriod(max_conn_refresh_period)),
       rng_(std::random_device{}()),
       timers_(std::make_shared<OutstandingTimers>(cq_impl)) {}
 
@@ -57,13 +75,14 @@ std::chrono::milliseconds ConnectionRefreshState::RandomizedRefreshDelay() {
 }
 
 bool ConnectionRefreshState::enabled() const {
-  return max_conn_refresh_period_.count() != 0;
+  return max_conn_refresh_period_.count() > 0;
 }
 
 void ScheduleChannelRefresh(
     std::shared_ptr<internal::CompletionQueueImpl> const& cq_impl,
     std::shared_ptr<ConnectionRefreshState> const& state,
     std::shared_ptr<grpc::Channel> const& channel) {
+  if (!state || !state->enabled()) return;
   // The timers will only hold weak pointers to the channel or to the
   // completion queue, so if either of them are destroyed, the timer chain
   // will simply not continue.
@@ -102,8 +121,13 @@ void ScheduleChannelRefresh(
 void ScheduleStubRefresh(
     std::shared_ptr<internal::CompletionQueueImpl> const& cq_impl,
     std::shared_ptr<ConnectionRefreshState> const& state,
-    std::shared_ptr<BigtableStub> const& stub, std::string const& instance_name,
+    std::shared_ptr<BigtableStub> const& stub,
+    internal::ImmutableOptions options, std::string const& instance_name,
     std::function<void(Status const&)> connection_status_fn) {
+  if (!state || !state->enabled()) return;
+  if (!options) {
+    options = internal::MakeImmutableOptions(Options{});
+  }
   if (!connection_status_fn) {
     connection_status_fn = LogFailedConnectionRefresh;
   }
@@ -116,7 +140,8 @@ void ScheduleStubRefresh(
   using TimerFuture = future<StatusOr<std::chrono::system_clock::time_point>>;
   auto timer_future =
       cq.MakeRelativeTimer(state->RandomizedRefreshDelay())
-          .then([weak_stub, weak_cq_impl, state, instance_name,
+          .then([weak_stub, weak_cq_impl, state, options = std::move(options),
+                 instance_name,
                  connection_status_fn =
                      std::move(connection_status_fn)](TimerFuture fut) mutable {
             if (!fut.get()) {
@@ -130,18 +155,28 @@ void ScheduleStubRefresh(
             auto cq = CompletionQueue(cq_impl);
 
             auto client_context = std::make_shared<grpc::ClientContext>();
-            google::cloud::internal::ImmutableOptions options;
-            google::bigtable::v2::PingAndWarmRequest request;
-            request.set_name(instance_name);
             // Use the client_context to set a deadline similar to
             // AsyncWaitConnectionReady.
             client_context->set_deadline(std::chrono::system_clock::now() +
                                          kConnectionReadyTimeout);
+            internal::ConfigureContext(*client_context, *options);
+            if (options->has<bigtable::DeadlineOption>()) {
+              client_context->set_deadline(
+                  std::chrono::system_clock::now() +
+                  options->get<bigtable::DeadlineOption>());
+            }
+            google::bigtable::v2::PingAndWarmRequest request;
+            request.set_name(instance_name);
+            if (options->has<bigtable::AppProfileIdOption>()) {
+              request.set_app_profile_id(
+                  options->get<bigtable::AppProfileIdOption>());
+            }
             auto op_ctx = std::make_shared<OperationContext>();
-            stub->AsyncPingAndWarm(cq, client_context, std::move(options),
-                                   request, std::move(op_ctx))
+            stub->AsyncPingAndWarm(cq, client_context, options, request,
+                                   std::move(op_ctx))
                 .then(
-                    [weak_stub, weak_cq_impl, state, instance_name,
+                    [weak_stub, weak_cq_impl, state,
+                     options = std::move(options), instance_name,
                      connection_status_fn = std::move(connection_status_fn)](
                         future<
                             StatusOr<google::bigtable::v2::PingAndWarmResponse>>
@@ -152,11 +187,22 @@ void ScheduleStubRefresh(
                       if (!stub) return;
                       auto cq_impl = weak_cq_impl.lock();
                       if (!cq_impl) return;
-                      ScheduleStubRefresh(cq_impl, state, stub, instance_name,
+                      ScheduleStubRefresh(cq_impl, state, stub,
+                                          std::move(options), instance_name,
                                           std::move(connection_status_fn));
                     });
           });
   state->timers().RegisterTimer(std::move(timer_future));
+}
+
+void ScheduleStubRefresh(
+    std::shared_ptr<internal::CompletionQueueImpl> const& cq_impl,
+    std::shared_ptr<ConnectionRefreshState> const& state,
+    std::shared_ptr<BigtableStub> const& stub, std::string const& instance_name,
+    std::function<void(Status const&)> connection_status_fn) {
+  ScheduleStubRefresh(cq_impl, state, stub,
+                      internal::MakeImmutableOptions(Options{}), instance_name,
+                      std::move(connection_status_fn));
 }
 
 void OutstandingTimers::RegisterTimer(future<void> fut) {

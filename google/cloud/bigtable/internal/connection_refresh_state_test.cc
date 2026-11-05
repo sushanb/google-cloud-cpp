@@ -12,9 +12,13 @@
 // See the License for the specific language governing permissions and
 
 #include "google/cloud/bigtable/internal/connection_refresh_state.h"
+#include "google/cloud/bigtable/options.h"
 #include "google/cloud/bigtable/testing/mock_bigtable_stub.h"
+#include "google/cloud/common_options.h"
+#include "google/cloud/testing_util/mock_completion_queue_impl.h"
 #include "google/cloud/testing_util/status_matchers.h"
 #include <gmock/gmock.h>
+#include <chrono>
 #include <thread>
 
 namespace google {
@@ -125,6 +129,33 @@ TEST(ConnectionRefreshState, Disabled) {
   EXPECT_FALSE(state.enabled());
 }
 
+TEST(ConnectionRefreshState, ClampsInvalidRanges) {
+  using ms = std::chrono::milliseconds;
+  ConnectionRefreshState disabled_with_min(nullptr, ms(1000), ms(0));
+  EXPECT_FALSE(disabled_with_min.enabled());
+  EXPECT_EQ(disabled_with_min.RandomizedRefreshDelay(), ms(0));
+
+  ConnectionRefreshState inverted(nullptr, ms(1000), ms(500));
+  EXPECT_TRUE(inverted.enabled());
+  EXPECT_EQ(inverted.RandomizedRefreshDelay(), ms(500));
+}
+
+TEST(ConnectionRefreshState, ScheduleStubRefreshNoopWhenDisabled) {
+  using ms = std::chrono::milliseconds;
+  auto mock_cq = std::make_shared<testing_util::MockCompletionQueueImpl>();
+  EXPECT_CALL(*mock_cq, MakeRelativeTimer).Times(0);
+  EXPECT_CALL(*mock_cq, RunAsync).Times(0);
+
+  auto state =
+      std::make_shared<ConnectionRefreshState>(mock_cq, ms(1000), ms(0));
+  auto mock_stub = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock_stub, AsyncPingAndWarm).Times(0);
+
+  ScheduleStubRefresh(mock_cq, state, mock_stub,
+                      internal::MakeImmutableOptions(Options{}),
+                      "projects/my-project/instances/my-instance");
+}
+
 class ScheduleStubRefreshTest : public ::testing::Test {
  public:
   ScheduleStubRefreshTest() : thread1_([this] { cq_.Run(); }) {}
@@ -189,6 +220,59 @@ TEST_F(ScheduleStubRefreshTest, RefreshTimerCancelled) {
   ScheduleStubRefresh(cq_impl, refresh_state, mock_stub, instance_name,
                       mock_fn.AsStdFunction());
   cq_impl->CancelAll();
+}
+
+TEST_F(ScheduleStubRefreshTest, ForwardsImmutableOptionsAndAppProfileId) {
+  auto cq_impl = internal::GetCompletionQueueImpl(cq_);
+  auto refresh_state = std::make_shared<ConnectionRefreshState>(
+      cq_impl, std::chrono::milliseconds(1), std::chrono::milliseconds(2));
+  std::string instance_name = "projects/my-project/instances/my-instance";
+  auto immutable_options = internal::MakeImmutableOptions(
+      Options{}
+          .set<UserProjectOption>("my-quota-project")
+          .set<bigtable::AppProfileIdOption>("my-app-profile"));
+
+  promise<void> p;
+  promise<StatusOr<google::bigtable::v2::PingAndWarmResponse>> p2;
+
+  auto mock_stub = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock_stub, AsyncPingAndWarm)
+      .WillOnce([&](CompletionQueue&,
+                    std::shared_ptr<grpc::ClientContext> context,
+                    internal::ImmutableOptions options,
+                    google::bigtable::v2::PingAndWarmRequest const& request,
+                    std::shared_ptr<OperationContext>) {
+        EXPECT_NE(context, nullptr);
+        EXPECT_NE(options, nullptr);
+        if (options) {
+          EXPECT_THAT(options->get<UserProjectOption>(),
+                      Eq("my-quota-project"));
+        }
+        EXPECT_THAT(request.name(), Eq(instance_name));
+        EXPECT_THAT(request.app_profile_id(), Eq("my-app-profile"));
+        return p2.get_future();
+      })
+      .WillRepeatedly([](CompletionQueue&, std::shared_ptr<grpc::ClientContext>,
+                         internal::ImmutableOptions,
+                         google::bigtable::v2::PingAndWarmRequest const&,
+                         std::shared_ptr<OperationContext>) {
+        return make_ready_future(
+            make_status_or(google::bigtable::v2::PingAndWarmResponse{}));
+      });
+
+  MockFunction<void(Status const&)> mock_fn;
+  EXPECT_CALL(mock_fn, Call)
+      .WillOnce([&p](Status const& s) {
+        EXPECT_THAT(s, IsOk());
+        p.set_value();
+      })
+      .WillRepeatedly([](Status const&) {});
+
+  ScheduleStubRefresh(cq_impl, refresh_state, mock_stub, immutable_options,
+                      instance_name, mock_fn.AsStdFunction());
+  p2.set_value(google::bigtable::v2::PingAndWarmResponse{});
+  p.get_future().get();
+  refresh_state->timers().CancelAll();
 }
 
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END

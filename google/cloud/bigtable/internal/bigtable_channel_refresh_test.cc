@@ -14,13 +14,17 @@
 
 #include "google/cloud/bigtable/internal/bigtable_channel_refresh.h"
 #include "google/cloud/bigtable/internal/bigtable_stub_factory.h"
+#include "google/cloud/bigtable/internal/defaults.h"
 #include "google/cloud/bigtable/options.h"
 #include "google/cloud/credentials.h"
 #include "google/cloud/grpc_options.h"
+#include "google/cloud/testing_util/chrono_output.h"
 #include "google/cloud/testing_util/mock_completion_queue_impl.h"
 #include "google/cloud/testing_util/mock_grpc_authentication_strategy.h"
+#include "google/cloud/testing_util/scoped_environment.h"
 #include <gmock/gmock.h>
 #include <chrono>
+#include <optional>
 
 namespace google {
 namespace cloud {
@@ -131,6 +135,97 @@ TEST(BigtableChannelRefresh, Continuations) {
 
   // Simulate the timer firing, which should trigger another round of refreshes.
   p.set_value(make_status_or(std::chrono::system_clock::now()));
+}
+
+TEST(BigtableChannelRefresh, InstanceAffinityDisabledWithZeroMax) {
+  using ms = std::chrono::milliseconds;
+  using ns = std::chrono::nanoseconds;
+
+  auto mock = std::make_shared<MockCompletionQueueImpl>();
+
+  // Only the DynamicChannelPool cooldown timer (120s) is armed; zero
+  // per-channel refresh timers or timer deregistration callbacks should be
+  // scheduled.
+  EXPECT_CALL(*mock, RunAsync).Times(0);
+  EXPECT_CALL(*mock, MakeRelativeTimer(ns(std::chrono::seconds(120))))
+      .WillOnce([](std::chrono::nanoseconds) {
+        return make_ready_future<
+            StatusOr<std::chrono::system_clock::time_point>>(
+            Status(StatusCode::kCancelled, "cancelled"));
+      });
+
+  CompletionQueue cq(mock);
+  auto auth = MakeStubFactoryMockAuth();
+  auto stub = CreateBigtableStub(
+      std::move(auth), cq, "projects/my-project/instances/my-instance",
+      StubManager::Priming::kNoPriming,
+      Options{}
+          .set<GrpcNumChannelsOption>(kTestChannels)
+          .set<bigtable::MinConnectionRefreshOption>(ms(1000))
+          .set<bigtable::MaxConnectionRefreshOption>(ms(0)));
+}
+
+TEST(BigtableChannelRefresh, InstanceAffinityDisabledWithEmulatorEnv) {
+  using ms = std::chrono::milliseconds;
+  using ns = std::chrono::nanoseconds;
+
+  testing_util::ScopedEnvironment emulator("BIGTABLE_EMULATOR_HOST",
+                                           "localhost:8080");
+  auto mock = std::make_shared<MockCompletionQueueImpl>();
+
+  EXPECT_CALL(*mock, RunAsync).Times(0);
+  EXPECT_CALL(*mock, MakeRelativeTimer(ns(std::chrono::seconds(120))))
+      .WillOnce([](std::chrono::nanoseconds) {
+        return make_ready_future<
+            StatusOr<std::chrono::system_clock::time_point>>(
+            Status(StatusCode::kCancelled, "cancelled"));
+      });
+
+  CompletionQueue cq(mock);
+  auto auth = MakeStubFactoryMockAuth();
+  auto options = bigtable::internal::DefaultDataOptions(
+      Options{}
+          .set<GrpcNumChannelsOption>(kTestChannels)
+          .set<bigtable::MinConnectionRefreshOption>(ms(1000)));
+  auto stub = CreateBigtableStub(std::move(auth), cq,
+                                 "projects/my-project/instances/my-instance",
+                                 StubManager::Priming::kNoPriming, options);
+}
+
+TEST(BigtableChannelRefresh, InstanceAffinityEnabled) {
+  using ms = std::chrono::milliseconds;
+  using ns = std::chrono::nanoseconds;
+  using ::testing::AllOf;
+  using ::testing::Ge;
+  using ::testing::Le;
+
+  auto mock = std::make_shared<MockCompletionQueueImpl>();
+
+  EXPECT_CALL(*mock, RunAsync).Times(kTestChannels);
+  EXPECT_CALL(*mock, MakeRelativeTimer(ns(std::chrono::seconds(120))))
+      .WillOnce([](std::chrono::nanoseconds) {
+        return make_ready_future<
+            StatusOr<std::chrono::system_clock::time_point>>(
+            Status(StatusCode::kCancelled, "cancelled"));
+      });
+  EXPECT_CALL(*mock,
+              MakeRelativeTimer(AllOf(Ge(ns(ms(500))), Le(ns(ms(1000))))))
+      .Times(kTestChannels)
+      .WillRepeatedly([](std::chrono::nanoseconds) {
+        return make_ready_future<
+            StatusOr<std::chrono::system_clock::time_point>>(
+            Status(StatusCode::kCancelled, "cancelled"));
+      });
+
+  CompletionQueue cq(mock);
+  auto auth = MakeStubFactoryMockAuth();
+  auto stub = CreateBigtableStub(
+      std::move(auth), cq, "projects/my-project/instances/my-instance",
+      StubManager::Priming::kNoPriming,
+      Options{}
+          .set<GrpcNumChannelsOption>(kTestChannels)
+          .set<bigtable::MinConnectionRefreshOption>(ms(500))
+          .set<bigtable::MaxConnectionRefreshOption>(ms(1000)));
 }
 
 }  // namespace
