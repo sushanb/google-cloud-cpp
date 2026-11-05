@@ -31,7 +31,18 @@
 #include "google/cloud/testing_util/validate_metadata.h"
 #include "absl/strings/str_format.h"
 #include <gmock/gmock.h>
+#include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <queue>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
 namespace google {
 namespace cloud {
@@ -1326,6 +1337,189 @@ TEST_F(AsyncRowReaderTest, DeepStack) {
                          std::make_shared<OperationContext>());
 }
 
+TEST_F(AsyncRowReaderTest, DeepStackCrossThreadIsolation) {
+  // Return 150 rows ("000" .. "149") in a single response. On the calling
+  // thread, recursion reaches depth 100 at row "099" and offloads remaining
+  // work via `CQ::RunAsync`. Executing that `RunAsync` callback on a fresh
+  // worker thread must start with recursion depth 0 (even while the calling
+  // thread is still blocked at depth 100), so rows "100" .. "149" complete
+  // without triggering any further `RunAsync` hops.
+  auto mock_cq = std::make_shared<MockCompletionQueueImpl>();
+  EXPECT_CALL(*mock_cq, RunAsync)
+      .Times(1)
+      .WillOnce([](std::unique_ptr<internal::RunAsyncBase> f) {
+        std::thread worker([f = std::move(f)] { f->exec(); });
+        worker.join();
+      });
+  CompletionQueue cq(mock_cq);
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, AsyncReadRows)
+      .WillOnce([this](Unused, auto client_context, Unused,
+                       v2::ReadRowsRequest const& request, auto const&) {
+        metadata_fixture_.SetServerMetadata(*client_context, {});
+        EXPECT_EQ(kAppProfile, request.app_profile_id());
+        EXPECT_EQ(kTableName, request.table_name());
+        auto stream = std::make_unique<MockAsyncReadRowsStream>();
+        EXPECT_CALL(*stream, Start).WillOnce([] {
+          return make_ready_future(true);
+        });
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([] {
+              int i = 0;
+              std::vector<std::pair<std::string, bool>> v(150);
+              std::generate_n(v.begin(), 150, [&i] {
+                return std::make_pair(absl::StrFormat("%03d", i++), true);
+              });
+              return make_ready_future(MakeResponse(std::move(v)));
+            })
+            .WillOnce([] { return make_ready_future(EndOfStream()); });
+        EXPECT_CALL(*stream, Finish).WillOnce([] {
+          return make_ready_future(Status{});
+        });
+        return stream;
+      });
+
+  int row_index = 0;
+  MockFunction<future<bool>(bigtable::Row const&)> on_row;
+  EXPECT_CALL(on_row, Call)
+      .Times(150)
+      .WillRepeatedly([&row_index](bigtable::Row const& row) {
+        EXPECT_EQ(absl::StrFormat("%03d", row_index++), row.row_key());
+        return make_ready_future(true);
+      });
+
+  MockFunction<void(Status const&)> on_finish;
+  EXPECT_CALL(on_finish, Call).WillOnce([](Status const& status) {
+    ASSERT_STATUS_OK(status);
+  });
+
+  auto retry = DataLimitedErrorCountRetryPolicy(kNumRetries).clone();
+  auto mock_b = std::make_unique<MockBackoffPolicy>();
+  EXPECT_CALL(*mock_b, OnCompletion).Times(0);
+
+  AsyncRowReader::Create(cq, mock, kAppProfile, kTableName,
+                         on_row.AsStdFunction(), on_finish.AsStdFunction(),
+                         bigtable::RowSet(), bigtable::RowReader::NO_ROWS_LIMIT,
+                         bigtable::Filter::PassAllFilter(), false,
+                         std::move(retry), std::move(mock_b), false,
+                         std::make_shared<OperationContext>());
+}
+
+TEST_F(AsyncRowReaderTest, DeepStackConcurrentBackpressureAndMultiThreadedCq) {
+  auto constexpr kTotalRows = std::size_t{250};
+  auto constexpr kAsyncRows = std::size_t{20};
+
+  std::mutex mu;
+  std::condition_variable cv;
+  std::queue<promise<bool>> pending_promises;
+  bool stop_workers = false;
+
+  std::mutex rows_mu;
+  std::vector<std::string> received_keys;
+
+  promise<Status> done;
+  auto done_future = done.get_future();
+
+  internal::AutomaticallyCreatedBackgroundThreads background(4);
+
+  auto fulfill_loop = [&] {
+    for (;;) {
+      promise<bool> p;
+      {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return stop_workers || !pending_promises.empty(); });
+        if (pending_promises.empty()) return;
+        p = std::move(pending_promises.front());
+        pending_promises.pop();
+      }
+      p.set_value(true);
+    }
+  };
+  std::vector<std::thread> app_threads;
+  app_threads.emplace_back(fulfill_loop);
+  app_threads.emplace_back(fulfill_loop);
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, AsyncReadRows)
+      .WillOnce([this](Unused, auto client_context, Unused,
+                       v2::ReadRowsRequest const& request, auto const&) {
+        metadata_fixture_.SetServerMetadata(*client_context, {});
+        EXPECT_EQ(kAppProfile, request.app_profile_id());
+        EXPECT_EQ(kTableName, request.table_name());
+        auto stream = std::make_unique<MockAsyncReadRowsStream>();
+        EXPECT_CALL(*stream, Start).WillOnce([] {
+          return make_ready_future(true);
+        });
+        EXPECT_CALL(*stream, Read)
+            .WillOnce([] {
+              int i = 0;
+              std::vector<std::pair<std::string, bool>> v(kTotalRows);
+              std::generate_n(v.begin(), kTotalRows, [&i] {
+                return std::make_pair(absl::StrFormat("%03d", i++), true);
+              });
+              return make_ready_future(MakeResponse(std::move(v)));
+            })
+            .WillOnce([] { return make_ready_future(EndOfStream()); });
+        EXPECT_CALL(*stream, Finish).WillOnce([] {
+          return make_ready_future(Status{});
+        });
+        return stream;
+      });
+
+  auto on_row = [&](bigtable::Row const& row) {
+    std::size_t idx = 0;
+    {
+      std::lock_guard<std::mutex> lk(rows_mu);
+      idx = received_keys.size();
+      received_keys.push_back(row.row_key());
+    }
+    if (idx < kAsyncRows) {
+      promise<bool> p;
+      auto f = p.get_future();
+      {
+        std::lock_guard<std::mutex> lk(mu);
+        pending_promises.push(std::move(p));
+      }
+      cv.notify_one();
+      return f;
+    }
+    return make_ready_future(true);
+  };
+
+  auto on_finish = [&done](Status status) {
+    done.set_value(std::move(status));
+  };
+
+  auto retry = DataLimitedErrorCountRetryPolicy(kNumRetries).clone();
+  auto mock_b = std::make_unique<MockBackoffPolicy>();
+  EXPECT_CALL(*mock_b, OnCompletion).Times(0);
+
+  AsyncRowReader::Create(background.cq(), mock, kAppProfile, kTableName,
+                         std::move(on_row), std::move(on_finish),
+                         bigtable::RowSet(), bigtable::RowReader::NO_ROWS_LIMIT,
+                         bigtable::Filter::PassAllFilter(), false,
+                         std::move(retry), std::move(mock_b), false,
+                         std::make_shared<OperationContext>());
+
+  auto final_status = done_future.get();
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    stop_workers = true;
+  }
+  cv.notify_all();
+  for (auto& t : app_threads) {
+    t.join();
+  }
+  background.Shutdown();
+
+  ASSERT_STATUS_OK(final_status);
+  ASSERT_EQ(kTotalRows, received_keys.size());
+  for (std::size_t i = 0; i < kTotalRows; ++i) {
+    EXPECT_EQ(absl::StrFormat("%03d", static_cast<int>(i)), received_keys[i]);
+  }
+}
+
 TEST_F(AsyncRowReaderTest, TimerErrorEndsLoop) {
   // Simulate a timer error (likely due to the CQ being shutdown). We should not
   // retry in this case.
@@ -1335,6 +1529,29 @@ TEST_F(AsyncRowReaderTest, TimerErrorEndsLoop) {
         Status(StatusCode::kCancelled, "timer cancelled"));
   });
   CompletionQueue cq(mock_cq);
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_shared<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(1);
+  EXPECT_CALL(*mock_metric, PostCall).Times(1);
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce([](opentelemetry::context::Context const&,
+                   OnDoneParams const& params) {
+        EXPECT_THAT(params.operation_status,
+                    StatusIs(StatusCode::kUnavailable));
+      });
+  EXPECT_CALL(*mock_metric, ElementRequest).Times(1);
+  EXPECT_CALL(*mock_metric, ElementDelivery).Times(1);
+
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+
+  // Normally std::make_shared would be used here, but some weird type deduction
+  // is preventing it.
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({mock_metric}, clock));
+#else
+  auto operation_context = std::make_shared<OperationContext>();
+#endif
 
   auto mock = std::make_shared<MockBigtableStub>();
   EXPECT_CALL(*mock, AsyncReadRows)
@@ -1384,7 +1601,109 @@ TEST_F(AsyncRowReaderTest, TimerErrorEndsLoop) {
                          bigtable::RowSet(), bigtable::RowReader::NO_ROWS_LIMIT,
                          bigtable::Filter::PassAllFilter(), false,
                          std::move(retry), std::move(mock_b), false,
-                         std::make_shared<OperationContext>());
+                         std::move(operation_context));
+}
+
+class RetryAllErrorsPolicy : public bigtable::DataRetryPolicy {
+ public:
+  bool OnFailure(Status const&) override { return true; }
+  bool IsExhausted() const override { return false; }
+  bool IsPermanentFailure(Status const&) const override { return false; }
+  std::unique_ptr<bigtable::DataRetryPolicy> clone() const override {
+    return std::make_unique<RetryAllErrorsPolicy>();
+  }
+};
+
+TEST_F(AsyncRowReaderTest, TimerErrorDrainsBufferedRowsWithCustomRetryPolicy) {
+  auto mock_cq = std::make_shared<MockCompletionQueueImpl>();
+  EXPECT_CALL(*mock_cq, MakeRelativeTimer).WillOnce([] {
+    return make_ready_future<StatusOr<std::chrono::system_clock::time_point>>(
+        Status(StatusCode::kCancelled, "timer cancelled"));
+  });
+  CompletionQueue cq(mock_cq);
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_shared<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(1);
+  EXPECT_CALL(*mock_metric, PostCall).Times(1);
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce([](opentelemetry::context::Context const&,
+                   OnDoneParams const& params) {
+        EXPECT_THAT(params.operation_status, StatusIs(StatusCode::kInternal));
+      });
+  EXPECT_CALL(*mock_metric, ElementRequest).Times(2);
+  EXPECT_CALL(*mock_metric, ElementDelivery).Times(2);
+
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+
+  // Normally std::make_shared would be used here, but some weird type deduction
+  // is preventing it.
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({mock_metric}, clock));
+#else
+  auto operation_context = std::make_shared<OperationContext>();
+#endif
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, AsyncReadRows)
+      .WillOnce([this](Unused, auto client_context, Unused,
+                       v2::ReadRowsRequest const& request, auto const&) {
+        metadata_fixture_.SetServerMetadata(*client_context, {});
+        EXPECT_EQ(kAppProfile, request.app_profile_id());
+        EXPECT_EQ(kTableName, request.table_name());
+        auto stream = std::make_unique<MockAsyncReadRowsStream>();
+        ::testing::InSequence s;
+        EXPECT_CALL(*stream, Start).WillOnce([] {
+          return make_ready_future(true);
+        });
+        EXPECT_CALL(*stream, Read).WillOnce([] {
+          // Buffer "r1" and "r2" in ready_rows_, then fail on out-of-order "r0"
+          // with kInternal so OnDataReceived interrupts the stream before
+          // draining ready_rows_.
+          return make_ready_future(
+              MakeResponse({{"r1", true}, {"r2", true}, {"r0", true}}));
+        });
+        EXPECT_CALL(*stream, Cancel);
+        EXPECT_CALL(*stream, Read).WillOnce([] {
+          return make_ready_future(EndOfStream());
+        });
+        EXPECT_CALL(*stream, Finish).WillOnce([] {
+          return make_ready_future(Status{});
+        });
+        return stream;
+      });
+
+  MockFunction<future<bool>(bigtable::Row const&)> on_row;
+  EXPECT_CALL(on_row, Call)
+      .WillOnce([](bigtable::Row const& row) {
+        EXPECT_EQ("r1", row.row_key());
+        return make_ready_future(true);
+      })
+      .WillOnce([](bigtable::Row const& row) {
+        EXPECT_EQ("r2", row.row_key());
+        return make_ready_future(true);
+      });
+
+  MockFunction<void(Status const&)> on_finish;
+  EXPECT_CALL(on_finish, Call).WillOnce([](Status const& status) {
+    EXPECT_THAT(status, StatusIs(StatusCode::kInternal));
+  });
+
+  auto retry = std::make_unique<RetryAllErrorsPolicy>();
+  auto mock_b = std::make_unique<MockBackoffPolicy>();
+  EXPECT_CALL(*mock_b, OnCompletion).WillOnce(Return(ms(0)));
+
+  MockFunction<void(grpc::ClientContext&)> mock_setup;
+  EXPECT_CALL(mock_setup, Call).Times(1);
+  internal::OptionsSpan span(
+      Options{}.set<internal::GrpcSetupOption>(mock_setup.AsStdFunction()));
+
+  AsyncRowReader::Create(cq, mock, kAppProfile, kTableName,
+                         on_row.AsStdFunction(), on_finish.AsStdFunction(),
+                         bigtable::RowSet(), bigtable::RowReader::NO_ROWS_LIMIT,
+                         bigtable::Filter::PassAllFilter(), false,
+                         std::move(retry), std::move(mock_b), false,
+                         std::move(operation_context));
 }
 
 TEST_F(AsyncRowReaderTest, CurrentOptionsContinuedOnRetries) {

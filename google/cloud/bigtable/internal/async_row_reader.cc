@@ -72,16 +72,17 @@ void AsyncRowReader::TryGiveRowToUser() {
   // overcome this is to always switch thread to a CompletionQueue thread.
   // Switching thread for every row has a non-trivial cost, though. To find a
   // good balance, we allow for recursion no deeper than 100 and achieve it by
-  // tracking the level in `recursion_level_`.
+  // tracking the per-thread level in `recursion_level`.
   //
   // The magic value 100 is arbitrary, but back-of-the-envelope calculation
   // indicates it should cap this stack usage to below 100K. Default stack
   // size is usually 1MB.
+  static thread_local int recursion_level = 0;
   struct CountFrames {
     explicit CountFrames(int& cntr) : cntr(++cntr) {}
     ~CountFrames() { --cntr; }
     int& cntr;
-  } counter(recursion_level_);
+  } counter(recursion_level);
 
   if (ready_rows_.empty()) {
     if (whole_op_finished_) {
@@ -107,9 +108,8 @@ void AsyncRowReader::TryGiveRowToUser() {
   ready_rows_.pop();
 
   auto self = this->shared_from_this();
-  bool const break_recursion = recursion_level_ >= 100;
   operation_context_->ElementDelivery(*client_context_);
-  on_row_(std::move(row)).then([self, break_recursion](future<bool> fut) {
+  on_row_(std::move(row)).then([self](future<bool> fut) {
     bool should_cancel;
 #if GOOGLE_CLOUD_CPP_HAVE_EXCEPTIONS
     try {
@@ -133,7 +133,7 @@ void AsyncRowReader::TryGiveRowToUser() {
       self->Cancel("User cancelled");
       return;
     }
-    if (break_recursion) {
+    if (recursion_level >= 100) {
       self->cq_.RunAsync([self] { self->UserWantsRows(); });
       return;
     }
@@ -230,7 +230,6 @@ void AsyncRowReader::OnStreamFinished(Status status) {
     TryGiveRowToUser();
     return;
   }
-  client_context_.reset();
   auto self = this->shared_from_this();
   internal::TracedAsyncBackoff(cq_, *call_context_.options, *delay,
                                "Async Backoff")
@@ -239,6 +238,7 @@ void AsyncRowReader::OnStreamFinished(Status status) {
           self->MakeRequest();
         } else {
           self->whole_op_finished_ = true;
+          self->operation_context_->OnDone(self->status_);
           self->TryGiveRowToUser();
         }
       });
