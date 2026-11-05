@@ -15,7 +15,13 @@
 #include "google/cloud/bigtable/mutation_batcher.h"
 #include "google/cloud/bigtable/internal/client_options_defaults.h"
 #include "google/cloud/grpc_error_delegate.h"
+#include "google/cloud/internal/throw_delegate.h"
+#include <algorithm>
+#include <cstddef>
+#include <mutex>
 #include <sstream>
+#include <utility>
+#include <vector>
 
 namespace google {
 namespace cloud {
@@ -190,6 +196,8 @@ bool MutationBatcher::FlushIfPossible(CompletionQueue cq) {
 void MutationBatcher::OnBulkApplyDone(
     CompletionQueue cq, MutationBatcher::Batch batch,
     std::vector<FailedMutation> const& failed) {
+  std::vector<std::pair<CompletionPromise, Status>> completion_promises;
+  completion_promises.reserve(batch.mutation_data.size());
   // First process all the failures, marking the mutations as done after
   // processing them.
   for (auto const& f : failed) {
@@ -204,25 +212,56 @@ void MutationBatcher::OnBulkApplyDone(
       google::cloud::internal::ThrowRuntimeError(std::move(os).str());
     }
     MutationData& data = batch.mutation_data[idx];
-    data.completion_promise.set_value(f.status());
-    data.done = true;
+    if (!data.done) {
+      completion_promises.emplace_back(std::move(data.completion_promise),
+                                       f.status());
+      data.done = true;
+    }
   }
   // Any remaining mutations are treated as successful.
   for (auto& data : batch.mutation_data) {
     if (!data.done) {
-      data.completion_promise.set_value(Status());
+      completion_promises.emplace_back(std::move(data.completion_promise),
+                                       Status());
       data.done = true;
     }
   }
   auto const num_mutations = batch.mutation_data.size();
   batch.mutation_data.clear();
 
-  std::unique_lock<std::mutex> lk(mu_);
-  outstanding_size_ -= batch.requests_size;
-  outstanding_mutations_ -= batch.num_mutations;
-  num_requests_pending_ -= num_mutations;
-  num_outstanding_batches_--;
-  SatisfyPromises(TryAdmit(cq), lk);  // unlocks the lock
+  std::vector<AdmissionPromise> admission_promises;
+  std::vector<NoMorePendingPromise> no_more_pending_promises;
+  {
+    std::unique_lock<std::mutex> lk(mu_);
+    outstanding_size_ -= batch.requests_size;
+    outstanding_mutations_ -= batch.num_mutations;
+    num_requests_pending_ -= num_mutations;
+    num_outstanding_batches_--;
+    admission_promises = TryAdmit(cq);
+    if (num_requests_pending_ == 0 && num_outstanding_batches_ == 0) {
+      // We should wait not only on num_requests_pending_ being zero but also on
+      // num_outstanding_batches_ because we want to allow the user to kill the
+      // completion queue after this promise is fulfilled. Otherwise, the user
+      // can destroy the completion queue while the last batch is still being
+      // processed - we've had this bug (#2140).
+      no_more_pending_promises_.swap(no_more_pending_promises);
+    }
+  }
+
+  // Satisfy promises outside `mu_` and without touching `this` again, as a
+  // continuation or waiting thread may destroy the `MutationBatcher`.
+  // `completion_promises` are satisfied before `no_more_pending_promises` so
+  // that `completion_future.then()` callbacks finish before
+  // `AsyncWaitForNoPendingRequests()` unblocks.
+  for (auto& promise : admission_promises) {
+    promise.set_value();
+  }
+  for (auto& p : completion_promises) {
+    p.first.set_value(std::move(p.second));
+  }
+  for (auto& promise : no_more_pending_promises) {
+    promise.set_value();
+  }
 }
 
 std::vector<MutationBatcher::AdmissionPromise> MutationBatcher::TryAdmit(
