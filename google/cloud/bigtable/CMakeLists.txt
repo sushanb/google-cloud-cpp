@@ -259,7 +259,11 @@ add_library(
     internal/sessions/session/session_impl.h
     internal/sessions/session/session_state.h
     internal/sessions/session/write_status.h
+    internal/sessions/sessions_data_connection.cc
+    internal/sessions/sessions_data_connection.h
     internal/sessions/sessions_options.h
+    internal/sessions/shim/client_directory.h
+    internal/sessions/shim/diverter.h
     internal/sessions/telemetry/debug_snapshot.h
     internal/sessions/telemetry/session_tracer.h
     internal/sessions/transport/current_cq.h
@@ -552,7 +556,11 @@ if (BUILD_TESTING)
         internal/sessions/pool/session_pool_impl_test.cc
         internal/sessions/pool/session_pool_lifecycle_test.cc
         internal/sessions/session/session_impl_test.cc
+        internal/sessions/sessions_data_connection_test.cc
+        internal/sessions/sessions_layer_lint_test.cc
         internal/sessions/sessions_options_test.cc
+        internal/sessions/sessions_spec_test.cc
+        internal/sessions/shim/client_directory_test.cc
         internal/sessions/telemetry/session_tracer_test.cc
         internal/sessions/transport/peak_ewma_tracker_test.cc
         internal/sessions/transport/session_stream_test.cc

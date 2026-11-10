@@ -25,6 +25,8 @@
 #include "google/cloud/bigtable/internal/mutate_rows_limiter.h"
 #include "google/cloud/bigtable/internal/partial_result_set_source.h"
 #include "google/cloud/bigtable/internal/row_reader_impl.h"
+#include "google/cloud/bigtable/internal/sessions/sessions_data_connection.h"
+#include "google/cloud/bigtable/internal/sessions/sessions_options.h"
 #include "google/cloud/bigtable/options.h"
 #include "google/cloud/bigtable/result_source_interface.h"
 #include "google/cloud/background_threads.h"
@@ -64,7 +66,7 @@ namespace bigtable {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace {
 
-std::unique_ptr<bigtable_internal::OperationContextFactory>
+std::shared_ptr<bigtable_internal::OperationContextFactory>
 MakeOperationContextFactory(
     Options const& options,
     std::vector<bigtable::InstanceResource> const& instances) {
@@ -85,11 +87,11 @@ MakeOperationContextFactory(
                                            client_uid);
     }
 #endif  // GOOGLE_CLOUD_CPP_BIGTABLE_WITH_GRPC_OTEL_METRICS
-    return std::make_unique<bigtable_internal::MetricsOperationContextFactory>(
+    return std::make_shared<bigtable_internal::MetricsOperationContextFactory>(
         std::move(client_uid), std::move(metric_service_connection), options);
   }
 #endif  // GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
-  return std::make_unique<bigtable_internal::SimpleOperationContextFactory>();
+  return std::make_shared<bigtable_internal::SimpleOperationContextFactory>();
 }
 
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
@@ -110,7 +112,7 @@ struct DataConnectionComponents {
   std::unique_ptr<BackgroundThreads> background;
   std::shared_ptr<google::cloud::internal::GrpcAuthenticationStrategy> auth;
   std::shared_ptr<bigtable_internal::MutateRowsLimiter> limiter;
-  std::unique_ptr<bigtable_internal::OperationContextFactory>
+  std::shared_ptr<bigtable_internal::OperationContextFactory>
       operation_context_factory;
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
   std::shared_ptr<bigtable_internal::DirectAccessCompatibility>
@@ -124,7 +126,8 @@ DataConnectionComponents MakeDataConnectionComponents(
   google::cloud::internal::CheckExpectedOptions<
       bigtable::AppProfileIdOption, CommonOptionList, GrpcOptionList,
       UnifiedCredentialsOptionList, bigtable::ClientOptionList,
-      bigtable::DataPolicyOptionList>(options, location);
+      bigtable::DataPolicyOptionList, bigtable_internal::SessionsOptionList>(
+      options, location);
   if (!instances.empty()) {
     options.set<bigtable_internal::InstanceChannelAffinityOption>(instances);
   }
@@ -136,7 +139,7 @@ DataConnectionComponents MakeDataConnectionComponents(
                                                             options);
   std::shared_ptr<bigtable_internal::MutateRowsLimiter> limiter =
       bigtable_internal::MakeMutateRowsLimiter(background->cq(), options);
-  std::unique_ptr<bigtable_internal::OperationContextFactory>
+  std::shared_ptr<bigtable_internal::OperationContextFactory>
       operation_context_factory =
           MakeOperationContextFactory(options, instances);
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
@@ -546,6 +549,7 @@ std::shared_ptr<DataConnection> MakeDataConnection(
     std::vector<InstanceResource> const& instances, Options options) {
   DataConnectionComponents components =
       MakeDataConnectionComponents(std::move(options), instances, __func__);
+  auto shared_factory = components.operation_context_factory;
 
   std::shared_ptr<DataConnection> conn;
   if (!instances.empty() &&
@@ -554,14 +558,26 @@ std::shared_ptr<DataConnection> MakeDataConnection(
   } else {
     conn = MakeInstanceAffinityDataConnection(std::move(components), instances);
   }
+  if (conn->options().get<experimental::EnableSessionsOption>()) {
+    auto conn_opts = conn->options();
+    conn = bigtable_internal::sessions::MakeSessionsDataConnection(
+        std::move(conn), std::move(shared_factory), instances,
+        std::move(conn_opts));
+  }
   return WrapDataTracing(std::move(conn));
 }
 
 std::shared_ptr<DataConnection> MakeDataConnection(Options options) {
   DataConnectionComponents components =
       MakeDataConnectionComponents(std::move(options), {}, __func__);
+  auto shared_factory = components.operation_context_factory;
   std::shared_ptr<DataConnection> conn =
       MakeSingleStubDataConnection(std::move(components));
+  if (conn->options().get<experimental::EnableSessionsOption>()) {
+    auto conn_opts = conn->options();
+    conn = bigtable_internal::sessions::MakeSessionsDataConnection(
+        std::move(conn), std::move(shared_factory), {}, std::move(conn_opts));
+  }
   return WrapDataTracing(std::move(conn));
 }
 
