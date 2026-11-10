@@ -226,6 +226,13 @@ add_library(
     internal/row_reader_impl.h
     internal/rpc_policy_parameters.h
     internal/rpc_policy_parameters.inc
+    internal/sessions/client.cc
+    internal/sessions/client.h
+    internal/sessions/client/client_configuration_manager.cc
+    internal/sessions/client/client_configuration_manager.h
+    internal/sessions/client/session_client.h
+    internal/sessions/client/sync_waiter.cc
+    internal/sessions/client/sync_waiter.h
     internal/sessions/latch.h
     internal/sessions/logging_helper.h
     internal/sessions/middleware/cancellable_vrpc.cc
@@ -531,6 +538,9 @@ if (BUILD_TESTING)
         internal/query_plan_test.cc
         internal/rate_limiter_test.cc
         internal/retry_traits_test.cc
+        internal/sessions/client/client_configuration_manager_test.cc
+        internal/sessions/client/sync_waiter_test.cc
+        internal/sessions/client_test.cc
         internal/sessions/middleware/cancellable_vrpc_test.cc
         internal/sessions/middleware/retrying_vrpc_test.cc
         internal/sessions/pool/dynamic_picker_test.cc
