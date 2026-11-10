@@ -56,7 +56,7 @@ TEST(MetricsOperationContextFactoryTest, ReadRow) {
         EXPECT_THAT(resource_labels.cluster, IsEmpty());
         EXPECT_THAT(resource_labels.zone, IsEmpty());
         EXPECT_THAT(data_labels.method, Eq("ReadRow"));
-        EXPECT_THAT(data_labels.streaming, Eq("true"));
+        EXPECT_THAT(data_labels.streaming, Eq("false"));
         EXPECT_THAT(data_labels.client_name,
                     Eq("cpp.Bigtable/" + version_string()));
         EXPECT_THAT(data_labels.client_uid, Eq("my-client-uid"));
@@ -395,6 +395,8 @@ TEST(MetricsOperationContextFactoryTest,
     op->StubSelection(
         StubSelectionParams{10, ChannelPoolLbPolicy::kRandomTwoLeastUsed,
                             TransportType::kDirectPath, RpcType::kUnary});
+    EXPECT_THAT(factory.provider(), NotNull());
+    EXPECT_THAT(factory.client_uid(), Eq("test-uid"));
   }
 }
 

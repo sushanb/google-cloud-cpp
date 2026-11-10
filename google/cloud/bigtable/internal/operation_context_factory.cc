@@ -30,6 +30,16 @@
 #include <opentelemetry/sdk/metrics/export/periodic_exporting_metric_reader_factory.h>
 #include <opentelemetry/sdk/metrics/meter_context_factory.h>
 #include <opentelemetry/sdk/metrics/meter_provider_factory.h>
+#include <opentelemetry/sdk/metrics/view/instrument_selector.h>
+#include <opentelemetry/sdk/metrics/view/meter_selector.h>
+#include <opentelemetry/sdk/metrics/view/view.h>
+#include <opentelemetry/version.h>
+#if OPENTELEMETRY_VERSION_MAJOR > 1 || \
+    (OPENTELEMETRY_VERSION_MAJOR == 1 && OPENTELEMETRY_VERSION_MINOR >= 10)
+#include <opentelemetry/sdk/metrics/view/instrument_selector_factory.h>
+#include <opentelemetry/sdk/metrics/view/meter_selector_factory.h>
+#include <opentelemetry/sdk/metrics/view/view_factory.h>
+#endif
 #include <string_view>
 #endif  // GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
 
@@ -182,6 +192,87 @@ std::shared_ptr<OperationContext> MakeOperationContext(
   return std::make_shared<OperationContext>(
       CloneMetrics(resource_labels, data_labels, client_labels, metrics),
       clock);
+}
+
+std::vector<double> const& SessionLifetimeHistogramBoundaries() {
+  static auto const* const kBoundaries = [] {
+    auto* b = new std::vector<double>{0.0};
+    for (double v = 1.0; v <= 86400000.0; v *= 2.0) {
+      b->push_back(v);
+    }
+    return b;
+  }();
+  return *kBoundaries;
+}
+
+std::vector<double> const& FineGrainLatencyHistogramBoundaries() {
+  static auto const* const kBoundaries = new std::vector<double>{
+      0.0,       0.1,     0.2,      0.3,      0.4,      0.5,       0.6,
+      0.7,       0.8,     0.9,      1.0,      1.1,      1.2,       1.3,
+      1.4,       1.5,     1.6,      1.7,      1.8,      1.9,       2.0,
+      2.1,       2.2,     2.3,      2.4,      2.5,      2.6,       2.7,
+      2.8,       2.9,     3.0,      4.0,      5.0,      6.0,       8.0,
+      10.0,      13.0,    16.0,     20.0,     25.0,     30.0,      40.0,
+      50.0,      65.0,    80.0,     100.0,    130.0,    160.0,     200.0,
+      250.0,     300.0,   400.0,    500.0,    650.0,    800.0,     900.0,
+      1000.0,    2000.0,  3000.0,   4000.0,   5000.0,   6000.0,    10000.0,
+      20000.0,   50000.0, 100000.0, 200000.0, 500000.0, 1000000.0, 2000000.0,
+      5000000.0,
+  };
+  return *kBoundaries;
+}
+
+void RegisterHistogramView(opentelemetry::sdk::metrics::ViewRegistry& registry,
+                           std::string const& meter_name,
+                           std::string const& meter_version,
+                           std::string const& instrument_name,
+                           std::string const& unit,
+                           std::vector<double> boundaries) {
+  auto histogram_config = std::make_unique<
+      opentelemetry::sdk::metrics::HistogramAggregationConfig>();
+  histogram_config->boundaries_ = std::move(boundaries);
+  auto aggregation_config =
+      std::shared_ptr<opentelemetry::sdk::metrics::AggregationConfig>(
+          std::move(histogram_config));
+  std::string description = "Explicit histogram buckets for " + instrument_name;
+
+#if OPENTELEMETRY_VERSION_MAJOR > 1 || \
+    (OPENTELEMETRY_VERSION_MAJOR == 1 && OPENTELEMETRY_VERSION_MINOR >= 23)
+  registry.AddView(
+      opentelemetry::sdk::metrics::InstrumentSelectorFactory::Create(
+          opentelemetry::sdk::metrics::InstrumentType::kHistogram,
+          instrument_name, unit),
+      opentelemetry::sdk::metrics::MeterSelectorFactory::Create(
+          meter_name, meter_version, ""),
+      opentelemetry::sdk::metrics::ViewFactory::Create(
+          instrument_name, std::move(description),
+          opentelemetry::sdk::metrics::AggregationType::kHistogram,
+          std::move(aggregation_config)));
+#elif OPENTELEMETRY_VERSION_MAJOR > 1 || \
+    (OPENTELEMETRY_VERSION_MAJOR == 1 && OPENTELEMETRY_VERSION_MINOR >= 10)
+  registry.AddView(
+      opentelemetry::sdk::metrics::InstrumentSelectorFactory::Create(
+          opentelemetry::sdk::metrics::InstrumentType::kHistogram,
+          instrument_name, unit),
+      opentelemetry::sdk::metrics::MeterSelectorFactory::Create(
+          meter_name, meter_version, ""),
+      opentelemetry::sdk::metrics::ViewFactory::Create(
+          instrument_name, std::move(description), unit,
+          opentelemetry::sdk::metrics::AggregationType::kHistogram,
+          std::move(aggregation_config)));
+#else
+  (void)unit;
+  registry.AddView(
+      std::make_unique<opentelemetry::sdk::metrics::InstrumentSelector>(
+          opentelemetry::sdk::metrics::InstrumentType::kHistogram,
+          instrument_name),
+      std::make_unique<opentelemetry::sdk::metrics::MeterSelector>(
+          meter_name, meter_version, ""),
+      std::make_unique<opentelemetry::sdk::metrics::View>(
+          instrument_name, std::move(description),
+          opentelemetry::sdk::metrics::AggregationType::kHistogram,
+          std::move(aggregation_config)));
+#endif
 }
 
 }  // namespace
@@ -359,8 +450,30 @@ void MetricsOperationContextFactory::InitializeProvider(
       opentelemetry::sdk::metrics::PeriodicExportingMetricReaderFactory::Create(
           std::move(exporter), reader_options);
 
+  auto view_registry =
+      std::make_unique<opentelemetry::sdk::metrics::ViewRegistry>();
+  auto constexpr kSessionsMeterName = "google-cloud-cpp-bigtable-sessions";
+  auto constexpr kSessionsMeterVersion = "1.0.0";
+  RegisterHistogramView(*view_registry, kSessionsMeterName,
+                        kSessionsMeterVersion, "session/open_latencies", "ms",
+                        FineGrainLatencyHistogramBoundaries());
+  RegisterHistogramView(*view_registry, kSessionsMeterName,
+                        kSessionsMeterVersion, "session/durations", "ms",
+                        SessionLifetimeHistogramBoundaries());
+  RegisterHistogramView(*view_registry, kSessionsMeterName,
+                        kSessionsMeterVersion, "session/uptime", "ms",
+                        SessionLifetimeHistogramBoundaries());
+  RegisterHistogramView(*view_registry, kSessionsMeterName,
+                        kSessionsMeterVersion, "transport_latencies", "ms",
+                        FineGrainLatencyHistogramBoundaries());
+  for (auto const* rpc_scope : {"ReadRow", "MutateRow"}) {
+    RegisterHistogramView(*view_registry, rpc_scope, "v1",
+                          "throttling_latencies", "ms",
+                          FineGrainLatencyHistogramBoundaries());
+  }
+
   auto context = opentelemetry::sdk::metrics::MeterContextFactory::Create(
-      std::make_unique<opentelemetry::sdk::metrics::ViewRegistry>(),
+      std::move(view_registry),
       // NOTE: this skips OTel's built in resource detection which is more
       // confusing than helpful. (The default is {{"service_name",
       // "unknown_service" }}). And after #14930, this gets copied into our
@@ -384,6 +497,7 @@ std::shared_ptr<OperationContext> MetricsOperationContextFactory::ReadRow(
     v.emplace_back(std::make_shared<RetryCount>(kRpc, provider_));
     v.emplace_back(
         std::make_shared<ApplicationBlockingLatency>(kRpc, provider_));
+    v.emplace_back(std::make_shared<ThrottlingLatency>(kRpc, provider_));
     v.emplace_back(std::make_shared<ServerLatency>(kRpc, provider_));
     v.emplace_back(std::make_shared<ConnectivityErrorCount>(kRpc, provider_));
     v.emplace_back(std::make_shared<OutstandingRpcs>(kRpc, provider_));
@@ -392,7 +506,7 @@ std::shared_ptr<OperationContext> MetricsOperationContextFactory::ReadRow(
 
   return MakeOperationContext(
       TableResourceLabelsFromTableName(table_name), kRpc,
-      /*streaming=*/"true", client_uid_, app_profile, client_resource_labels_,
+      /*streaming=*/"false", client_uid_, app_profile, client_resource_labels_,
       read_row_metrics_.metrics, clock_);
 }
 
@@ -431,6 +545,7 @@ std::shared_ptr<OperationContext> MetricsOperationContextFactory::MutateRow(
     v.emplace_back(std::make_shared<RetryCount>(kRpc, provider_));
     v.emplace_back(
         std::make_shared<ApplicationBlockingLatency>(kRpc, provider_));
+    v.emplace_back(std::make_shared<ThrottlingLatency>(kRpc, provider_));
     v.emplace_back(std::make_shared<ServerLatency>(kRpc, provider_));
     v.emplace_back(std::make_shared<ConnectivityErrorCount>(kRpc, provider_));
     v.emplace_back(std::make_shared<OutstandingRpcs>(kRpc, provider_));

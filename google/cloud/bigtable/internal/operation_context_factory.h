@@ -140,6 +140,16 @@ class MetricsOperationContextFactory : public OperationContextFactory {
     return direct_access_compatibility_;
   }
 
+  std::shared_ptr<opentelemetry::metrics::MeterProvider> provider() const {
+    return provider_;
+  }
+
+  std::string const& client_uid() const { return client_uid_; }
+
+  ClientResourceLabels const& client_resource_labels() const {
+    return client_resource_labels_;
+  }
+
  private:
   void InitializeProvider(
       std::shared_ptr<monitoring_v3::MetricServiceConnection> conn,

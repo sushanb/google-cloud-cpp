@@ -2285,6 +2285,106 @@ TEST(ApplicationBlockingLatency, StreamingData) {
   clone->OnDone(otel_context, {clock->Now(), Status{}});
 }
 
+TEST(SessionMetricsTest, ThrottlingLatencyAndServerLatencySuppression) {
+  auto mock_throttling = std::make_unique<MockHistogram<double>>();
+  EXPECT_CALL(
+      *mock_throttling,
+      Record(A<double>(), A<opentelemetry::common::KeyValueIterable const&>(),
+             A<opentelemetry::context::Context const&>()))
+      .WillOnce([](double value,
+                   opentelemetry::common::KeyValueIterable const& attributes,
+                   opentelemetry::context::Context const&) {
+        EXPECT_THAT(value, Eq(2.5));
+        EXPECT_THAT(MakeAttributesMap(attributes),
+                    UnorderedElementsAre(
+                        Pair("project_id", "my-project-id"),
+                        Pair("instance", "my-instance"),
+                        Pair("cluster", "sess-c1"), Pair("table", "my-table"),
+                        Pair("zone", "sess-z1"), Pair("method", "ReadRow"),
+                        Pair("client_name", "my-client-name"),
+                        Pair("client_uid", "my-client-uid"),
+                        Pair("app_profile", "my-app-profile")));
+      });
+
+  auto mock_server = std::make_unique<MockHistogram<double>>();
+  EXPECT_CALL(
+      *mock_server,
+      Record(A<double>(), A<opentelemetry::common::KeyValueIterable const&>(),
+             A<opentelemetry::context::Context const&>()))
+      .Times(0);
+
+  opentelemetry::nostd::shared_ptr<MockMeter> mock_meter =
+      std::make_shared<MockMeter>();
+  EXPECT_CALL(*mock_meter, CreateDoubleHistogram)
+      .WillOnce([mock = std::move(mock_throttling)](
+                    opentelemetry::nostd::string_view name,
+                    opentelemetry::nostd::string_view,
+                    opentelemetry::nostd::string_view unit) mutable {
+        EXPECT_THAT(name, Eq("throttling_latencies"));
+        EXPECT_THAT(unit, Eq("ms"));
+        return std::move(mock);
+      })
+      .WillOnce([mock = std::move(mock_server)](
+                    opentelemetry::nostd::string_view name,
+                    opentelemetry::nostd::string_view,
+                    opentelemetry::nostd::string_view) mutable {
+        EXPECT_THAT(name, Eq("server_latencies"));
+        return std::move(mock);
+      });
+
+  opentelemetry::nostd::shared_ptr<MockMeterProvider> mock_provider =
+      std::make_shared<MockMeterProvider>();
+  EXPECT_CALL(*mock_provider, GetMeter)
+      .Times(2)
+      .WillRepeatedly(::testing::Return(mock_meter));
+
+  ThrottlingLatency throttling("ReadRow", mock_provider);
+  ServerLatency server("ReadRow", mock_provider);
+  TableResourceLabels resource_labels{"my-project-id", "my-instance",
+                                      "my-table", "", ""};
+  TableDataLabels data_labels{"ReadRow",        "false",
+                              "my-client-name", "my-client-uid",
+                              "my-app-profile", ""};
+  auto throttling_clone = throttling.clone(resource_labels, data_labels);
+  auto server_clone = server.clone(resource_labels, data_labels);
+
+  auto otel_context = opentelemetry::context::RuntimeContext::GetCurrent();
+  auto clock = std::make_shared<FakeSteadyClock>();
+
+  SessionAttemptInfo info;
+  info.attempt_status = Status{};
+  info.cluster_id = "sess-c1";
+  info.zone_id = "sess-z1";
+  info.throttling_latency = std::chrono::microseconds(2500);
+  throttling_clone->SessionPostCall(otel_context, {clock->Now(), info});
+  server_clone->SessionPostCall(otel_context, {clock->Now(), info});
+
+  // Unset throttling_latency (pre-write rejection) must not record 0.0ms.
+  SessionAttemptInfo uncommitted;
+  uncommitted.attempt_status = Status(StatusCode::kUnavailable, "uncommitted");
+  throttling_clone->SessionPostCall(otel_context, {clock->Now(), uncommitted});
+}
+
+TEST(SessionMetricsTest, ThreeProngSessionConnectivityErrorCheck) {
+  TableResourceLabels empty_loc{"p", "i", "t", "", ""};
+  TableResourceLabels known_loc{"p", "i", "t", "c1", "z1"};
+
+  SessionAttemptInfo err_no_peer;
+  err_no_peer.attempt_status = Status(StatusCode::kUnavailable, "down");
+  EXPECT_TRUE(IsSessionConnectivityError(err_no_peer, empty_loc));
+  EXPECT_FALSE(IsSessionConnectivityError(err_no_peer, known_loc));
+
+  SessionAttemptInfo err_with_peer = err_no_peer;
+  err_with_peer.has_peer_info = true;
+  err_with_peer.transport_type = "transport_type_session_direct_access";
+  EXPECT_FALSE(IsSessionConnectivityError(err_with_peer, empty_loc));
+
+  SessionAttemptInfo deadline_err;
+  deadline_err.attempt_status =
+      Status(StatusCode::kDeadlineExceeded, "timeout");
+  EXPECT_FALSE(IsSessionConnectivityError(deadline_err, empty_loc));
+}
+
 }  // namespace
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
 }  // namespace bigtable_internal
