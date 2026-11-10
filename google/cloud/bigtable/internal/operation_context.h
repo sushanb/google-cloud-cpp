@@ -20,8 +20,10 @@
 #include "google/cloud/internal/operation_context.h"
 #include "google/cloud/status.h"
 #include <grpcpp/grpcpp.h>
+#include <chrono>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -33,6 +35,20 @@ GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 
 struct StubSelectionParams;
 class Metric;
+
+/// Per-attempt routing, peer, and throttling metadata reported by a Bigtable
+/// Sessions virtual RPC attempt.
+struct SessionAttemptInfo {
+  google::cloud::Status attempt_status;
+  std::string cluster_id;
+  std::string zone_id;
+  std::string transport_type;
+  std::string transport_region;
+  std::string transport_zone;
+  std::string transport_subzone;
+  bool has_peer_info = false;
+  std::optional<std::chrono::nanoseconds> throttling_latency = std::nullopt;
+};
 
 /**
  * A Bigtable-specific context that persists across retries in an operation.
@@ -80,6 +96,12 @@ class OperationContext : public ::google::cloud::internal::OperationContext {
   // synchronously or asynchronously.
   void ElementRequest(grpc::ClientContext const& client_context);
   void ElementDelivery(grpc::ClientContext const& client_context);
+
+  // Session-path hooks for virtual RPC attempts that do not execute over a
+  // per-attempt unary/streaming grpc::ClientContext.
+  void SessionPreCall();
+  void SessionPostCall(SessionAttemptInfo const& info);
+  void SessionElementDelivery();
 
  private:
   void ProcessMetadata(

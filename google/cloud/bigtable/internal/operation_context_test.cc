@@ -129,6 +129,10 @@ class MockMetric : public TableSchemaMetric {
               (opentelemetry::context::Context const&,
                grpc::ClientContext const&, PostCallParams const&),
               (override));
+  MOCK_METHOD(void, SessionPostCall,
+              (opentelemetry::context::Context const&,
+               SessionPostCallParams const&),
+              (override));
   MOCK_METHOD(void, OnDone,
               (opentelemetry::context::Context const&, OnDoneParams const&),
               (override));
@@ -258,6 +262,58 @@ TEST(OperationContextMetricTest, MetricElementDelivery) {
   operation_context.ElementDelivery(client_context);
   clock->AdvanceTime(std::chrono::milliseconds(5));
   operation_context.ElementDelivery(client_context);
+}
+
+TEST(OperationContextMetricTest, SessionLifecycleHooks) {
+  auto start_time = std::chrono::steady_clock::now();
+  auto mock_metric = std::make_shared<MockMetric>();
+
+  EXPECT_CALL(*mock_metric, PreCall)
+      .WillOnce(
+          [&](opentelemetry::context::Context const&, PreCallParams const& p) {
+            EXPECT_THAT(p.attempt_start, Eq(start_time));
+            EXPECT_TRUE(p.first_attempt);
+          })
+      .WillOnce(
+          [&](opentelemetry::context::Context const&, PreCallParams const& p) {
+            EXPECT_THAT(p.attempt_start,
+                        Eq(start_time + std::chrono::milliseconds(10)));
+            EXPECT_FALSE(p.first_attempt);
+          });
+
+  EXPECT_CALL(*mock_metric, SessionPostCall)
+      .WillOnce([&](opentelemetry::context::Context const&,
+                    SessionPostCallParams const& p) {
+        EXPECT_THAT(p.attempt_end,
+                    Eq(start_time + std::chrono::milliseconds(4)));
+        EXPECT_THAT(p.info.cluster_id, Eq("c1"));
+        EXPECT_THAT(p.info.zone_id, Eq("z1"));
+        EXPECT_TRUE(p.info.has_peer_info);
+      });
+
+  EXPECT_CALL(*mock_metric, ElementDelivery)
+      .WillOnce([&](opentelemetry::context::Context const&,
+                    ElementDeliveryParams const& p) {
+        EXPECT_TRUE(p.first_response);
+      });
+
+  auto clock = std::make_shared<FakeSteadyClock>();
+  OperationContext operation_context({mock_metric}, clock);
+
+  clock->SetTime(start_time);
+  operation_context.SessionPreCall();
+  clock->AdvanceTime(std::chrono::milliseconds(4));
+  SessionAttemptInfo info;
+  info.attempt_status = Status{};
+  info.cluster_id = "c1";
+  info.zone_id = "z1";
+  info.has_peer_info = true;
+  info.transport_type = "TRANSPORT_TYPE_SESSION_DIRECT_ACCESS";
+  operation_context.SessionPostCall(info);
+  operation_context.SessionElementDelivery();
+
+  clock->AdvanceTime(std::chrono::milliseconds(6));
+  operation_context.SessionPreCall();
 }
 
 #endif  // GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS

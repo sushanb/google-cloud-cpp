@@ -106,6 +106,18 @@ bool IsConnectivityError(google::cloud::Status const& status,
          !HasServerTiming(client_context);
 }
 
+bool IsSessionConnectivityError(SessionAttemptInfo const& info,
+                                TableResourceLabels const& resource_labels) {
+  if (info.attempt_status.code() ==
+      google::cloud::StatusCode::kDeadlineExceeded) {
+    return false;
+  }
+  bool const has_peer = info.has_peer_info && !info.transport_type.empty();
+  bool const has_location =
+      !resource_labels.cluster.empty() && !resource_labels.zone.empty();
+  return !has_peer && !has_location;
+}
+
 std::optional<google::bigtable::v2::ResponseParams>
 GetResponseParamsFromTrailingMetadata(
     grpc::ClientContext const& client_context) {
@@ -212,6 +224,16 @@ void OperationLatency::PostCall(opentelemetry::context::Context const&,
   }
 }
 
+void OperationLatency::SessionPostCall(opentelemetry::context::Context const&,
+                                       SessionPostCallParams const& p) {
+  if (!p.info.cluster_id.empty()) {
+    resource_labels_.cluster = p.info.cluster_id;
+  }
+  if (!p.info.zone_id.empty()) {
+    resource_labels_.zone = p.info.zone_id;
+  }
+}
+
 void OperationLatency::OnDone(opentelemetry::context::Context const& context,
                               OnDoneParams const& p) {
   data_labels_.status = StatusCodeToString(p.operation_status.code());
@@ -255,6 +277,23 @@ void AttemptLatency::PostCall(opentelemetry::context::Context const& context,
     resource_labels_.zone = response_params->zone_id();
   }
 
+  auto attempt_elapsed = std::chrono::duration_cast<LatencyDuration>(
+      p.attempt_end - attempt_start_);
+  attempt_latencies_->Record(attempt_elapsed.count(),
+                             IntoLabelMap(resource_labels_, data_labels_),
+                             context);
+}
+
+void AttemptLatency::SessionPostCall(
+    opentelemetry::context::Context const& context,
+    SessionPostCallParams const& p) {
+  data_labels_.status = StatusCodeToString(p.info.attempt_status.code());
+  if (!p.info.cluster_id.empty()) {
+    resource_labels_.cluster = p.info.cluster_id;
+  }
+  if (!p.info.zone_id.empty()) {
+    resource_labels_.zone = p.info.zone_id;
+  }
   auto attempt_elapsed = std::chrono::duration_cast<LatencyDuration>(
       p.attempt_end - attempt_start_);
   attempt_latencies_->Record(attempt_elapsed.count(),
@@ -322,6 +361,38 @@ void AttemptLatency2::PostCall(opentelemetry::context::Context const& context,
       context);
 }
 
+void AttemptLatency2::SessionPostCall(
+    opentelemetry::context::Context const& context,
+    SessionPostCallParams const& p) {
+  data_labels_.status = StatusCodeToString(p.info.attempt_status.code());
+  if (!p.info.cluster_id.empty()) {
+    resource_labels_.cluster = p.info.cluster_id;
+  }
+  if (!p.info.zone_id.empty()) {
+    resource_labels_.zone = p.info.zone_id;
+  }
+  if (p.info.has_peer_info && !p.info.transport_type.empty()) {
+    peer_info_labels_.transport_type =
+        absl::AsciiStrToLower(p.info.transport_type);
+    peer_info_labels_.transport_region =
+        absl::AsciiStrToLower(p.info.transport_region);
+    peer_info_labels_.transport_subzone =
+        absl::AsciiStrToLower(p.info.transport_subzone);
+  } else {
+    peer_info_labels_.transport_type = absl::AsciiStrToLower(
+        google::bigtable::v2::PeerInfo::TransportType_Name(
+            google::bigtable::v2::PeerInfo::TRANSPORT_TYPE_UNKNOWN));
+    peer_info_labels_.transport_region.clear();
+    peer_info_labels_.transport_subzone.clear();
+  }
+  auto attempt_elapsed = std::chrono::duration_cast<LatencyDuration>(
+      p.attempt_end - attempt_start_);
+  attempt_latencies2_->Record(
+      attempt_elapsed.count(),
+      IntoLabelMap(resource_labels_, data_labels_, {}, peer_info_labels_),
+      context);
+}
+
 std::unique_ptr<TableSchemaMetric> AttemptLatency2::clone(
     TableResourceLabels const& resource_labels,
     TableDataLabels const& data_labels) const {
@@ -357,6 +428,16 @@ void RetryCount::PostCall(opentelemetry::context::Context const&,
   if (response_params) {
     resource_labels_.cluster = response_params->cluster_id();
     resource_labels_.zone = response_params->zone_id();
+  }
+}
+
+void RetryCount::SessionPostCall(opentelemetry::context::Context const&,
+                                 SessionPostCallParams const& p) {
+  if (!p.info.cluster_id.empty()) {
+    resource_labels_.cluster = p.info.cluster_id;
+  }
+  if (!p.info.zone_id.empty()) {
+    resource_labels_.zone = p.info.zone_id;
   }
 }
 
@@ -402,6 +483,16 @@ void FirstResponseLatency::PostCall(opentelemetry::context::Context const&,
   if (response_params) {
     resource_labels_.cluster = response_params->cluster_id();
     resource_labels_.zone = response_params->zone_id();
+  }
+}
+
+void FirstResponseLatency::SessionPostCall(
+    opentelemetry::context::Context const&, SessionPostCallParams const& p) {
+  if (!p.info.cluster_id.empty()) {
+    resource_labels_.cluster = p.info.cluster_id;
+  }
+  if (!p.info.zone_id.empty()) {
+    resource_labels_.zone = p.info.zone_id;
   }
 }
 
@@ -500,6 +591,16 @@ void ApplicationBlockingLatency::PostCall(
   }
 }
 
+void ApplicationBlockingLatency::SessionPostCall(
+    opentelemetry::context::Context const&, SessionPostCallParams const& p) {
+  if (!p.info.cluster_id.empty()) {
+    resource_labels_.cluster = p.info.cluster_id;
+  }
+  if (!p.info.zone_id.empty()) {
+    resource_labels_.zone = p.info.zone_id;
+  }
+}
+
 void ApplicationBlockingLatency::OnDone(
     opentelemetry::context::Context const& context, OnDoneParams const&) {
   auto m = IntoLabelMap(resource_labels_, data_labels_,
@@ -513,6 +614,47 @@ std::unique_ptr<TableSchemaMetric> ApplicationBlockingLatency::clone(
     TableResourceLabels const& resource_labels,
     TableDataLabels const& data_labels) const {
   auto m = std::make_unique<ApplicationBlockingLatency>(*this);
+  m->resource_labels_ = resource_labels;
+  m->data_labels_ = data_labels;
+  return m;
+}
+
+ThrottlingLatency::ThrottlingLatency(
+    std::string const& instrumentation_scope,
+    opentelemetry::nostd::shared_ptr<
+        opentelemetry::metrics::MeterProvider> const& provider)
+    : throttling_latencies_(
+          provider
+              ->GetMeter(instrumentation_scope,
+                         kMeterInstrumentationScopeVersion)
+              ->CreateDoubleHistogram(
+                  "throttling_latencies",
+                  "The latency introduced by the client queuing the RPC due to "
+                  "an unavailable transport or overload.",
+                  "ms")) {}
+
+void ThrottlingLatency::SessionPostCall(
+    opentelemetry::context::Context const& context,
+    SessionPostCallParams const& p) {
+  if (!p.info.cluster_id.empty()) {
+    resource_labels_.cluster = p.info.cluster_id;
+  }
+  if (!p.info.zone_id.empty()) {
+    resource_labels_.zone = p.info.zone_id;
+  }
+  if (p.info.throttling_latency.has_value()) {
+    auto const elapsed =
+        std::chrono::duration_cast<LatencyDuration>(*p.info.throttling_latency);
+    auto m = IntoLabelMap(resource_labels_, data_labels_,
+                          std::set<std::string>{"streaming", "status"});
+    throttling_latencies_->Record(elapsed.count(), std::move(m), context);
+  }
+}
+
+std::unique_ptr<TableSchemaMetric> ThrottlingLatency::clone(
+    TableResourceLabels const& resource_labels,
+    TableDataLabels const& data_labels) const {
+  auto m = std::make_unique<ThrottlingLatency>(*this);
   m->resource_labels_ = resource_labels;
   m->data_labels_ = data_labels;
   return m;
@@ -540,6 +682,20 @@ void ConnectivityErrorCount::PostCall(opentelemetry::context::Context const&,
   data_labels_.status = StatusCodeToString(status.code());
   if (resource_labels_.cluster.empty() || resource_labels_.zone.empty() ||
       IsConnectivityError(status, client_context)) {
+    ++num_errors_;
+  }
+}
+
+void ConnectivityErrorCount::SessionPostCall(
+    opentelemetry::context::Context const&, SessionPostCallParams const& p) {
+  if (!p.info.cluster_id.empty()) {
+    resource_labels_.cluster = p.info.cluster_id;
+  }
+  if (!p.info.zone_id.empty()) {
+    resource_labels_.zone = p.info.zone_id;
+  }
+  data_labels_.status = StatusCodeToString(p.info.attempt_status.code());
+  if (IsSessionConnectivityError(p.info, resource_labels_)) {
     ++num_errors_;
   }
 }

@@ -96,6 +96,31 @@ void OperationContext::ElementRequest(grpc::ClientContext const&) {
 }
 
 void OperationContext::ElementDelivery(grpc::ClientContext const&) {
+  SessionElementDelivery();
+}
+
+void OperationContext::SessionPreCall() {
+  auto otel_context = opentelemetry::context::RuntimeContext::GetCurrent();
+  auto attempt_start = clock_->Now();
+  if (attempt_number_ == 0) {
+    operation_start_ = attempt_start;
+  }
+  for (auto& m : cloned_metrics_) {
+    m->PreCall(otel_context,
+               PreCallParams{attempt_start, attempt_number_ == 0});
+  }
+  ++attempt_number_;
+}
+
+void OperationContext::SessionPostCall(SessionAttemptInfo const& info) {
+  auto attempt_end = clock_->Now();
+  auto otel_context = opentelemetry::context::RuntimeContext::GetCurrent();
+  for (auto& m : cloned_metrics_) {
+    m->SessionPostCall(otel_context, SessionPostCallParams{attempt_end, info});
+  }
+}
+
+void OperationContext::SessionElementDelivery() {
   auto otel_context = opentelemetry::context::RuntimeContext::GetCurrent();
   auto first_response = clock_->Now();
   for (auto& m : cloned_metrics_) {
@@ -133,6 +158,12 @@ void OperationContext::OnDone(Status const&) {}
 void OperationContext::ElementRequest(grpc::ClientContext const&) {}
 
 void OperationContext::ElementDelivery(grpc::ClientContext const&) {}
+
+void OperationContext::SessionPreCall() { ++attempt_number_; }
+
+void OperationContext::SessionPostCall(SessionAttemptInfo const&) {}
+
+void OperationContext::SessionElementDelivery() {}
 
 #endif  // GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
 

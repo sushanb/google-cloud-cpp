@@ -75,6 +75,8 @@ LabelMap IntoLabelMap(
 bool HasServerTiming(grpc::ClientContext const& client_context);
 bool IsConnectivityError(google::cloud::Status const& status,
                          grpc::ClientContext const& client_context);
+bool IsSessionConnectivityError(SessionAttemptInfo const& info,
+                                TableResourceLabels const& resource_labels);
 std::optional<google::bigtable::v2::ResponseParams>
 GetResponseParamsFromTrailingMetadata(
     grpc::ClientContext const& client_context);
@@ -104,6 +106,8 @@ class OperationLatency : public TableSchemaMetric {
   void PostCall(opentelemetry::context::Context const& context,
                 grpc::ClientContext const& client_context,
                 PostCallParams const& p) override;
+  void SessionPostCall(opentelemetry::context::Context const& context,
+                       SessionPostCallParams const& p) override;
   void OnDone(opentelemetry::context::Context const& context,
               OnDoneParams const& p) override;
   std::unique_ptr<TableSchemaMetric> clone(
@@ -128,6 +132,8 @@ class AttemptLatency : public TableSchemaMetric {
   void PostCall(opentelemetry::context::Context const& context,
                 grpc::ClientContext const& client_context,
                 PostCallParams const& p) override;
+  void SessionPostCall(opentelemetry::context::Context const& context,
+                       SessionPostCallParams const& p) override;
   std::unique_ptr<TableSchemaMetric> clone(
       TableResourceLabels const& resource_labels,
       TableDataLabels const& data_labels) const override;
@@ -151,6 +157,8 @@ class AttemptLatency2 : public TableSchemaMetric {
   void PostCall(opentelemetry::context::Context const& context,
                 grpc::ClientContext const& client_context,
                 PostCallParams const& p) override;
+  void SessionPostCall(opentelemetry::context::Context const& context,
+                       SessionPostCallParams const& p) override;
   std::unique_ptr<TableSchemaMetric> clone(
       TableResourceLabels const& resource_labels,
       TableDataLabels const& data_labels) const override;
@@ -174,6 +182,8 @@ class RetryCount : public TableSchemaMetric {
   void PostCall(opentelemetry::context::Context const& context,
                 grpc::ClientContext const& client_context,
                 PostCallParams const& p) override;
+  void SessionPostCall(opentelemetry::context::Context const& context,
+                       SessionPostCallParams const& p) override;
   void OnDone(opentelemetry::context::Context const& context,
               OnDoneParams const& p) override;
   std::unique_ptr<TableSchemaMetric> clone(
@@ -200,6 +210,8 @@ class FirstResponseLatency : public TableSchemaMetric {
   void PostCall(opentelemetry::context::Context const& context,
                 grpc::ClientContext const& client_context,
                 PostCallParams const& p) override;
+  void SessionPostCall(opentelemetry::context::Context const& context,
+                       SessionPostCallParams const& p) override;
   void ElementDelivery(opentelemetry::context::Context const&,
                        ElementDeliveryParams const&) override;
   void OnDone(opentelemetry::context::Context const& context,
@@ -226,6 +238,9 @@ class ServerLatency : public TableSchemaMetric {
   void PostCall(opentelemetry::context::Context const& context,
                 grpc::ClientContext const& client_context,
                 PostCallParams const& p) override;
+  // Suppressed on the session path (CLIENT_SIDE_METRICS_SPEC.md #2).
+  void SessionPostCall(opentelemetry::context::Context const&,
+                       SessionPostCallParams const&) override {}
 
   std::unique_ptr<TableSchemaMetric> clone(
       TableResourceLabels const& resource_labels,
@@ -247,6 +262,8 @@ class ApplicationBlockingLatency : public TableSchemaMetric {
   void PostCall(opentelemetry::context::Context const& context,
                 grpc::ClientContext const& client_context,
                 PostCallParams const& p) override;
+  void SessionPostCall(opentelemetry::context::Context const& context,
+                       SessionPostCallParams const& p) override;
   void ElementDelivery(opentelemetry::context::Context const&,
                        ElementDeliveryParams const&) override;
   void ElementRequest(opentelemetry::context::Context const&,
@@ -267,6 +284,25 @@ class ApplicationBlockingLatency : public TableSchemaMetric {
   std::vector<LatencyDuration> pending_latencies_;
 };
 
+class ThrottlingLatency : public TableSchemaMetric {
+ public:
+  ThrottlingLatency(std::string const& instrumentation_scope,
+                    opentelemetry::nostd::shared_ptr<
+                        opentelemetry::metrics::MeterProvider> const& provider);
+  void SessionPostCall(opentelemetry::context::Context const& context,
+                       SessionPostCallParams const& p) override;
+
+  std::unique_ptr<TableSchemaMetric> clone(
+      TableResourceLabels const& resource_labels,
+      TableDataLabels const& data_labels) const override;
+
+ private:
+  TableResourceLabels resource_labels_;
+  TableDataLabels data_labels_;
+  opentelemetry::nostd::shared_ptr<opentelemetry::metrics::Histogram<double>>
+      throttling_latencies_;
+};
+
 class ConnectivityErrorCount : public TableSchemaMetric {
  public:
   ConnectivityErrorCount(
@@ -276,6 +312,8 @@ class ConnectivityErrorCount : public TableSchemaMetric {
   void PostCall(opentelemetry::context::Context const&,
                 grpc::ClientContext const& client_context,
                 PostCallParams const& p) override;
+  void SessionPostCall(opentelemetry::context::Context const&,
+                       SessionPostCallParams const& p) override;
   void OnDone(opentelemetry::context::Context const& context,
               OnDoneParams const&) override;
   std::unique_ptr<TableSchemaMetric> clone(

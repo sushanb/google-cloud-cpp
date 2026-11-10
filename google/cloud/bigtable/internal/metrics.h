@@ -76,6 +76,11 @@ struct PostCallParams {
   google::cloud::Status attempt_status;
 };
 
+struct SessionPostCallParams {
+  OperationContext::Clock::time_point attempt_end;
+  SessionAttemptInfo info;
+};
+
 struct OnDoneParams {
   OperationContext::Clock::time_point operation_end;
   google::cloud::Status operation_status;
@@ -107,6 +112,8 @@ class Metric {
                        PreCallParams const&) {}
   virtual void PostCall(opentelemetry::context::Context const&,
                         grpc::ClientContext const&, PostCallParams const&) {}
+  virtual void SessionPostCall(opentelemetry::context::Context const&,
+                               SessionPostCallParams const&) {}
   virtual void OnDone(opentelemetry::context::Context const&,
                       OnDoneParams const&) {}
   virtual void ElementRequest(opentelemetry::context::Context const&,
