@@ -240,6 +240,9 @@ add_library(
     internal/sessions/pool/pool_sizer.h
     internal/sessions/pool/session_creation_budget.h
     internal/sessions/pool/session_list.h
+    internal/sessions/pool/session_pool_impl.cc
+    internal/sessions/pool/session_pool_impl.h
+    internal/sessions/pool/session_pool_lifecycle.cc
     internal/sessions/session/session_impl.cc
     internal/sessions/session/session_impl.h
     internal/sessions/session/session_state.h
@@ -529,6 +532,8 @@ if (BUILD_TESTING)
         internal/sessions/pool/pool_executors_test.cc
         internal/sessions/pool/pool_sizer_test.cc
         internal/sessions/pool/session_list_test.cc
+        internal/sessions/pool/session_pool_impl_test.cc
+        internal/sessions/pool/session_pool_lifecycle_test.cc
         internal/sessions/session/session_impl_test.cc
         internal/sessions/sessions_options_test.cc
         internal/sessions/telemetry/session_tracer_test.cc

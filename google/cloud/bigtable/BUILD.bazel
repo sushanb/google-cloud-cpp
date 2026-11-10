@@ -234,6 +234,17 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "sessions_pool_test_helpers",
+    testonly = True,
+    hdrs = ["internal/sessions/pool/session_pool_impl_test_helpers.h"],
+    deps = [
+        ":google_cloud_cpp_bigtable",
+        "//google/cloud/testing_util:google_cloud_cpp_testing_grpc_private",
+        "@googletest//:gtest",
+    ],
+)
+
 [cc_test(
     name = test.replace("/", "_").replace(".cc", ""),
     srcs = [test],
@@ -248,6 +259,7 @@ cc_library(
     deps = [
         ":bigtable_client_testing",
         ":google_cloud_cpp_bigtable",
+        ":sessions_pool_test_helpers",
         "//:common",
         "//:grpc_utils",
         "//google/cloud/testing_util:google_cloud_cpp_testing_grpc_private",
