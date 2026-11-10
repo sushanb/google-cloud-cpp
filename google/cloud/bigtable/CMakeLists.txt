@@ -228,7 +228,13 @@ add_library(
     internal/rpc_policy_parameters.inc
     internal/sessions/latch.h
     internal/sessions/logging_helper.h
+    internal/sessions/session/session_impl.cc
+    internal/sessions/session/session_impl.h
+    internal/sessions/session/session_state.h
+    internal/sessions/session/write_status.h
     internal/sessions/sessions_options.h
+    internal/sessions/telemetry/debug_snapshot.h
+    internal/sessions/telemetry/session_tracer.h
     internal/sessions/transport/current_cq.h
     internal/sessions/transport/peak_ewma_tracker.cc
     internal/sessions/transport/peak_ewma_tracker.h
@@ -293,7 +299,8 @@ add_library(
     version_info.h)
 target_link_libraries(
     google_cloud_cpp_bigtable
-    PUBLIC absl::memory
+    PUBLIC absl::flat_hash_map
+           absl::memory
            absl::strings
            google-cloud-cpp::bigtable_protos
            google-cloud-cpp::common
@@ -504,7 +511,9 @@ if (BUILD_TESTING)
         internal/query_plan_test.cc
         internal/rate_limiter_test.cc
         internal/retry_traits_test.cc
+        internal/sessions/session/session_impl_test.cc
         internal/sessions/sessions_options_test.cc
+        internal/sessions/telemetry/session_tracer_test.cc
         internal/sessions/transport/peak_ewma_tracker_test.cc
         internal/sessions/transport/session_stream_test.cc
         internal/stub_manager_test.cc
