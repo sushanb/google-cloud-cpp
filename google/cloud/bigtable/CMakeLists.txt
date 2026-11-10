@@ -228,6 +228,11 @@ add_library(
     internal/rpc_policy_parameters.inc
     internal/sessions/latch.h
     internal/sessions/logging_helper.h
+    internal/sessions/middleware/cancellable_vrpc.cc
+    internal/sessions/middleware/cancellable_vrpc.h
+    internal/sessions/middleware/retry_oracle.h
+    internal/sessions/middleware/retrying_vrpc.cc
+    internal/sessions/middleware/retrying_vrpc.h
     internal/sessions/pool/dynamic_picker.cc
     internal/sessions/pool/dynamic_picker.h
     internal/sessions/pool/lightweight_thread_pool.cc
@@ -526,6 +531,8 @@ if (BUILD_TESTING)
         internal/query_plan_test.cc
         internal/rate_limiter_test.cc
         internal/retry_traits_test.cc
+        internal/sessions/middleware/cancellable_vrpc_test.cc
+        internal/sessions/middleware/retrying_vrpc_test.cc
         internal/sessions/pool/dynamic_picker_test.cc
         internal/sessions/pool/lightweight_thread_pool_test.cc
         internal/sessions/pool/metrics_collector_test.cc

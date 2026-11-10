@@ -138,6 +138,30 @@ cc_library(
 )
 
 cc_library(
+    name = "sessions_l4_middleware",
+    srcs = [
+        s
+        for s in google_cloud_cpp_bigtable_srcs
+        if s.startswith("internal/sessions/middleware/")
+    ],
+    hdrs = [
+        h
+        for h in google_cloud_cpp_bigtable_hdrs
+        if h.startswith("internal/sessions/middleware/")
+    ],
+    # Do not sort: grpc++ must come last
+    deps = [
+        ":sessions_l1_transport",
+        ":sessions_l2_session",
+        "//:common",
+        "//:grpc_utils",
+        "@abseil-cpp//absl/strings",
+        "@googleapis//google/bigtable/v2:bigtable_cc_grpc",
+        "@grpc//:grpc++",
+    ],
+)
+
+cc_library(
     name = "google_cloud_cpp_bigtable",
     srcs = [
         s
@@ -169,6 +193,7 @@ cc_library(
         ":sessions_l1_transport",
         ":sessions_l2_session",
         ":sessions_l3_pool",
+        ":sessions_l4_middleware",
         ":sessions_l7_telemetry",
         "//:common",
         "//:grpc_utils",

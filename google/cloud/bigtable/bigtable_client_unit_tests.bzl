@@ -69,6 +69,8 @@ bigtable_client_unit_tests = [
     "internal/query_plan_test.cc",
     "internal/rate_limiter_test.cc",
     "internal/retry_traits_test.cc",
+    "internal/sessions/middleware/cancellable_vrpc_test.cc",
+    "internal/sessions/middleware/retrying_vrpc_test.cc",
     "internal/sessions/pool/dynamic_picker_test.cc",
     "internal/sessions/pool/lightweight_thread_pool_test.cc",
     "internal/sessions/pool/metrics_collector_test.cc",
