@@ -222,13 +222,23 @@ bigtable::Row TransformReadModifyWriteRowResponse(
 DataConnectionImpl::DataConnectionImpl(
     std::unique_ptr<BackgroundThreads> background,
     std::unique_ptr<StubManager> stub_manager,
-    std::unique_ptr<OperationContextFactory> operation_context_factory,
+    std::shared_ptr<OperationContextFactory> operation_context_factory,
     std::shared_ptr<MutateRowsLimiter> limiter, Options options)
     : background_(std::move(background)),
       stub_manager_(std::move(stub_manager)),
       operation_context_factory_(std::move(operation_context_factory)),
       limiter_(std::move(limiter)),
       options_(MergeOptions(std::move(options), DataConnection::options())) {}
+
+DataConnectionImpl::DataConnectionImpl(
+    std::unique_ptr<BackgroundThreads> background,
+    std::unique_ptr<StubManager> stub_manager,
+    std::unique_ptr<OperationContextFactory> operation_context_factory,
+    std::shared_ptr<MutateRowsLimiter> limiter, Options options)
+    : DataConnectionImpl(std::move(background), std::move(stub_manager),
+                         std::shared_ptr<OperationContextFactory>(
+                             std::move(operation_context_factory)),
+                         std::move(limiter), std::move(options)) {}
 
 DataConnectionImpl::~DataConnectionImpl() = default;
 
@@ -239,7 +249,8 @@ DataConnectionImpl::DataConnectionImpl(
     std::shared_ptr<MutateRowsLimiter> limiter, Options options)
     : DataConnectionImpl(std::move(background),
                          std::make_unique<StubManager>(std::move(stub)),
-                         std::move(operation_context_factory),
+                         std::shared_ptr<OperationContextFactory>(
+                             std::move(operation_context_factory)),
                          std::move(limiter), std::move(options)) {}
 
 Status DataConnectionImpl::Apply(std::string const& table_name,

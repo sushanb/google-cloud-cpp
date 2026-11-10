@@ -57,6 +57,12 @@ class DataConnectionImpl : public bigtable::DataConnection {
   DataConnectionImpl(
       std::unique_ptr<BackgroundThreads> background,
       std::unique_ptr<StubManager> stub_manager,
+      std::shared_ptr<OperationContextFactory> operation_context_factory,
+      std::shared_ptr<MutateRowsLimiter> limiter, Options options);
+
+  DataConnectionImpl(
+      std::unique_ptr<BackgroundThreads> background,
+      std::unique_ptr<StubManager> stub_manager,
       std::unique_ptr<OperationContextFactory> operation_context_factory,
       std::shared_ptr<MutateRowsLimiter> limiter, Options options);
 
@@ -137,7 +143,7 @@ class DataConnectionImpl : public bigtable::DataConnection {
   std::unique_ptr<StubManager> stub_manager_;
   std::shared_ptr<::google::cloud::monitoring_v3::MetricServiceConnection>
       metric_service_connection_;
-  std::unique_ptr<OperationContextFactory> operation_context_factory_;
+  std::shared_ptr<OperationContextFactory> operation_context_factory_;
   std::shared_ptr<MutateRowsLimiter> limiter_;
   Options options_;
 };

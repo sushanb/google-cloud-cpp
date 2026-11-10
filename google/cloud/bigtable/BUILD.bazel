@@ -189,20 +189,32 @@ cc_library(
 )
 
 cc_library(
+    name = "sessions_l6_shim",
+    hdrs = [
+        h
+        for h in google_cloud_cpp_bigtable_hdrs
+        if h.startswith("internal/sessions/shim/")
+    ],
+    deps = [
+        ":sessions_l1_transport",
+        ":sessions_l5_client",
+        "//:common",
+    ],
+)
+
+cc_library(
     name = "google_cloud_cpp_bigtable",
     srcs = [
         s
         for s in google_cloud_cpp_bigtable_srcs
         if not s.startswith("internal/sessions/") or
-           s.startswith("internal/sessions/sessions_data_connection") or
-           s.startswith("internal/sessions/shim/")
+           s.startswith("internal/sessions/sessions_data_connection")
     ],
     hdrs = [
         h
         for h in google_cloud_cpp_bigtable_hdrs
         if not h.startswith("internal/sessions/") or
-           h.startswith("internal/sessions/sessions_data_connection") or
-           h.startswith("internal/sessions/shim/")
+           h.startswith("internal/sessions/sessions_data_connection")
     ],
     local_defines = select({
         ":metrics_enabled": [
@@ -222,6 +234,7 @@ cc_library(
         ":sessions_l3_pool",
         ":sessions_l4_middleware",
         ":sessions_l5_client",
+        ":sessions_l6_shim",
         ":sessions_l7_telemetry",
         "//:common",
         "//:grpc_utils",
@@ -301,6 +314,10 @@ cc_library(
 [cc_test(
     name = test.replace("/", "_").replace(".cc", ""),
     srcs = [test],
+    data = glob([
+        "internal/sessions/**/*.h",
+        "internal/sessions/**/*.cc",
+    ]) if test == "internal/sessions/sessions_layer_lint_test.cc" else [],
     local_defines = select({
         ":metrics_enabled": [
             "GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS",

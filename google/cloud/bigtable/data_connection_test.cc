@@ -16,6 +16,7 @@
 #include "google/cloud/bigtable/data_connection.h"
 #include "google/cloud/bigtable/internal/bigtable_stub_factory.h"
 #include "google/cloud/bigtable/internal/data_connection_impl.h"
+#include "google/cloud/bigtable/internal/sessions/sessions_data_connection.h"
 #include "google/cloud/bigtable/options.h"
 #include "google/cloud/common_options.h"
 #include "google/cloud/credentials.h"
@@ -100,6 +101,15 @@ TEST(MakeDataConnection, WithInstances) {
   EXPECT_THAT(
       options.get<bigtable_internal::InstanceChannelAffinityOption>().size(),
       Eq(2));
+}
+
+TEST(MakeDataConnection, EnableSessionsOptionCreatesSessionsDataConnection) {
+  auto conn = MakeDataConnection(DisableTracing(
+      TestOptions().set<experimental::EnableSessionsOption>(true)));
+  ASSERT_NE(conn, nullptr);
+  EXPECT_NE(std::dynamic_pointer_cast<
+                bigtable_internal::sessions::SessionsDataConnection>(conn),
+            nullptr);
 }
 
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
