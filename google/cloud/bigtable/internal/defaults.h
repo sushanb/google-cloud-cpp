@@ -63,6 +63,11 @@ DefaultDirectPathInitializationMode() {
 bool IsDirectPath(Options const& options);
 
 /**
+ * Returns true if Sessions transport is enabled for Bigtable.
+ */
+bool IsSessionsEnabled(Options const& options);
+
+/**
  * Returns an `Options` with the appropriate defaults for Bigtable.
  *
  * Environment variables and the optional @p opts argument may be consulted to

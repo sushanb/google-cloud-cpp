@@ -31,9 +31,21 @@ TEST(IdempotentMutationPolicyTest, Simple) {
   EXPECT_TRUE(
       policy->is_idempotent(DeleteFromColumn("fam", "col", 0_us, 10_us).op));
   EXPECT_TRUE(policy->is_idempotent(DeleteFromFamily("fam").op));
+  EXPECT_TRUE(policy->is_idempotent(DeleteFromRow().op));
 
   EXPECT_TRUE(policy->is_idempotent(SetCell("fam", "col", 0_ms, "v1").op));
   EXPECT_FALSE(policy->is_idempotent(SetCell("fam", "c2", "v2").op));
+
+  google::bigtable::v2::Mutation add_to_cell;
+  add_to_cell.mutable_add_to_cell()->set_family_name("fam");
+  EXPECT_FALSE(policy->is_idempotent(add_to_cell));
+
+  google::bigtable::v2::Mutation merge_to_cell;
+  merge_to_cell.mutable_merge_to_cell()->set_family_name("fam");
+  EXPECT_FALSE(policy->is_idempotent(merge_to_cell));
+
+  google::bigtable::v2::Mutation unset_mutation;
+  EXPECT_FALSE(policy->is_idempotent(unset_mutation));
 }
 
 /// @test Verify that bigtable::AlwaysRetryMutationPolicy works as expected.

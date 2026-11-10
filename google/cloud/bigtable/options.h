@@ -290,6 +290,20 @@ struct DirectPathInitializationModeOption {
   using Type = DirectPathInitializationMode;
 };
 
+/**
+ * Option to enable the Cloud Bigtable Sessions bidirectional streaming
+ * transport for eligible data-plane operations (`ReadRow`, `AsyncReadRow`,
+ * `Apply`, and `AsyncApply`).
+ *
+ * By default, Sessions are disabled unless enabled via this option or the
+ * `GOOGLE_CLOUD_CPP_BIGTABLE_ENABLE_SESSIONS` environment variable.
+ *
+ * @ingroup google-cloud-bigtable-options
+ */
+struct EnableSessionsOption {
+  using Type = bool;
+};
+
 }  // namespace experimental
 
 /// The complete list of options accepted by `bigtable::*Client`
@@ -381,7 +395,8 @@ using DataPolicyOptionList =
                IdempotentMutationPolicyOption, EnableMetricsOption,
                MetricsPeriodOption,
                experimental::DynamicChannelPoolSizingPolicyOption,
-               experimental::DirectPathInitializationModeOption>;
+               experimental::DirectPathInitializationModeOption,
+               experimental::EnableSessionsOption>;
 
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
 }  // namespace bigtable

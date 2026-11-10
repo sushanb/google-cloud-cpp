@@ -75,11 +75,13 @@ Options DefaultConnectionRefreshOptions(Options opts) {
     opts.set<MinConnectionRefreshOption>(kDefaultMinRefreshPeriod);
     opts.set<MaxConnectionRefreshOption>(kDefaultMaxRefreshPeriod);
   } else if (has_min && !has_max) {
-    opts.set<MaxConnectionRefreshOption>((std::max)(
-        opts.get<MinConnectionRefreshOption>(), kDefaultMaxRefreshPeriod));
+    opts.set<MaxConnectionRefreshOption>(
+        (std::max)(opts.get<MinConnectionRefreshOption>(),
+                   kDefaultMaxRefreshPeriod));
   } else if (!has_min && has_max) {
-    opts.set<MinConnectionRefreshOption>((std::min)(
-        opts.get<MaxConnectionRefreshOption>(), kDefaultMinRefreshPeriod));
+    opts.set<MinConnectionRefreshOption>(
+        (std::min)(opts.get<MaxConnectionRefreshOption>(),
+                   kDefaultMinRefreshPeriod));
   } else {
     // If the range is invalid, use the greater value as both the min and max
     auto const p = opts.get<MinConnectionRefreshOption>();
@@ -143,6 +145,23 @@ bool IsDirectPath(Options const& options) {
   }
   return options.get<experimental::DirectPathModeOption>() ==
          experimental::DirectPathMode::kEnabled;
+}
+
+bool IsSessionsEnabled(Options const& options) {
+  std::optional<std::string> const env_sessions =
+      google::cloud::internal::GetEnv(
+          "GOOGLE_CLOUD_CPP_BIGTABLE_ENABLE_SESSIONS");
+  if (env_sessions.has_value()) {
+    if (*env_sessions == "false" || *env_sessions == "0") return false;
+    if (*env_sessions == "true" || *env_sessions == "1") return true;
+  }
+  std::optional<std::string> const cbt_sessions =
+      google::cloud::internal::GetEnv("CBT_ENABLE_SESSIONS");
+  if (cbt_sessions.has_value()) {
+    if (*cbt_sessions == "false" || *cbt_sessions == "0") return false;
+    if (*cbt_sessions == "true" || *cbt_sessions == "1") return true;
+  }
+  return options.get<experimental::EnableSessionsOption>();
 }
 
 Options HandleUniverseDomain(Options opts) {
@@ -313,6 +332,7 @@ Options DefaultDataOptions(Options opts) {
   if (!opts.has<EnableServerRetriesOption>()) {
     opts.set<EnableServerRetriesOption>(true);
   }
+  opts.set<experimental::EnableSessionsOption>(IsSessionsEnabled(opts));
   opts = DefaultOptions(std::move(opts));
   if (!opts.has<AuthorityOption>()) {
     auto ep = google::cloud::internal::UniverseDomainEndpoint(

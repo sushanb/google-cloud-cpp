@@ -170,6 +170,11 @@ TEST(MergeOptions, ClientDeadlineOptionCallGrpcSetupOption) {
   EXPECT_THAT(context.deadline() - clock.Now(), Eq(std::chrono::seconds(5)));
 }
 
+TEST(OptionsTest, EnableSessionsOptionInDataPolicyOptionList) {
+  auto opts = Options{}.set<bigtable::experimental::EnableSessionsOption>(true);
+  EXPECT_TRUE(opts.get<bigtable::experimental::EnableSessionsOption>());
+}
+
 }  // namespace
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
 }  // namespace bigtable_internal

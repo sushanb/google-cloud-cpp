@@ -31,10 +31,19 @@ std::unique_ptr<IdempotentMutationPolicy> SafeIdempotentMutationPolicy::clone()
 
 bool SafeIdempotentMutationPolicy::is_idempotent(
     google::bigtable::v2::Mutation const& m) {
-  if (!m.has_set_cell()) {
-    return true;
+  switch (m.mutation_case()) {
+    case google::bigtable::v2::Mutation::kSetCell:
+      return m.set_cell().timestamp_micros() != ServerSetTimestamp();
+    case google::bigtable::v2::Mutation::kDeleteFromColumn:
+    case google::bigtable::v2::Mutation::kDeleteFromFamily:
+    case google::bigtable::v2::Mutation::kDeleteFromRow:
+      return true;
+    case google::bigtable::v2::Mutation::kAddToCell:
+    case google::bigtable::v2::Mutation::kMergeToCell:
+    case google::bigtable::v2::Mutation::MUTATION_NOT_SET:
+      return false;
   }
-  return m.set_cell().timestamp_micros() != ServerSetTimestamp();
+  return false;
 }
 
 bool SafeIdempotentMutationPolicy::is_idempotent(

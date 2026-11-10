@@ -226,6 +226,7 @@ add_library(
     internal/row_reader_impl.h
     internal/rpc_policy_parameters.h
     internal/rpc_policy_parameters.inc
+    internal/sessions/sessions_options.h
     internal/stub_manager.cc
     internal/stub_manager.h
     internal/table_schema_metrics.cc
@@ -494,6 +495,7 @@ if (BUILD_TESTING)
         internal/query_plan_test.cc
         internal/rate_limiter_test.cc
         internal/retry_traits_test.cc
+        internal/sessions/sessions_options_test.cc
         internal/stub_manager_test.cc
         internal/table_schema_metrics_test.cc
         internal/traced_row_reader_test.cc
