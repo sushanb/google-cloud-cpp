@@ -228,6 +228,18 @@ add_library(
     internal/rpc_policy_parameters.inc
     internal/sessions/latch.h
     internal/sessions/logging_helper.h
+    internal/sessions/pool/dynamic_picker.cc
+    internal/sessions/pool/dynamic_picker.h
+    internal/sessions/pool/lightweight_thread_pool.cc
+    internal/sessions/pool/lightweight_thread_pool.h
+    internal/sessions/pool/metrics_collector.cc
+    internal/sessions/pool/metrics_collector.h
+    internal/sessions/pool/pool_executors.cc
+    internal/sessions/pool/pool_executors.h
+    internal/sessions/pool/pool_sizer.cc
+    internal/sessions/pool/pool_sizer.h
+    internal/sessions/pool/session_creation_budget.h
+    internal/sessions/pool/session_list.h
     internal/sessions/session/session_impl.cc
     internal/sessions/session/session_impl.h
     internal/sessions/session/session_state.h
@@ -511,6 +523,12 @@ if (BUILD_TESTING)
         internal/query_plan_test.cc
         internal/rate_limiter_test.cc
         internal/retry_traits_test.cc
+        internal/sessions/pool/dynamic_picker_test.cc
+        internal/sessions/pool/lightweight_thread_pool_test.cc
+        internal/sessions/pool/metrics_collector_test.cc
+        internal/sessions/pool/pool_executors_test.cc
+        internal/sessions/pool/pool_sizer_test.cc
+        internal/sessions/pool/session_list_test.cc
         internal/sessions/session/session_impl_test.cc
         internal/sessions/sessions_options_test.cc
         internal/sessions/telemetry/session_tracer_test.cc
