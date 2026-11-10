@@ -75,6 +75,8 @@ bigtable_client_unit_tests = [
     "internal/sessions/pool/pool_executors_test.cc",
     "internal/sessions/pool/pool_sizer_test.cc",
     "internal/sessions/pool/session_list_test.cc",
+    "internal/sessions/pool/session_pool_impl_test.cc",
+    "internal/sessions/pool/session_pool_lifecycle_test.cc",
     "internal/sessions/session/session_impl_test.cc",
     "internal/sessions/sessions_options_test.cc",
     "internal/sessions/telemetry/session_tracer_test.cc",
