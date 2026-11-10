@@ -114,6 +114,7 @@ google_cloud_cpp_bigtable_hdrs = [
     "internal/row_reader_impl.h",
     "internal/rpc_policy_parameters.h",
     "internal/rpc_policy_parameters.inc",
+    "internal/sessions/sessions_options.h",
     "internal/stub_manager.h",
     "internal/table_schema_metrics.h",
     "internal/traced_row_reader.h",

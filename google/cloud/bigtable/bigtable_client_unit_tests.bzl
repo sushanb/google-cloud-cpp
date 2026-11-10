@@ -69,6 +69,7 @@ bigtable_client_unit_tests = [
     "internal/query_plan_test.cc",
     "internal/rate_limiter_test.cc",
     "internal/retry_traits_test.cc",
+    "internal/sessions/sessions_options_test.cc",
     "internal/stub_manager_test.cc",
     "internal/table_schema_metrics_test.cc",
     "internal/traced_row_reader_test.cc",

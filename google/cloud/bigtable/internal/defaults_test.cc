@@ -712,6 +712,37 @@ TEST(ConnectionRefreshRange, DisabledIfEmulator) {
   EXPECT_EQ(secs(0), opts.get<MaxConnectionRefreshOption>());
 }
 
+TEST(SessionsEnvTest, DefaultDisabledAndOptionAndEnvPrecedence) {
+  ScopedEnvironment env_cpp("GOOGLE_CLOUD_CPP_BIGTABLE_ENABLE_SESSIONS",
+                            std::nullopt);
+  ScopedEnvironment env_cbt("CBT_ENABLE_SESSIONS", std::nullopt);
+
+  Options default_opts = DefaultDataOptions(Options{});
+  EXPECT_FALSE(default_opts.get<experimental::EnableSessionsOption>());
+
+  Options explicit_true = DefaultDataOptions(
+      Options{}.set<experimental::EnableSessionsOption>(true));
+  EXPECT_TRUE(explicit_true.get<experimental::EnableSessionsOption>());
+
+  {
+    ScopedEnvironment enable_env("GOOGLE_CLOUD_CPP_BIGTABLE_ENABLE_SESSIONS",
+                                 "true");
+    Options from_env = DefaultDataOptions(Options{});
+    EXPECT_TRUE(from_env.get<experimental::EnableSessionsOption>());
+
+    Options override_false = DefaultDataOptions(
+        Options{}.set<experimental::EnableSessionsOption>(false));
+    EXPECT_TRUE(override_false.get<experimental::EnableSessionsOption>());
+  }
+
+  {
+    ScopedEnvironment disable_env("CBT_ENABLE_SESSIONS", "false");
+    Options forced_off = DefaultDataOptions(
+        Options{}.set<experimental::EnableSessionsOption>(true));
+    EXPECT_FALSE(forced_off.get<experimental::EnableSessionsOption>());
+  }
+}
+
 }  // namespace
 }  // namespace internal
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
