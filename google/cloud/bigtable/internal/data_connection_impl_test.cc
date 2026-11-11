@@ -17,10 +17,10 @@
 #include "google/cloud/bigtable/internal/crc32c.h"
 #include "google/cloud/bigtable/internal/defaults.h"
 #include "google/cloud/bigtable/internal/operation_context.h"
+#include "google/cloud/bigtable/internal/operation_context_factory.h"
 #include "google/cloud/bigtable/internal/query_plan.h"
 #ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
 #include "google/cloud/bigtable/internal/metrics.h"
-#include "google/cloud/bigtable/internal/operation_context_factory.h"
 #include "google/cloud/bigtable/internal/table_schema_metrics.h"
 #include "google/cloud/testing_util/fake_clock.h"
 #endif
@@ -37,6 +37,7 @@
 #include "google/cloud/credentials.h"
 #include "google/cloud/grpc_options.h"
 #include "google/cloud/internal/async_streaming_read_rpc_impl.h"
+#include "google/cloud/internal/background_threads_impl.h"
 #include "google/cloud/internal/time_utils.h"
 #include "google/cloud/status_or.h"
 #include "google/cloud/testing_util/fake_completion_queue_impl.h"
@@ -48,7 +49,13 @@
 #include <google/protobuf/text_format.h>
 #include <gmock/gmock.h>
 #include <grpcpp/client_context.h>
+#include <atomic>
 #include <chrono>
+#include <future>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace google {
 namespace cloud {
@@ -455,6 +462,8 @@ class FakeOperationContextFactory : public OperationContextFactory {
   std::shared_ptr<OperationContext::Clock> clock_;
 };
 
+#endif  // GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+
 class MockOperationContextFactory : public OperationContextFactory {
  public:
   MOCK_METHOD(std::shared_ptr<OperationContext>, ReadRow,
@@ -476,8 +485,6 @@ class MockOperationContextFactory : public OperationContextFactory {
   MOCK_METHOD(std::shared_ptr<OperationContext>, ExecuteQuery,
               (std::string const&, std::string const&), (override));
 };
-
-#endif  // GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
 
 class DataConnectionTest : public ::testing::Test {
  protected:
@@ -2745,6 +2752,152 @@ TEST_F(DataConnectionTest, AsyncReadModifyWriteRowTransientErrorNotRetried) {
   EXPECT_THAT(row, StatusIs(StatusCode::kUnavailable));
 }
 
+TEST_F(DataConnectionTest,
+       ReadModifyWriteRowAppProfileIdOptionOverridesRequest) {
+  auto factory = std::make_unique<MockOperationContextFactory>();
+  EXPECT_CALL(*factory, ReadModifyWriteRow(kTableName, "override-profile"))
+      .WillOnce(Return(std::make_shared<OperationContext>()))
+      .WillOnce(Return(std::make_shared<OperationContext>()));
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, ReadModifyWriteRow)
+      .Times(2)
+      .WillRepeatedly([](grpc::ClientContext&, Options const&,
+                         v2::ReadModifyWriteRowRequest const& request,
+                         bigtable_internal::OperationContext&) {
+        EXPECT_EQ("override-profile", request.app_profile_id());
+        EXPECT_EQ(kTableName, request.table_name());
+        EXPECT_EQ("row", request.row_key());
+        return PermanentError();
+      });
+
+  std::shared_ptr<DataConnectionImpl> conn =
+      TestConnection(std::move(mock), std::move(factory));
+  internal::OptionsSpan span(
+      CallOptions().set<AppProfileIdOption>("override-profile"));
+
+  v2::ReadModifyWriteRowRequest req_with_stale_profile;
+  req_with_stale_profile.set_app_profile_id("stale-profile");
+  req_with_stale_profile.set_table_name(kTableName);
+  req_with_stale_profile.set_row_key("row");
+  EXPECT_THAT(conn->ReadModifyWriteRow(req_with_stale_profile),
+              StatusIs(StatusCode::kPermissionDenied));
+
+  v2::ReadModifyWriteRowRequest req_without_profile;
+  req_without_profile.set_table_name(kTableName);
+  req_without_profile.set_row_key("row");
+  EXPECT_THAT(conn->ReadModifyWriteRow(req_without_profile),
+              StatusIs(StatusCode::kPermissionDenied));
+}
+
+TEST_F(DataConnectionTest,
+       ReadModifyWriteRowPreservesRequestAppProfileIdWhenOptionUnset) {
+  auto factory = std::make_unique<MockOperationContextFactory>();
+  EXPECT_CALL(*factory, ReadModifyWriteRow(kTableName, "proto-profile"))
+      .WillOnce(Return(std::make_shared<OperationContext>()));
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, ReadModifyWriteRow)
+      .WillOnce([](grpc::ClientContext&, Options const&,
+                   v2::ReadModifyWriteRowRequest const& request,
+                   bigtable_internal::OperationContext&) {
+        EXPECT_EQ("proto-profile", request.app_profile_id());
+        EXPECT_EQ(kTableName, request.table_name());
+        EXPECT_EQ("row", request.row_key());
+        return PermanentError();
+      });
+
+  v2::ReadModifyWriteRowRequest req;
+  req.set_app_profile_id("proto-profile");
+  req.set_table_name(kTableName);
+  req.set_row_key("row");
+
+  Options options = CallOptions();
+  options.unset<AppProfileIdOption>();
+  std::shared_ptr<DataConnectionImpl> conn =
+      TestConnection(std::move(mock), std::move(factory));
+  internal::OptionsSpan span(std::move(options));
+  EXPECT_THAT(conn->ReadModifyWriteRow(req),
+              StatusIs(StatusCode::kPermissionDenied));
+}
+
+TEST_F(DataConnectionTest,
+       AsyncReadModifyWriteRowAppProfileIdOptionOverridesRequest) {
+  auto factory = std::make_unique<MockOperationContextFactory>();
+  EXPECT_CALL(*factory, ReadModifyWriteRow(kTableName, "override-profile"))
+      .WillOnce(Return(std::make_shared<OperationContext>()))
+      .WillOnce(Return(std::make_shared<OperationContext>()));
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, AsyncReadModifyWriteRow)
+      .Times(2)
+      .WillRepeatedly(
+          [](google::cloud::CompletionQueue&,
+             std::shared_ptr<grpc::ClientContext> const&,
+             internal::ImmutableOptions const&,
+             v2::ReadModifyWriteRowRequest const& request,
+             std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ("override-profile", request.app_profile_id());
+            EXPECT_EQ(kTableName, request.table_name());
+            EXPECT_EQ("row", request.row_key());
+            return make_ready_future<StatusOr<v2::ReadModifyWriteRowResponse>>(
+                PermanentError());
+          });
+
+  std::shared_ptr<DataConnectionImpl> conn =
+      TestConnection(std::move(mock), std::move(factory));
+  internal::OptionsSpan span(
+      CallOptions().set<AppProfileIdOption>("override-profile"));
+
+  v2::ReadModifyWriteRowRequest req_with_stale_profile;
+  req_with_stale_profile.set_app_profile_id("stale-profile");
+  req_with_stale_profile.set_table_name(kTableName);
+  req_with_stale_profile.set_row_key("row");
+  EXPECT_THAT(conn->AsyncReadModifyWriteRow(req_with_stale_profile).get(),
+              StatusIs(StatusCode::kPermissionDenied));
+
+  v2::ReadModifyWriteRowRequest req_without_profile;
+  req_without_profile.set_table_name(kTableName);
+  req_without_profile.set_row_key("row");
+  EXPECT_THAT(conn->AsyncReadModifyWriteRow(req_without_profile).get(),
+              StatusIs(StatusCode::kPermissionDenied));
+}
+
+TEST_F(DataConnectionTest,
+       AsyncReadModifyWriteRowPreservesRequestAppProfileIdWhenOptionUnset) {
+  auto factory = std::make_unique<MockOperationContextFactory>();
+  EXPECT_CALL(*factory, ReadModifyWriteRow(kTableName, "proto-profile"))
+      .WillOnce(Return(std::make_shared<OperationContext>()));
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, AsyncReadModifyWriteRow)
+      .WillOnce(
+          [](google::cloud::CompletionQueue&,
+             std::shared_ptr<grpc::ClientContext> const&,
+             internal::ImmutableOptions const&,
+             v2::ReadModifyWriteRowRequest const& request,
+             std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ("proto-profile", request.app_profile_id());
+            EXPECT_EQ(kTableName, request.table_name());
+            EXPECT_EQ("row", request.row_key());
+            return make_ready_future<StatusOr<v2::ReadModifyWriteRowResponse>>(
+                PermanentError());
+          });
+
+  v2::ReadModifyWriteRowRequest req;
+  req.set_app_profile_id("proto-profile");
+  req.set_table_name(kTableName);
+  req.set_row_key("row");
+
+  Options options = CallOptions();
+  options.unset<AppProfileIdOption>();
+  std::shared_ptr<DataConnectionImpl> conn =
+      TestConnection(std::move(mock), std::move(factory));
+  internal::OptionsSpan span(std::move(options));
+  EXPECT_THAT(conn->AsyncReadModifyWriteRow(req).get(),
+              StatusIs(StatusCode::kPermissionDenied));
+}
+
 // The `AsyncRowReader` is tested extensively in `async_row_reader_test.cc`.
 // In this test, we just verify that the configuration is passed along.
 TEST_F(DataConnectionTest, AsyncReadRows) {
@@ -4048,6 +4201,252 @@ TEST_F(DataConnectionTest, AsyncPrepareQueryFailsOnInvalidType) {
               StatusIs(StatusCode::kInternal, "Column type cannot be empty"));
 
   fake_cq_impl->SimulateCompletion(false);
+}
+
+TEST_F(DataConnectionTest,
+       PrepareQueryExpiredRefreshDoesNotDeadlockDefaultBackgroundThreads) {
+  char constexpr kResultMetadataText[] = R"pb(
+    proto_schema {
+      columns {
+        name: "row_key"
+        type { string_type {} }
+      }
+      columns {
+        name: "value"
+        type { string_type {} }
+      }
+    }
+  )pb";
+  v2::PrepareQueryResponse initial_pq_response;
+  initial_pq_response.set_prepared_query("test-pq-id-initial");
+  ASSERT_TRUE(google::protobuf::TextFormat::ParseFromString(
+      kResultMetadataText, initial_pq_response.mutable_metadata()));
+  *initial_pq_response.mutable_valid_until() = internal::ToProtoTimestamp(
+      std::chrono::system_clock::now() + std::chrono::milliseconds(500));
+
+  v2::PrepareQueryResponse refresh_pq_response;
+  refresh_pq_response.set_prepared_query("test-pq-id-refresh");
+  ASSERT_TRUE(google::protobuf::TextFormat::ParseFromString(
+      kResultMetadataText, refresh_pq_response.mutable_metadata()));
+  *refresh_pq_response.mutable_valid_until() = internal::ToProtoTimestamp(
+      std::chrono::system_clock::now() + std::chrono::hours(1));
+
+  std::promise<void> refresh_done;
+  std::future<void> refresh_done_future = refresh_done.get_future();
+  std::atomic<bool> notified{false};
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, PrepareQuery)
+      .WillOnce([&](grpc::ClientContext&, Options const&,
+                    v2::PrepareQueryRequest const&,
+                    bigtable_internal::OperationContext&) {
+        return initial_pq_response;
+      });
+  EXPECT_CALL(*mock, AsyncPrepareQuery)
+      .WillOnce(
+          [&](CompletionQueue& cq, std::shared_ptr<grpc::ClientContext> const&,
+              google::cloud::internal::ImmutableOptions options,
+              v2::PrepareQueryRequest const& request,
+              std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ(request.instance_name(),
+                      "projects/test-project/instances/test-instance");
+            EXPECT_EQ(request.app_profile_id(), kAppProfile);
+            auto p =
+                std::make_shared<promise<StatusOr<v2::PrepareQueryResponse>>>();
+            future<StatusOr<v2::PrepareQueryResponse>> f = p->get_future();
+            cq.RunAsync([p, options = std::move(options), refresh_pq_response,
+                         &refresh_done, &notified]() mutable {
+              internal::OptionsSpan span(std::move(options));
+              p->set_value(std::move(refresh_pq_response));
+              if (!notified.exchange(true)) refresh_done.set_value();
+            });
+            return f;
+          });
+  EXPECT_CALL(*mock, ExecuteQuery)
+      .WillOnce(
+          [&](std::shared_ptr<grpc::ClientContext> const&, Options const&,
+              v2::ExecuteQueryRequest const& request,
+              std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ(request.prepared_query(), "test-pq-id-refresh");
+            auto stream = std::make_unique<MockExecuteQueryStream>();
+            EXPECT_CALL(*stream, Read)
+                .WillOnce(Return(google::cloud::Status{}));
+            return stream;
+          });
+  EXPECT_CALL(*mock, AsyncMutateRow)
+      .WillOnce(
+          [](CompletionQueue& cq, std::shared_ptr<grpc::ClientContext> const&,
+             google::cloud::internal::ImmutableOptions options,
+             v2::MutateRowRequest const&,
+             std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            auto p =
+                std::make_shared<promise<StatusOr<v2::MutateRowResponse>>>();
+            future<StatusOr<v2::MutateRowResponse>> f = p->get_future();
+            cq.RunAsync([p, options = std::move(options)]() mutable {
+              internal::OptionsSpan span(std::move(options));
+              p->set_value(v2::MutateRowResponse{});
+            });
+            return f;
+          });
+
+  {
+    std::unique_ptr<BackgroundThreads> background =
+        internal::MakeBackgroundThreadsFactory(
+            bigtable::internal::DefaultDataOptions(Options{}))();
+    std::shared_ptr<bigtable::DataConnection> conn =
+        TestConnection(std::move(background), std::move(mock),
+                       std::make_unique<SimpleOperationContextFactory>());
+    internal::OptionsSpan span(CallOptions());
+
+    bigtable::InstanceResource instance(Project("test-project"),
+                                        "test-instance");
+    bigtable::SqlStatement statement("SELECT * FROM the-table");
+    StatusOr<bigtable::PreparedQuery> prepared_query =
+        conn->PrepareQuery({instance, statement});
+    ASSERT_STATUS_OK(prepared_query);
+
+    ASSERT_EQ(refresh_done_future.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+
+    bigtable::RowStream row_stream =
+        conn->ExecuteQuery({prepared_query->BindParameters({})});
+    for (StatusOr<bigtable::QueryRow> const& row : row_stream) {
+      ASSERT_STATUS_OK(row);
+    }
+
+    future<Status> apply_status =
+        conn->AsyncApply(kTableName, IdempotentMutation("row"));
+    ASSERT_STATUS_OK(apply_status.get());
+  }
+}
+
+TEST_F(DataConnectionTest,
+       AsyncPrepareQueryExpiredRefreshDoesNotDeadlockDefaultBackgroundThreads) {
+  char constexpr kResultMetadataText[] = R"pb(
+    proto_schema {
+      columns {
+        name: "row_key"
+        type { string_type {} }
+      }
+      columns {
+        name: "value"
+        type { string_type {} }
+      }
+    }
+  )pb";
+  v2::PrepareQueryResponse initial_pq_response;
+  initial_pq_response.set_prepared_query("test-pq-id-initial");
+  ASSERT_TRUE(google::protobuf::TextFormat::ParseFromString(
+      kResultMetadataText, initial_pq_response.mutable_metadata()));
+  *initial_pq_response.mutable_valid_until() = internal::ToProtoTimestamp(
+      std::chrono::system_clock::now() + std::chrono::milliseconds(500));
+
+  v2::PrepareQueryResponse refresh_pq_response;
+  refresh_pq_response.set_prepared_query("test-pq-id-refresh");
+  ASSERT_TRUE(google::protobuf::TextFormat::ParseFromString(
+      kResultMetadataText, refresh_pq_response.mutable_metadata()));
+  *refresh_pq_response.mutable_valid_until() = internal::ToProtoTimestamp(
+      std::chrono::system_clock::now() + std::chrono::hours(1));
+
+  std::promise<void> refresh_done;
+  std::future<void> refresh_done_future = refresh_done.get_future();
+  std::atomic<bool> notified{false};
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, AsyncPrepareQuery)
+      .WillOnce(
+          [&](CompletionQueue& cq, std::shared_ptr<grpc::ClientContext> const&,
+              google::cloud::internal::ImmutableOptions options,
+              v2::PrepareQueryRequest const& request,
+              std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ(request.instance_name(),
+                      "projects/test-project/instances/test-instance");
+            EXPECT_EQ(request.app_profile_id(), kAppProfile);
+            auto p =
+                std::make_shared<promise<StatusOr<v2::PrepareQueryResponse>>>();
+            future<StatusOr<v2::PrepareQueryResponse>> f = p->get_future();
+            cq.RunAsync([p, options = std::move(options),
+                         initial_pq_response]() mutable {
+              internal::OptionsSpan span(std::move(options));
+              p->set_value(std::move(initial_pq_response));
+            });
+            return f;
+          })
+      .WillOnce(
+          [&](CompletionQueue& cq, std::shared_ptr<grpc::ClientContext> const&,
+              google::cloud::internal::ImmutableOptions options,
+              v2::PrepareQueryRequest const& request,
+              std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ(request.instance_name(),
+                      "projects/test-project/instances/test-instance");
+            EXPECT_EQ(request.app_profile_id(), kAppProfile);
+            auto p =
+                std::make_shared<promise<StatusOr<v2::PrepareQueryResponse>>>();
+            future<StatusOr<v2::PrepareQueryResponse>> f = p->get_future();
+            cq.RunAsync([p, options = std::move(options), refresh_pq_response,
+                         &refresh_done, &notified]() mutable {
+              internal::OptionsSpan span(std::move(options));
+              p->set_value(std::move(refresh_pq_response));
+              if (!notified.exchange(true)) refresh_done.set_value();
+            });
+            return f;
+          });
+  EXPECT_CALL(*mock, ExecuteQuery)
+      .WillOnce(
+          [&](std::shared_ptr<grpc::ClientContext> const&, Options const&,
+              v2::ExecuteQueryRequest const& request,
+              std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ(request.prepared_query(), "test-pq-id-refresh");
+            auto stream = std::make_unique<MockExecuteQueryStream>();
+            EXPECT_CALL(*stream, Read)
+                .WillOnce(Return(google::cloud::Status{}));
+            return stream;
+          });
+  EXPECT_CALL(*mock, AsyncMutateRow)
+      .WillOnce(
+          [](CompletionQueue& cq, std::shared_ptr<grpc::ClientContext> const&,
+             google::cloud::internal::ImmutableOptions options,
+             v2::MutateRowRequest const&,
+             std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            auto p =
+                std::make_shared<promise<StatusOr<v2::MutateRowResponse>>>();
+            future<StatusOr<v2::MutateRowResponse>> f = p->get_future();
+            cq.RunAsync([p, options = std::move(options)]() mutable {
+              internal::OptionsSpan span(std::move(options));
+              p->set_value(v2::MutateRowResponse{});
+            });
+            return f;
+          });
+
+  {
+    std::unique_ptr<BackgroundThreads> background =
+        internal::MakeBackgroundThreadsFactory(
+            bigtable::internal::DefaultDataOptions(Options{}))();
+    std::shared_ptr<bigtable::DataConnection> conn =
+        TestConnection(std::move(background), std::move(mock),
+                       std::make_unique<SimpleOperationContextFactory>());
+    internal::OptionsSpan span(CallOptions());
+
+    bigtable::InstanceResource instance(Project("test-project"),
+                                        "test-instance");
+    bigtable::SqlStatement statement("SELECT * FROM the-table");
+    StatusOr<bigtable::PreparedQuery> prepared_query =
+        conn->AsyncPrepareQuery({instance, statement}).get();
+    ASSERT_STATUS_OK(prepared_query);
+
+    ASSERT_EQ(refresh_done_future.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+
+    bigtable::RowStream row_stream =
+        conn->ExecuteQuery({prepared_query->BindParameters({})});
+    for (StatusOr<bigtable::QueryRow> const& row : row_stream) {
+      ASSERT_STATUS_OK(row);
+    }
+
+    future<Status> apply_status =
+        conn->AsyncApply(kTableName, IdempotentMutation("row"));
+    ASSERT_STATUS_OK(apply_status.get());
+  }
 }
 
 }  // namespace
