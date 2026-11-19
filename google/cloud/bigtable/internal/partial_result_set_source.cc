@@ -45,12 +45,14 @@ StatusOr<std::unique_ptr<bigtable::ResultSourceInterface>>
 PartialResultSetSource::Create(
     std::optional<google::bigtable::v2::ResultSetMetadata> metadata,
     std::shared_ptr<OperationContext> operation_context,
-    std::unique_ptr<PartialResultSetReader> reader) {
+    std::unique_ptr<PartialResultSetReader> reader, bool invoke_on_done) {
   std::unique_ptr<PartialResultSetSource> source(new PartialResultSetSource(
-      std::move(metadata), std::move(operation_context), std::move(reader)));
+      std::move(metadata), std::move(operation_context), std::move(reader),
+      invoke_on_done));
 
   // Do an initial read from the stream to determine the fate of the factory.
   auto status = source->ReadFromStream();
+  source->last_status_ = status;
 
   // Any error during parsing will be returned.
   if (!status.ok()) return status;
@@ -61,11 +63,12 @@ PartialResultSetSource::Create(
 PartialResultSetSource::PartialResultSetSource(
     std::optional<google::bigtable::v2::ResultSetMetadata> metadata,
     std::shared_ptr<OperationContext> operation_context,
-    std::unique_ptr<PartialResultSetReader> reader)
+    std::unique_ptr<PartialResultSetReader> reader, bool invoke_on_done)
     : options_(internal::CurrentOptions()),
       reader_(std::move(reader)),
       operation_context_(std::move(operation_context)),
-      metadata_(std::move(metadata)) {
+      metadata_(std::move(metadata)),
+      invoke_on_done_(invoke_on_done) {
   if (metadata_.has_value()) {
     columns_ = std::make_shared<std::vector<std::string>>();
     columns_->reserve(metadata_->proto_schema().columns_size());
@@ -95,7 +98,9 @@ PartialResultSetSource::~PartialResultSetSource() {
     state_ = State::kFinished;
   }
 
-  operation_context_->OnDone(last_status_);
+  if (invoke_on_done_) {
+    operation_context_->OnDone(last_status_);
+  }
 }
 
 StatusOr<bigtable::QueryRow> PartialResultSetSource::NextRow() {

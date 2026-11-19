@@ -45,7 +45,8 @@ class PartialResultSetSource : public bigtable::ResultSourceInterface {
   static StatusOr<std::unique_ptr<bigtable::ResultSourceInterface>> Create(
       std::optional<google::bigtable::v2::ResultSetMetadata> metadata,
       std::shared_ptr<OperationContext> operation_context,
-      std::unique_ptr<PartialResultSetReader> reader);
+      std::unique_ptr<PartialResultSetReader> reader,
+      bool invoke_on_done = true);
 
   ~PartialResultSetSource() override;
 
@@ -59,7 +60,7 @@ class PartialResultSetSource : public bigtable::ResultSourceInterface {
   explicit PartialResultSetSource(
       std::optional<google::bigtable::v2::ResultSetMetadata> metadata,
       std::shared_ptr<OperationContext> operation_context,
-      std::unique_ptr<PartialResultSetReader> reader);
+      std::unique_ptr<PartialResultSetReader> reader, bool invoke_on_done);
 
   Status ReadFromStream();
   Status ProcessDataFromStream(google::bigtable::v2::PartialResultSet& result);
@@ -106,6 +107,7 @@ class PartialResultSetSource : public bigtable::ResultSourceInterface {
   std::optional<std::string> resume_token_ = "";
 
   Status last_status_;
+  bool invoke_on_done_ = true;
   // The state of our PartialResultSetReader.
   enum class State {
     // `Read()` has yet to return false.

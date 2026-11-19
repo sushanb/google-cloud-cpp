@@ -23,6 +23,9 @@
 #include "google/cloud/bigtable/internal/operation_context_factory.h"
 #include "google/cloud/bigtable/internal/table_schema_metrics.h"
 #include "google/cloud/testing_util/fake_clock.h"
+#if !defined(_WIN32) && !defined(__MACH__)
+#include "google/cloud/testing_util/mock_opentelemetry_metrics.h"
+#endif
 #endif
 #include "google/cloud/bigtable/bound_query.h"
 #include "google/cloud/bigtable/instance_resource.h"
@@ -49,6 +52,7 @@
 #include <gmock/gmock.h>
 #include <grpcpp/client_context.h>
 #include <chrono>
+#include <cstddef>
 
 namespace google {
 namespace cloud {
@@ -3391,7 +3395,11 @@ TEST_F(DataConnectionTest, ExecuteQuerySuccessWithQueryPlanRefresh) {
   auto mock_metric = std::make_unique<MockMetric>();
   EXPECT_CALL(*mock_metric, PreCall).Times(2);
   EXPECT_CALL(*mock_metric, PostCall).Times(2);
-  EXPECT_CALL(*mock_metric, OnDone).Times(2);
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce(
+          [](opentelemetry::context::Context const&, OnDoneParams const& p) {
+            EXPECT_THAT(p.operation_status, testing_util::IsOk());
+          });
   EXPECT_CALL(*mock_metric, ElementRequest).Times(3);
   EXPECT_CALL(*mock_metric, ElementDelivery).Times(3);
   auto fake_metric = std::make_shared<CloningMetric>(std::move(mock_metric));
@@ -3566,7 +3574,11 @@ TEST_F(DataConnectionTest, PrepareAndExecuteQuerySuccessWithQueryPlanRefresh) {
   auto mock_metric_execute_query = std::make_unique<MockMetric>();
   EXPECT_CALL(*mock_metric_execute_query, PreCall).Times(2);
   EXPECT_CALL(*mock_metric_execute_query, PostCall).Times(2);
-  EXPECT_CALL(*mock_metric_execute_query, OnDone).Times(2);
+  EXPECT_CALL(*mock_metric_execute_query, OnDone)
+      .WillOnce(
+          [](opentelemetry::context::Context const&, OnDoneParams const& p) {
+            EXPECT_THAT(p.operation_status, testing_util::IsOk());
+          });
   EXPECT_CALL(*mock_metric_execute_query, ElementRequest).Times(3);
   EXPECT_CALL(*mock_metric_execute_query, ElementDelivery).Times(3);
 
@@ -3742,7 +3754,11 @@ TEST_F(DataConnectionTest,
   auto mock_metric_execute_query = std::make_unique<MockMetric>();
   EXPECT_CALL(*mock_metric_execute_query, PreCall).Times(2);
   EXPECT_CALL(*mock_metric_execute_query, PostCall).Times(2);
-  EXPECT_CALL(*mock_metric_execute_query, OnDone).Times(2);
+  EXPECT_CALL(*mock_metric_execute_query, OnDone)
+      .WillOnce(
+          [](opentelemetry::context::Context const&, OnDoneParams const& p) {
+            EXPECT_THAT(p.operation_status, testing_util::IsOk());
+          });
   EXPECT_CALL(*mock_metric_execute_query, ElementRequest).Times(3);
   EXPECT_CALL(*mock_metric_execute_query, ElementDelivery).Times(3);
 
@@ -3955,6 +3971,338 @@ TEST_F(DataConnectionTest, ExecuteQueryFailureWithSchemaChange) {
   }
   fake_cq_impl->SimulateCompletion(false);
 }
+
+TEST_F(DataConnectionTest,
+       ExecuteQueryInitialQueryPlanRefreshFailureCallsOnDoneOnce) {
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_unique<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(0);
+  EXPECT_CALL(*mock_metric, PostCall).Times(0);
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce(
+          [](opentelemetry::context::Context const&, OnDoneParams const& p) {
+            EXPECT_THAT(p.operation_status,
+                        StatusIs(StatusCode::kPermissionDenied));
+          });
+  EXPECT_CALL(*mock_metric, ElementRequest).Times(0);
+  EXPECT_CALL(*mock_metric, ElementDelivery).Times(0);
+  auto fake_metric = std::make_shared<CloningMetric>(std::move(mock_metric));
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+  auto factory = std::make_unique<FakeOperationContextFactory>(
+      TableResourceLabels{}, TableDataLabels{}, fake_metric, clock);
+#else
+  auto factory = std::make_unique<SimpleOperationContextFactory>();
+#endif
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, ExecuteQuery).Times(0);
+  auto fake_cq_impl = std::make_shared<FakeCompletionQueueImpl>();
+  auto refresh_fn = []() {
+    return make_ready_future(
+        StatusOr<v2::PrepareQueryResponse>(PermanentError()));
+  };
+  auto query_plan = QueryPlan::Create(CompletionQueue(fake_cq_impl),
+                                      TransientError(), std::move(refresh_fn));
+
+  auto conn = TestConnection(std::move(mock), std::move(factory));
+  internal::OptionsSpan span(CallOptions());
+  Project p("test-project");
+  bigtable::SqlStatement statement("SELECT key, val FROM t");
+  bigtable::InstanceResource instance(p, "test-instance");
+  bigtable::PreparedQuery pq(instance, statement, std::move(query_plan));
+  auto bq = pq.BindParameters({});
+
+  {
+    auto row_stream = conn->ExecuteQuery({std::move(bq)});
+    for (auto const& row : row_stream) {
+      EXPECT_THAT(row, StatusIs(StatusCode::kPermissionDenied));
+    }
+  }
+}
+
+TEST_F(DataConnectionTest,
+       ExecuteQueryPlanExpiredThenRefreshFailureCallsOnDoneOnce) {
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_unique<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(1);
+  EXPECT_CALL(*mock_metric, PostCall).Times(1);
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce(
+          [](opentelemetry::context::Context const&, OnDoneParams const& p) {
+            EXPECT_THAT(p.operation_status,
+                        StatusIs(StatusCode::kPermissionDenied));
+          });
+  EXPECT_CALL(*mock_metric, ElementRequest).Times(0);
+  EXPECT_CALL(*mock_metric, ElementDelivery).Times(0);
+  auto fake_metric = std::make_shared<CloningMetric>(std::move(mock_metric));
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+  auto factory = std::make_unique<FakeOperationContextFactory>(
+      TableResourceLabels{}, TableDataLabels{}, fake_metric, clock);
+#else
+  auto factory = std::make_unique<SimpleOperationContextFactory>();
+#endif
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  auto fake_cq_impl = std::make_shared<FakeCompletionQueueImpl>();
+  v2::PrepareQueryResponse initial_pq_response;
+  initial_pq_response.set_prepared_query("test-pq-id-initial");
+  *initial_pq_response.mutable_valid_until() = internal::ToProtoTimestamp(
+      std::chrono::system_clock::now() + std::chrono::seconds(3600));
+
+  auto refresh_fn = []() {
+    return make_ready_future(
+        StatusOr<v2::PrepareQueryResponse>(PermanentError()));
+  };
+  auto query_plan =
+      QueryPlan::Create(CompletionQueue(fake_cq_impl),
+                        std::move(initial_pq_response), std::move(refresh_fn));
+
+  EXPECT_CALL(*mock, ExecuteQuery)
+      .WillOnce(
+          [&](auto, auto const&, v2::ExecuteQueryRequest const& request,
+              std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ(request.prepared_query(), "test-pq-id-initial");
+            auto error_stream = std::make_unique<MockExecuteQueryStream>();
+            EXPECT_CALL(*error_stream, Read).WillOnce(Return(QueryPlanError()));
+            return error_stream;
+          });
+
+  auto conn = TestConnection(std::move(mock), std::move(factory));
+  internal::OptionsSpan span(CallOptions());
+  Project p("test-project");
+  bigtable::SqlStatement statement("SELECT key, val FROM t");
+  bigtable::InstanceResource instance(p, "test-instance");
+  bigtable::PreparedQuery pq(instance, statement, std::move(query_plan));
+  auto bq = pq.BindParameters({});
+
+  {
+    auto row_stream = conn->ExecuteQuery({std::move(bq)});
+    for (auto const& row : row_stream) {
+      EXPECT_THAT(row, StatusIs(StatusCode::kPermissionDenied));
+    }
+  }
+  fake_cq_impl->SimulateCompletion(false);
+}
+
+TEST_F(DataConnectionTest, ExecuteQueryUnconsumedRowStreamDoesNotCallOnDone) {
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_unique<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(0);
+  EXPECT_CALL(*mock_metric, PostCall).Times(0);
+  EXPECT_CALL(*mock_metric, OnDone).Times(0);
+  EXPECT_CALL(*mock_metric, ElementRequest).Times(0);
+  EXPECT_CALL(*mock_metric, ElementDelivery).Times(0);
+  auto fake_metric = std::make_shared<CloningMetric>(std::move(mock_metric));
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+  auto factory = std::make_unique<FakeOperationContextFactory>(
+      TableResourceLabels{}, TableDataLabels{}, fake_metric, clock);
+#else
+  auto factory = std::make_unique<SimpleOperationContextFactory>();
+#endif
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, ExecuteQuery).Times(0);
+  auto fake_cq_impl = std::make_shared<FakeCompletionQueueImpl>();
+  v2::PrepareQueryResponse pq_response;
+  pq_response.set_prepared_query("test-pq-id");
+  *pq_response.mutable_valid_until() = internal::ToProtoTimestamp(
+      std::chrono::system_clock::now() + std::chrono::seconds(3600));
+  auto refresh_fn = []() {
+    return make_ready_future(
+        StatusOr<v2::PrepareQueryResponse>(PermanentError()));
+  };
+  auto query_plan =
+      QueryPlan::Create(CompletionQueue(fake_cq_impl), std::move(pq_response),
+                        std::move(refresh_fn));
+
+  auto conn = TestConnection(std::move(mock), std::move(factory));
+  internal::OptionsSpan span(CallOptions());
+  Project p("test-project");
+  bigtable::SqlStatement statement("SELECT key, val FROM t");
+  bigtable::InstanceResource instance(p, "test-instance");
+  bigtable::PreparedQuery pq(instance, statement, std::move(query_plan));
+  auto bq = pq.BindParameters({});
+
+  {
+    auto row_stream = conn->ExecuteQuery({std::move(bq)});
+    (void)row_stream;
+  }
+  fake_cq_impl->SimulateCompletion(false);
+}
+
+#if !defined(_WIN32) && !defined(__MACH__)
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+TEST_F(DataConnectionTest,
+       ExecuteQueryApplicationBlockingLatencyWithQueryPlanRefresh) {
+  auto app_histogram = std::make_unique<testing_util::MockHistogram<double>>();
+  EXPECT_CALL(
+      *app_histogram,
+      Record(::testing::A<double>(),
+             ::testing::A<opentelemetry::common::KeyValueIterable const&>(),
+             ::testing::A<opentelemetry::context::Context const&>()))
+      .WillOnce([](double value, opentelemetry::common::KeyValueIterable const&,
+                   opentelemetry::context::Context const&) {
+        EXPECT_DOUBLE_EQ(value, 11.0);
+      })
+      .WillOnce([](double value, opentelemetry::common::KeyValueIterable const&,
+                   opentelemetry::context::Context const&) {
+        EXPECT_DOUBLE_EQ(value, 17.0);
+      });
+
+  auto op_histogram = std::make_unique<testing_util::MockHistogram<double>>();
+  EXPECT_CALL(
+      *op_histogram,
+      Record(::testing::A<double>(),
+             ::testing::A<opentelemetry::common::KeyValueIterable const&>(),
+             ::testing::A<opentelemetry::context::Context const&>()))
+      .WillOnce([](double value, opentelemetry::common::KeyValueIterable const&,
+                   opentelemetry::context::Context const&) {
+        EXPECT_DOUBLE_EQ(value, 28.0);
+      });
+
+  opentelemetry::nostd::shared_ptr<testing_util::MockMeter> mock_meter =
+      std::make_shared<testing_util::MockMeter>();
+  EXPECT_CALL(*mock_meter, CreateDoubleHistogram)
+      .WillOnce([mock = std::move(app_histogram)](
+                    opentelemetry::nostd::string_view name,
+                    opentelemetry::nostd::string_view,
+                    opentelemetry::nostd::string_view) mutable {
+        EXPECT_THAT(name, Eq("application_latencies"));
+        return std::move(mock);
+      })
+      .WillOnce([mock = std::move(op_histogram)](
+                    opentelemetry::nostd::string_view name,
+                    opentelemetry::nostd::string_view,
+                    opentelemetry::nostd::string_view) mutable {
+        EXPECT_THAT(name, Eq("operation_latencies"));
+        return std::move(mock);
+      });
+
+  opentelemetry::nostd::shared_ptr<testing_util::MockMeterProvider>
+      mock_provider = std::make_shared<testing_util::MockMeterProvider>();
+  EXPECT_CALL(*mock_provider, GetMeter)
+#if OPENTELEMETRY_ABI_VERSION_NO >= 2
+      .Times(2)
+      .WillRepeatedly(
+          [&](opentelemetry::nostd::string_view,
+              opentelemetry::nostd::string_view,
+              opentelemetry::nostd::string_view,
+              opentelemetry::common::KeyValueIterable const*) mutable {
+#else
+      .Times(2)
+      .WillRepeatedly([&](opentelemetry::nostd::string_view,
+                          opentelemetry::nostd::string_view,
+                          opentelemetry::nostd::string_view) mutable {
+#endif
+            return mock_meter;
+          });
+
+  auto app_metric =
+      std::make_shared<ApplicationBlockingLatency>("scope", mock_provider);
+  auto op_metric = std::make_shared<OperationLatency>("scope", mock_provider);
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+  clock->SetTime(std::chrono::steady_clock::time_point{} +
+                 std::chrono::hours(24));
+
+  auto factory = std::make_unique<MockOperationContextFactory>();
+  EXPECT_CALL(*factory, ExecuteQuery).WillOnce([&](auto const&, auto const&) {
+    std::vector<std::shared_ptr<Metric const>> metrics{app_metric, op_metric};
+    return std::make_shared<OperationContext>(
+        CloneMetrics(
+            TableResourceLabels{"p", "i", "", "", ""},
+            TableDataLabels{"ExecuteQuery", "true", "c", "u", kAppProfile, ""},
+            metrics),
+        clock);
+  });
+
+  auto constexpr kResultMetadataText = R"pb(
+    proto_schema {
+      columns {
+        name: "row_key"
+        type { string_type {} }
+      }
+      columns {
+        name: "value"
+        type { string_type {} }
+      }
+    }
+  )pb";
+  v2::PrepareQueryResponse initial_pq_response;
+  initial_pq_response.set_prepared_query("test-pq-id-initial");
+  ASSERT_TRUE(google::protobuf::TextFormat::ParseFromString(
+      kResultMetadataText, initial_pq_response.mutable_metadata()));
+  *initial_pq_response.mutable_valid_until() = internal::ToProtoTimestamp(
+      std::chrono::system_clock::now() + std::chrono::seconds(3600));
+
+  v2::PrepareQueryResponse refresh_pq_response;
+  refresh_pq_response.set_prepared_query("test-pq-id-refresh");
+  ASSERT_TRUE(google::protobuf::TextFormat::ParseFromString(
+      kResultMetadataText, refresh_pq_response.mutable_metadata()));
+  *refresh_pq_response.mutable_valid_until() = internal::ToProtoTimestamp(
+      std::chrono::system_clock::now() + std::chrono::seconds(3600));
+
+  auto fake_cq_impl = std::make_shared<FakeCompletionQueueImpl>();
+  auto refresh_fn = [&]() {
+    return make_ready_future(make_status_or(refresh_pq_response));
+  };
+
+  auto mock = std::make_shared<MockBigtableStub>();
+  EXPECT_CALL(*mock, ExecuteQuery)
+      .WillOnce(
+          [&](auto, auto const&, v2::ExecuteQueryRequest const& request,
+              std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ(request.prepared_query(), "test-pq-id-initial");
+            auto error_stream = std::make_unique<MockExecuteQueryStream>();
+            EXPECT_CALL(*error_stream, Read).WillOnce(Return(QueryPlanError()));
+            return error_stream;
+          })
+      .WillOnce(
+          [&](auto, auto const&, v2::ExecuteQueryRequest const& request,
+              std::shared_ptr<bigtable_internal::OperationContext> const&) {
+            EXPECT_EQ(request.prepared_query(), "test-pq-id-refresh");
+            auto stream = std::make_unique<MockExecuteQueryStream>();
+            EXPECT_CALL(*stream, Read)
+                .WillOnce([&](v2::ExecuteQueryResponse* r) {
+                  MakeResponse(*r->mutable_results(), {"r1", "v1"}, "token-1",
+                               false);
+                  return std::nullopt;
+                })
+                .WillOnce([&](v2::ExecuteQueryResponse* r) {
+                  MakeResponse(*r->mutable_results(), {"r2", "v2"},
+                               "sentinel-token", false);
+                  return std::nullopt;
+                })
+                .WillOnce(Return(google::cloud::Status()));
+            return stream;
+          });
+
+  auto conn = TestConnection(std::move(mock), std::move(factory));
+  internal::OptionsSpan span(CallOptions());
+  Project p("test-project");
+  bigtable::SqlStatement statement("SELECT * FROM the-table");
+  bigtable::InstanceResource instance(p, "test-instance");
+  auto query_plan =
+      QueryPlan::Create(CompletionQueue(fake_cq_impl),
+                        std::move(initial_pq_response), std::move(refresh_fn));
+  bigtable::PreparedQuery prepared_query(instance, statement,
+                                         std::move(query_plan));
+  auto bq = prepared_query.BindParameters({});
+
+  {
+    auto row_stream = conn->ExecuteQuery({std::move(bq)});
+    std::vector<std::chrono::milliseconds> user_blocking_times{
+        std::chrono::milliseconds(11), std::chrono::milliseconds(17)};
+    std::size_t idx = 0;
+    for (auto const& row : row_stream) {
+      ASSERT_STATUS_OK(row);
+      clock->AdvanceTime(user_blocking_times.at(idx++));
+    }
+    EXPECT_EQ(idx, std::size_t{2});
+  }
+  fake_cq_impl->SimulateCompletion(false);
+}
+#endif  // GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+#endif  // !defined(_WIN32) && !defined(__MACH__)
 
 TEST_F(DataConnectionTest, PrepareQueryFailsOnInvalidType) {
   auto mock = std::make_shared<MockBigtableStub>();

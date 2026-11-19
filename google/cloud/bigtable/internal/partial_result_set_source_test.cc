@@ -23,6 +23,9 @@
 #include "google/cloud/bigtable/internal/metrics.h"
 #include "google/cloud/bigtable/internal/table_schema_metrics.h"
 #include "google/cloud/testing_util/fake_clock.h"
+#if !defined(_WIN32) && !defined(__MACH__)
+#include "google/cloud/testing_util/mock_opentelemetry_metrics.h"
+#endif
 #endif
 #include "google/cloud/options.h"
 #include "google/cloud/testing_util/is_proto_equal.h"
@@ -33,6 +36,7 @@
 #include <gmock/gmock.h>
 #include <grpcpp/grpcpp.h>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -64,12 +68,14 @@ StatusOr<std::unique_ptr<bigtable::ResultSourceInterface>>
 CreatePartialResultSetSource(
     std::optional<google::bigtable::v2::ResultSetMetadata> metadata,
     std::shared_ptr<OperationContext> operation_context,
-    std::unique_ptr<PartialResultSetReader> reader, Options opts = {}) {
+    std::unique_ptr<PartialResultSetReader> reader, Options opts = {},
+    bool invoke_on_done = true) {
   internal::OptionsSpan span(internal::MergeOptions(
       std::move(opts.set<StringOption>(CurrentTestName())),
       internal::CurrentOptions()));
-  return PartialResultSetSource::Create(
-      std::move(metadata), std::move(operation_context), std::move(reader));
+  return PartialResultSetSource::Create(std::move(metadata),
+                                        std::move(operation_context),
+                                        std::move(reader), invoke_on_done);
 }
 
 // Returns a functor that will return the argument after expecting that the
@@ -605,6 +611,247 @@ TEST(PartialResultSetSourceTest, ResponseWithNoValues) {
   // At end of stream, we get an 'ok' response with an empty row.
   EXPECT_THAT((*reader)->NextRow(), IsValidAndEquals(bigtable::QueryRow{}));
 }
+
+TEST(PartialResultSetSourceTest, ChecksumMismatchReportsErrorToOnDone) {
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_shared<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(0);
+  EXPECT_CALL(*mock_metric, PostCall).Times(0);
+  EXPECT_CALL(*mock_metric, OnDone)
+      .WillOnce([](opentelemetry::context::Context const&,
+                   OnDoneParams const& p) -> void {
+        EXPECT_THAT(
+            p.operation_status,
+            StatusIs(StatusCode::kInternal, "Unexpected checksum mismatch"));
+      });
+  EXPECT_CALL(*mock_metric, ElementRequest).Times(0);
+  EXPECT_CALL(*mock_metric, ElementDelivery).Times(0);
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({mock_metric}, clock));
+#else
+  auto operation_context = std::make_shared<OperationContext>();
+#endif
+
+  auto constexpr kResultMetadataText = R"pb(
+    proto_schema {
+      columns {
+        name: "user_id"
+        type { string_type {} }
+      }
+    }
+  )pb";
+  google::bigtable::v2::ResultSetMetadata metadata;
+  ASSERT_TRUE(TextFormat::ParseFromString(kResultMetadataText, &metadata));
+  auto constexpr kProtoRowsText = R"pb(
+    values { string_value: "r1" }
+  )pb";
+  google::bigtable::v2::ProtoRows proto_rows;
+  ASSERT_TRUE(TextFormat::ParseFromString(kProtoRowsText, &proto_rows));
+  std::string binary_batch_data = proto_rows.SerializeAsString();
+  std::string partial_result_set_text =
+      absl::Substitute(R"pb(
+                         proto_rows_batch: {
+                           batch_data: "$0",
+                         },
+                         resume_token: "AAAAAWVyZXN1bWVfdG9rZW4=",
+                         reset: true,
+                         estimated_batch_size: 31,
+                         batch_checksum: 12345
+                       )pb",
+                       binary_batch_data);
+  google::bigtable::v2::PartialResultSet response;
+  ASSERT_TRUE(TextFormat::ParseFromString(partial_result_set_text, &response));
+
+  auto grpc_reader =
+      std::make_unique<bigtable_testing::MockPartialResultSetReader>();
+  EXPECT_CALL(*grpc_reader, Read(_, _))
+      .WillOnce([&response](std::optional<std::string> const&,
+                            UnownedPartialResultSet& result) {
+        result.result = response;
+        return true;
+      });
+  EXPECT_CALL(*grpc_reader, TryCancel()).Times(0);
+  grpc::ClientContext context;
+  EXPECT_CALL(*grpc_reader, context)
+      .WillRepeatedly([&]() -> grpc::ClientContext const& { return context; });
+
+  auto reader = CreatePartialResultSetSource(
+      metadata, std::move(operation_context), std::move(grpc_reader));
+  EXPECT_THAT(reader,
+              StatusIs(StatusCode::kInternal, "Unexpected checksum mismatch"));
+}
+
+TEST(PartialResultSetSourceTest, InvokeOnDoneFalseSkipsOnDone) {
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+  auto mock_metric = std::make_shared<MockMetric>();
+  EXPECT_CALL(*mock_metric, PreCall).Times(0);
+  EXPECT_CALL(*mock_metric, PostCall).Times(0);
+  EXPECT_CALL(*mock_metric, OnDone).Times(0);
+  EXPECT_CALL(*mock_metric, ElementRequest).Times(1);
+  EXPECT_CALL(*mock_metric, ElementDelivery).Times(1);
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({mock_metric}, clock));
+#else
+  auto operation_context = std::make_shared<OperationContext>();
+#endif
+
+  auto constexpr kText = R"pb(
+    proto_rows_batch: {}
+  )pb";
+  google::bigtable::v2::PartialResultSet response;
+  ASSERT_TRUE(TextFormat::ParseFromString(kText, &response));
+
+  auto grpc_reader =
+      std::make_unique<bigtable_testing::MockPartialResultSetReader>();
+  EXPECT_CALL(*grpc_reader, Read(_, _))
+      .WillOnce([&response](std::optional<std::string> const&,
+                            UnownedPartialResultSet& result) {
+        result.result = response;
+        return true;
+      })
+      .WillOnce(Return(false));
+  EXPECT_CALL(*grpc_reader, Finish()).WillOnce(ResultMock(Status()));
+  EXPECT_CALL(*grpc_reader, TryCancel()).Times(0);
+  grpc::ClientContext context;
+  EXPECT_CALL(*grpc_reader, context)
+      .Times(2)
+      .WillRepeatedly([&]() -> grpc::ClientContext const& { return context; });
+
+  auto reader = CreatePartialResultSetSource(
+      google::bigtable::v2::ResultSetMetadata{}, std::move(operation_context),
+      std::move(grpc_reader), Options{}, /*invoke_on_done=*/false);
+  ASSERT_STATUS_OK(reader);
+  EXPECT_THAT((*reader)->NextRow(), IsValidAndEquals(bigtable::QueryRow{}));
+}
+
+#if !defined(_WIN32) && !defined(__MACH__)
+#ifdef GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+TEST(PartialResultSetSourceTest,
+     ApplicationBlockingLatencySkipsInitialElementRequest) {
+  auto mock_histogram = std::make_unique<testing_util::MockHistogram<double>>();
+  EXPECT_CALL(
+      *mock_histogram,
+      Record(::testing::A<double>(),
+             ::testing::A<opentelemetry::common::KeyValueIterable const&>(),
+             ::testing::A<opentelemetry::context::Context const&>()))
+      .WillOnce([](double value, opentelemetry::common::KeyValueIterable const&,
+                   opentelemetry::context::Context const&) {
+        EXPECT_DOUBLE_EQ(value, 12.0);
+      })
+      .WillOnce([](double value, opentelemetry::common::KeyValueIterable const&,
+                   opentelemetry::context::Context const&) {
+        EXPECT_DOUBLE_EQ(value, 8.0);
+      });
+
+  opentelemetry::nostd::shared_ptr<testing_util::MockMeter> mock_meter =
+      std::make_shared<testing_util::MockMeter>();
+  EXPECT_CALL(*mock_meter, CreateDoubleHistogram)
+      .WillOnce([mock = std::move(mock_histogram)](
+                    opentelemetry::nostd::string_view name,
+                    opentelemetry::nostd::string_view,
+                    opentelemetry::nostd::string_view) mutable {
+        EXPECT_THAT(name, ::testing::Eq("application_latencies"));
+        return std::move(mock);
+      });
+
+  opentelemetry::nostd::shared_ptr<testing_util::MockMeterProvider>
+      mock_provider = std::make_shared<testing_util::MockMeterProvider>();
+  EXPECT_CALL(*mock_provider, GetMeter)
+#if OPENTELEMETRY_ABI_VERSION_NO >= 2
+      .WillOnce([&](opentelemetry::nostd::string_view,
+                    opentelemetry::nostd::string_view,
+                    opentelemetry::nostd::string_view,
+                    opentelemetry::common::KeyValueIterable const*) mutable {
+#else
+      .WillOnce([&](opentelemetry::nostd::string_view,
+                    opentelemetry::nostd::string_view,
+                    opentelemetry::nostd::string_view) mutable {
+#endif
+        return mock_meter;
+      });
+
+  ApplicationBlockingLatency metric("scope", mock_provider);
+  auto cloned_metric = std::shared_ptr<Metric>(metric.clone(
+      TableResourceLabels{"p", "i", "t", "", ""},
+      TableDataLabels{"ExecuteQuery", "true", "c", "u", "ap", ""}));
+  auto clock = std::make_shared<testing_util::FakeSteadyClock>();
+  clock->SetTime(std::chrono::steady_clock::time_point{} +
+                 std::chrono::hours(48));
+  // NOLINTNEXTLINE(modernize-make-shared)
+  auto operation_context = std::shared_ptr<OperationContext>(
+      new OperationContext({std::move(cloned_metric)}, clock));
+
+  auto constexpr kResultMetadataText = R"pb(
+    proto_schema {
+      columns {
+        name: "user_id"
+        type { string_type {} }
+      }
+    }
+  )pb";
+  google::bigtable::v2::ResultSetMetadata metadata;
+  ASSERT_TRUE(TextFormat::ParseFromString(kResultMetadataText, &metadata));
+  auto constexpr kProtoRowsText = R"pb(
+    values { string_value: "r1" }
+    values { string_value: "r2" }
+  )pb";
+  google::bigtable::v2::ProtoRows proto_rows;
+  ASSERT_TRUE(TextFormat::ParseFromString(kProtoRowsText, &proto_rows));
+  std::string binary_batch_data = proto_rows.SerializeAsString();
+  auto correct_checksum =
+      static_cast<uint32_t>(bigtable_internal::Crc32c(binary_batch_data));
+  std::string partial_result_set_text =
+      absl::Substitute(R"pb(
+                         proto_rows_batch: {
+                           batch_data: "$0",
+                         },
+                         resume_token: "token-1",
+                         reset: true,
+                         estimated_batch_size: 31,
+                         batch_checksum: $1
+                       )pb",
+                       binary_batch_data, correct_checksum);
+  google::bigtable::v2::PartialResultSet response;
+  ASSERT_TRUE(TextFormat::ParseFromString(partial_result_set_text, &response));
+
+  auto grpc_reader =
+      std::make_unique<bigtable_testing::MockPartialResultSetReader>();
+  EXPECT_CALL(*grpc_reader, Read(_, _))
+      .WillOnce([&response](std::optional<std::string> const&,
+                            UnownedPartialResultSet& result) {
+        result.result = response;
+        return true;
+      })
+      .WillOnce(Return(false));
+  EXPECT_CALL(*grpc_reader, Finish()).WillOnce(ResultMock(Status()));
+  EXPECT_CALL(*grpc_reader, TryCancel()).Times(0);
+  grpc::ClientContext context;
+  EXPECT_CALL(*grpc_reader, context)
+      .Times(6)
+      .WillRepeatedly([&]() -> grpc::ClientContext const& { return context; });
+
+  {
+    auto reader = CreatePartialResultSetSource(
+        metadata, std::move(operation_context), std::move(grpc_reader));
+    ASSERT_STATUS_OK(reader);
+
+    auto row1 = (*reader)->NextRow();
+    ASSERT_STATUS_OK(row1);
+    clock->AdvanceTime(std::chrono::milliseconds(12));
+
+    auto row2 = (*reader)->NextRow();
+    ASSERT_STATUS_OK(row2);
+    clock->AdvanceTime(std::chrono::milliseconds(8));
+
+    EXPECT_THAT((*reader)->NextRow(), IsValidAndEquals(bigtable::QueryRow{}));
+  }
+}
+#endif  // GOOGLE_CLOUD_CPP_BIGTABLE_WITH_OTEL_METRICS
+#endif  // !defined(_WIN32) && !defined(__MACH__)
 
 }  // namespace
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END

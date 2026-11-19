@@ -214,9 +214,10 @@ void OperationLatency::PostCall(opentelemetry::context::Context const&,
 
 void OperationLatency::OnDone(opentelemetry::context::Context const& context,
                               OnDoneParams const& p) {
+  if (!operation_start_.has_value()) return;
   data_labels_.status = StatusCodeToString(p.operation_status.code());
   auto operation_elapsed = std::chrono::duration_cast<LatencyDuration>(
-      p.operation_end - operation_start_);
+      p.operation_end - *operation_start_);
   operation_latencies_->Record(operation_elapsed.count(),
                                IntoLabelMap(resource_labels_, data_labels_),
                                context);
@@ -484,10 +485,12 @@ void ApplicationBlockingLatency::ElementDelivery(
 
 void ApplicationBlockingLatency::ElementRequest(
     opentelemetry::context::Context const&, ElementRequestParams const& p) {
+  if (!element_delivery_time_.has_value()) return;
   auto application_blocking_latency =
       std::chrono::duration_cast<LatencyDuration>(p.element_request -
-                                                  element_delivery_time_);
+                                                  *element_delivery_time_);
   pending_latencies_.push_back(application_blocking_latency);
+  element_delivery_time_.reset();
 }
 
 void ApplicationBlockingLatency::PostCall(
@@ -507,6 +510,8 @@ void ApplicationBlockingLatency::OnDone(
   for (auto const& latency : pending_latencies_) {
     application_blocking_latencies_->Record(latency.count(), m, context);
   }
+  pending_latencies_.clear();
+  element_delivery_time_.reset();
 }
 
 std::unique_ptr<TableSchemaMetric> ApplicationBlockingLatency::clone(
